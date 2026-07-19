@@ -69,6 +69,7 @@ BASE = {
     # 0 in the matrix BASE: the floor is itself an estimator change, so the
     # matrix isolates it (config 14) instead of baking it into every config.
     'risTargetFloor': 0.0,
+    'useCompaction': False,
 }
 
 # Stats on (throttled) for tail configs: the [COST] tailRays column in the log
@@ -107,6 +108,11 @@ CONFIGS = [
     # target), but the claim gets measured, not assumed.
     ("14_targetfloor",  dict(BASE, useRIS=True, useSharedCandidateSweep=True,
                              useAdaptiveM=True, risTargetFloor=0.01),           [1]),
+    # Stream compaction: same estimator, different thread that shades it.
+    # Phase B uses an independently-seeded RNG stream, so the 1-spp image is a
+    # different noise realization - converged must still match exactly.
+    ("15_compaction",   dict(BASE, useRIS=True, useSharedCandidateSweep=True,
+                             useAdaptiveM=True, useCompaction=True),            [1]),
 ]
 
 def render_graph_Matrix():

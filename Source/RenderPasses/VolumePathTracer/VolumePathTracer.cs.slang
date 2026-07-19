@@ -59,6 +59,18 @@ cbuffer CB
 #ifndef SPATIAL_NEIGHBORS
 #define SPATIAL_NEIGHBORS 0
 #endif
+// Stream compaction (ReSTIR PT Enhanced 6.2.2 / the UE classify->compact->
+// dense-dispatch pattern). Phase A ("main") runs per pixel: escape estimate,
+// candidate generation, reservoir merges - the work EVERY pixel owes - and
+// appends the ~13% of pixels whose reservoir selected a real scatter vertex
+// to a queue. Phase B ("shadeMain") is an indirect dispatch with one thread
+// per QUEUED PATH: shading, NEE and the bounce loop run in dense waves
+// instead of warps that are 87% idle lanes (measured: noCand 1.807M of
+// 2.07M pixels). Estimator-identical by construction - the same vertices
+// get shaded with the same math; only the thread that shades them changes.
+#ifndef USE_COMPACTION
+#define USE_COMPACTION 0
+#endif
 
 /** Snapshot accessors for the sampler-internal work counters. Compile to 0
     when GRID_VOLUME_SAMPLER_STATS is off, so all bucket math folds away.
@@ -224,6 +236,22 @@ struct TemporalReservoir
 
 RWStructuredBuffer<TemporalReservoir> gReservoirPrev; ///< Last frame's reservoirs (read).
 RWStructuredBuffer<TemporalReservoir> gReservoirCurr; ///< This frame's reservoirs (written).
+
+#if USE_COMPACTION
+/** One queued path = one RIS survivor. 16 bytes: everything else the shade
+    phase needs (primary ray, albedo, anisotropy) is recomputed from pixel
+    and instance id, which is cheaper than hauling it through memory.
+*/
+struct ScatterEntry
+{
+    uint pixel;  ///< Packed x | y<<16.
+    float t;     ///< Selected scatter distance on the primary ray.
+    uint inst;   ///< Grid volume instance of the survivor.
+    float W;     ///< Unbiased contribution weight of the reservoir.
+};
+RWStructuredBuffer<ScatterEntry> gScatterQueue;
+RWStructuredBuffer<uint> gScatterCount; ///< [0] = number of queued paths.
+#endif
 
 /** Reservoir over path vertices for the single-NEE estimator: vertex k
     survives with probability 1/k, giving a uniform pick without knowing the
@@ -757,7 +785,24 @@ void main(uint3 dispatchThreadId: SV_DispatchThreadID)
             if (selW > 0.f)
             {
                 risW = W;
-
+#if USE_COMPACTION
+                // Phase A ends here: append the survivor and let the dense
+                // shade dispatch do the rest. ONE atomic per wave (the UE
+                // wave-coherent append), not one per thread: lanes reserve
+                // contiguous slots via prefix count.
+                risExit = kRisExitContributed;
+                const uint laneSlot = WavePrefixCountBits(true);
+                uint waveBase = 0;
+                if (WaveIsFirstLane())
+                    InterlockedAdd(gScatterCount[0], WaveActiveCountBits(true), waveBase);
+                waveBase = WaveReadLaneFirst(waveBase);
+                ScatterEntry entry;
+                entry.pixel = pixel.x | (pixel.y << 16);
+                entry.t = selDs.t;
+                entry.inst = selDs.instance;
+                entry.W = W;
+                gScatterQueue[waveBase + laneSlot] = entry;
+#else
                 const GridVolume gv = gScene.getGridVolume(selDs.instance);
                 // ds.thp carries the instance albedo, exactly as the reference
                 // path uses it.
@@ -772,6 +817,7 @@ void main(uint3 dispatchThreadId: SV_DispatchThreadID)
                     traceLoop = true;
                 }
                 risExit = kRisExitContributed;
+#endif
             }
         }
     }
@@ -925,3 +971,130 @@ void main(uint3 dispatchThreadId: SV_DispatchThreadID)
         );
     }
 }
+
+#if USE_COMPACTION
+/** Phase B: dense shading of queued paths. One thread per REAL path - waves
+    are fully occupied doing shading/NEE/bounce marching instead of carrying
+    ~87% no-scatter lanes (the measured noCand fraction).
+
+    RNG: a fresh stream, decorrelated from phase A by a large seed offset.
+    Phase A's draws already decided everything up to and including the
+    survivor; phase B only needs INDEPENDENT draws for NEE/phase/bounces.
+    Different random numbers, identical distributions => converged-identical
+    (matrix config 15 is the gate).
+*/
+[numthreads(64, 1, 1)]
+void shadeMain(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    const uint queueIdx = dispatchThreadId.x;
+    if (queueIdx >= gScatterCount[0])
+        return;
+
+    const ScatterEntry entry = gScatterQueue[queueIdx];
+    const uint2 pixel = uint2(entry.pixel & 0xffffu, entry.pixel >> 16);
+
+    // Seed by PIXEL, not queue index: queue order is nondeterministic (wave
+    // append order), and per-pixel seeding keeps the whole frame reproducible
+    // regardless of it.
+    SampleGenerator sg = SampleGenerator(pixel, gFrameCount + 0x9e3779b9u);
+    VolumeInstanceSampler volumeSampler = {};
+
+    Ray ray = gScene.camera.computeRayPinhole(pixel, gFrameDim);
+    ray.tMax = FLT_MAX;
+    const float3 wi = -ray.dir;
+
+    float3 radiance = float3(0.f);
+    const GridVolume gv = gScene.getGridVolume(entry.inst);
+    // Same throughput rule as the fused path: instance albedo x reservoir W.
+    float3 throughput = gv.data.albedo * entry.W;
+
+    NeeVertexReservoir neeReservoir = {};
+    uint bounce = 0;
+    bool traceLoop = false;
+
+    const float3 scatterPos = ray.origin + entry.t * ray.dir;
+    if (scatterAtVertex(scatterPos, wi, gv.data.anisotropy, 0, ray, throughput, radiance, neeReservoir, volumeSampler, sg))
+    {
+        bounce = 1;
+        traceLoop = true;
+    }
+
+    // Continuation bounces: byte-identical logic to the fused loop, minus the
+    // bounce==0 primary-transmittance case, which cannot occur here (phase A
+    // owns the primary escape term).
+    while (traceLoop)
+    {
+        VolumeInstanceSampler::DistanceSample ds;
+        const bool scattered = volumeSampler.sampleDistance(ray, sg, ds);
+
+        if (!scattered)
+        {
+            radiance += throughput * evalEnvironment(ray.dir);
+            break;
+        }
+
+        throughput *= ds.thp;
+
+        const float3 pos = ray.origin + ds.t * ray.dir;
+        const float3 wiB = -ray.dir;
+
+        if (bounce >= kMaxBounces)
+            break;
+
+        const float g = gScene.getGridVolume(ds.instance).data.anisotropy;
+        if (!scatterAtVertex(pos, wiB, g, bounce, ray, throughput, radiance, neeReservoir, volumeSampler, sg))
+            break;
+
+        bounce++;
+    }
+
+    // Deferred single NEE for the whole path, exactly as the fused kernel.
+    if (kSingleNeePerPath && kUseNEE && neeReservoir.count > 0)
+    {
+        const HenyeyGreensteinPhaseFunction phase = HenyeyGreensteinPhaseFunction(neeReservoir.g);
+        radiance += neeReservoir.thp * evalNEE(neeReservoir.pos, neeReservoir.wi, phase, volumeSampler, sg) * float(neeReservoir.count);
+    }
+
+    // Phase A wrote the background/escape terms; this adds the scatter terms.
+    // One queue entry per pixel => single writer, plain read-modify-write.
+    gOutputColor[pixel] += float4(radiance, 0.f);
+    if (is_valid(gOutputLin))
+        gOutputLin[pixel] += float4(radiance, 0.f);
+
+#if USE_WORK_STATS
+    // Shade-phase work lands in the same [WORK]/[COST] slots as the fused
+    // kernel's shading bucket, so the log stays comparable across modes.
+    {
+        const uint a = WaveActiveSum(volumeSampler.statAabbTests);
+        const uint b = WaveActiveSum(volumeSampler.statSegments);
+        const uint g2 = WaveActiveSum(volumeSampler.statRays);
+        const uint h4 = WaveActiveSum(gvsCellsNow());
+        const uint h5 = WaveActiveSum(gvsTapsNow());
+        const uint h6 = WaveActiveSum(volumeSampler.statOverlapSteps);
+        const uint h7 = WaveActiveSum(volumeSampler.statOverlapLookups);
+        const uint h8 = WaveActiveSum(volumeSampler.statTailRays);
+        if (WaveIsFirstLane())
+        {
+            if (a > 0) InterlockedAdd(gRisStats[9], a);
+            if (b > 0) InterlockedAdd(gRisStats[10], b);
+            if (g2 > 0) InterlockedAdd(gRisStats[15], g2);
+            if (h4 > 0) InterlockedAdd(gRisStats[20], h4);
+            if (h5 > 0) InterlockedAdd(gRisStats[21], h5);
+            if (h6 > 0) InterlockedAdd(gRisStats[22], h6);
+            if (h7 > 0) InterlockedAdd(gRisStats[23], h7);
+            if (h8 > 0) InterlockedAdd(gRisStats[24], h8);
+        }
+    }
+#endif
+}
+
+/** Queue count -> indirect dispatch args for shadeMain (groups of 64). */
+RWByteAddressBuffer gDispatchArgs;
+
+[numthreads(1, 1, 1)]
+void argsMain()
+{
+    const uint n = gScatterCount[0];
+    gDispatchArgs.Store3(0, uint3((n + 63u) / 64u, 1u, 1u));
+}
+#endif // USE_COMPACTION

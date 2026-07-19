@@ -72,6 +72,7 @@ const char kUseSpatialReuse[] = "useSpatialReuse";
 const char kSpatialNeighbors[] = "spatialNeighbors";
 const char kSpatialRadiusPx[] = "spatialRadiusPx";
 const char kRisTargetFloor[] = "risTargetFloor";
+const char kUseCompaction[] = "useCompaction";
 } // namespace
 
 VolumePathTracer::VolumePathTracer(ref<Device> pDevice, const Properties& props) : RenderPass(pDevice)
@@ -142,6 +143,8 @@ void VolumePathTracer::parseProperties(const Properties& props)
             mSpatialRadiusPx = value;
         else if (key == kRisTargetFloor)
             mRisTargetFloor = value;
+        else if (key == kUseCompaction)
+            mUseCompaction = value;
         else
             logWarning("Unknown property '{}' in VolumePathTracer properties.", key);
     }
@@ -178,6 +181,7 @@ Properties VolumePathTracer::getProperties() const
     props[kSpatialNeighbors] = mSpatialNeighbors;
     props[kSpatialRadiusPx] = mSpatialRadiusPx;
     props[kRisTargetFloor] = mRisTargetFloor;
+    props[kUseCompaction] = mUseCompaction;
     return props;
 }
 
@@ -192,6 +196,8 @@ void VolumePathTracer::setScene(RenderContext* pRenderContext, const ref<Scene>&
 {
     mpScene = pScene;
     mpPass = nullptr;
+    mpPassShade = nullptr;
+    mpPassArgs = nullptr;
     mpVolumeSampler = nullptr;
     mpEnvMapSampler = nullptr;
 
@@ -776,10 +782,15 @@ void VolumePathTracer::prepareProgram(RenderContext* pRenderContext)
 {
     FALCOR_ASSERT(mpScene && mpVolumeSampler);
 
-    ProgramDesc desc;
-    desc.addShaderModules(mpScene->getShaderModules());
-    desc.addShaderLibrary(kShaderFile).csEntry("main");
-    desc.addTypeConformances(mpScene->getTypeConformances());
+    auto makeDesc = [&](const char* entry)
+    {
+        ProgramDesc d;
+        d.addShaderModules(mpScene->getShaderModules());
+        d.addShaderLibrary(kShaderFile).csEntry(entry);
+        d.addTypeConformances(mpScene->getTypeConformances());
+        return d;
+    };
+    ProgramDesc desc = makeDesc("main");
 
     DefineList defines;
     defines.add(mpScene->getSceneDefines());
@@ -809,6 +820,10 @@ void VolumePathTracer::prepareProgram(RenderContext* pRenderContext)
     // binding a null acceleration structure.
     defines.add("USE_BRICK_TLAS", (mUseBrickTlas && mBrickBlasesValid) ? "1" : "0");
     defines.add("USE_MERGED_TAIL", (mUseMergedTail && mpTailTex) ? "1" : "0");
+    // Stream compaction: only meaningful on the RIS path (the reference path
+    // stays a single fused kernel, byte-identical ground truth).
+    const bool compactionCompiled = mUseRIS && mUseCompaction;
+    defines.add("USE_COMPACTION", compactionCompiled ? "1" : "0");
     // Size the sampler's per-thread arrays to the scene, not to a fixed 16.
     // These arrays dominate register/scratch usage, and this pass measured as
     // spill-bound rather than work-bound, so oversizing them costs real time.
@@ -824,6 +839,16 @@ void VolumePathTracer::prepareProgram(RenderContext* pRenderContext)
     defines.add("is_valid_gRisDebug", "0");
 
     mpPass = ComputePass::create(mpDevice, desc, defines, true);
+
+    // Compaction pipeline: same module, two more entry points. Created from
+    // the same DefineList so all three kernels agree on every feature define.
+    mpPassShade = nullptr;
+    mpPassArgs = nullptr;
+    if (compactionCompiled)
+    {
+        mpPassShade = ComputePass::create(mpDevice, makeDesc("shadeMain"), defines, true);
+        mpPassArgs = ComputePass::create(mpDevice, makeDesc("argsMain"), defines, true);
+    }
 
     // RIS stat buffers. Always created (and always bound) so the shader's UAV
     // is never null, regardless of whether logging is currently enabled.
@@ -845,11 +870,23 @@ void VolumePathTracer::prepareProgram(RenderContext* pRenderContext)
     // Plain bindShaderData is still correct for the SCENE block: this pass
     // never traces against the scene's TLAS. The brick TLAS is our own,
     // pass-owned structure, bound separately in execute() each frame.
-    auto var = mpPass->getRootVar();
-    mpScene->bindShaderData(var["gScene"]);
-    mpSampleGenerator->bindShaderData(var);
-    if (mpEnvMapSampler)
-        mpEnvMapSampler->bindShaderData(var["gParams"]["envMapSampler"]);
+    // findMember guards: the shade/args entry points reference different
+    // subsets of the globals, and reflection strips what a program never
+    // touches.
+    auto bindStatics = [&](const ShaderVar& var)
+    {
+        if (auto v = var.findMember("gScene"); v.isValid())
+            mpScene->bindShaderData(v);
+        mpSampleGenerator->bindShaderData(var);
+        if (mpEnvMapSampler)
+        {
+            if (auto v = var.findMember("gParams"); v.isValid())
+                mpEnvMapSampler->bindShaderData(v["envMapSampler"]);
+        }
+    };
+    bindStatics(mpPass->getRootVar());
+    if (mpPassShade)
+        bindStatics(mpPassShade->getRootVar());
 }
 
 void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& renderData)
@@ -890,16 +927,13 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
         prepareProgram(pRenderContext);
     FALCOR_ASSERT(mpPass);
 
-    // Tell the shader which optional outputs are actually connected.
+    // Tell the shaders which optional outputs are actually connected.
     mpPass->getProgram()->addDefines(getValidResourceDefines(kOutputChannels, renderData));
+    if (mpPassShade)
+        mpPassShade->getProgram()->addDefines(getValidResourceDefines(kOutputChannels, renderData));
 
     const uint2 targetDim = renderData.getDefaultTextureDims();
     FALCOR_ASSERT(targetDim.x > 0 && targetDim.y > 0);
-
-    auto var = mpPass->getRootVar();
-
-    var["CB"]["gFrameCount"] = mFrameCount;
-    var["CB"]["gFrameDim"] = targetDim;
 
     // Footprint spread: world-space width one pixel spans per unit distance.
     // ALWAYS uploaded - it is a camera fact that drives the merged-tail gate
@@ -916,25 +950,14 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
             footprintSpread = 2.f * tanHalfFovY / float(targetDim.y) * mFootprintScale;
         }
     }
-    var["CB"]["gFootprintSpread"] = footprintSpread;
 
-    // HW-BVH brick backend: refresh the TLAS (per-instance mip = projected
-    // error; rebuild only when a selection changed) and bind its resources.
+    // HW-BVH brick backend: refresh the TLAS once per frame (side effect kept
+    // OUT of the bind lambda below, which runs once per kernel).
     if (mUseBrickTlas && mBrickBlasesValid)
-    {
         updateBrickTlas(pRenderContext, targetDim);
-        if (mpBrickTlas)
-        {
-            var["gBrickTlas"].setAccelerationStructure(mpBrickTlas);
-            var["gBrickTlasInstances"] = mpBrickInstanceInfo;
-            var["gBrickAABBs"] = mpBrickAABBs;
-        }
-    }
 
     // Stage B temporal reservoir history: (re)create + clear on resize or
-    // first use, ping-pong the bindings, and feed last frame's camera.
-    // Buffers are bound whenever the DEFINE is active (the shader statically
-    // references them); gTemporalEnable additionally gates actual use.
+    // first use; ping-pong bindings happen in the bind lambda.
     const bool temporalCompiled = mUseRIS && mUseTemporalReuse;
     const bool temporalActive = temporalCompiled && mMaxBounces > 0;
     if (temporalCompiled)
@@ -953,35 +976,103 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
             mReservoirDim = targetDim;
             mPrevCamValid = false; // History cleared: do not reproject into it.
         }
-        var["gReservoirPrev"] = mpReservoir[mReservoirFrame & 1];
-        var["gReservoirCurr"] = mpReservoir[(mReservoirFrame + 1) & 1];
     }
-    var["CB"]["gPrevViewProj"] = mPrevViewProj;
-    var["CB"]["gPrevCamPos"] = mPrevCamPos;
-    var["CB"]["gTemporalEnable"] = (temporalActive && mPrevCamValid) ? 1u : 0u;
-    var["CB"]["gTemporalMCap"] = mTemporalMCap;
-    var["CB"]["gSpatialRadiusPx"] = mSpatialRadiusPx;
-    var["CB"]["gRisTargetFloor"] = mRisTargetFloor;
 
-    // Merged coarse tail: bind the baked summed-field grid + its constants.
-    if (mUseMergedTail && mpTailTex)
+    // Stream compaction: queue of RIS survivors + indirect args for the dense
+    // shade dispatch. Worst case every pixel scatters, so size to pixel count.
+    const bool compactionActive = mUseRIS && mUseCompaction && mpPassShade && mpPassArgs;
+    if (compactionActive)
     {
-        var["gTailTex"] = mpTailTex;
-        var["TailCB"]["gTailOrigin"] = mTailOrigin;
-        var["TailCB"]["gTailFootprintGate"] = mTailGateVoxels * mTailMinVoxWorld;
-        var["TailCB"]["gTailCellSize"] = mTailCellSize;
-        var["TailCB"]["gTailEnabled"] = 1u;
-        var["TailCB"]["gTailDim"] = mTailDim;
+        const uint32_t pixelCount = targetDim.x * targetDim.y;
+        if (!mpScatterQueue || mpScatterQueue->getElementCount() < pixelCount)
+        {
+            mpScatterQueue = mpDevice->createStructuredBuffer(
+                16, pixelCount, ResourceBindFlags::UnorderedAccess | ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal
+            );
+            mpScatterQueue->setName("VolumePathTracer::mpScatterQueue");
+        }
+        if (!mpScatterCount)
+        {
+            mpScatterCount = mpDevice->createStructuredBuffer(
+                sizeof(uint32_t), 1, ResourceBindFlags::UnorderedAccess | ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal
+            );
+            mpScatterCount->setName("VolumePathTracer::mpScatterCount");
+        }
+        if (!mpDispatchArgs)
+        {
+            mpDispatchArgs = mpDevice->createBuffer(
+                3 * sizeof(uint32_t), ResourceBindFlags::IndirectArg | ResourceBindFlags::UnorderedAccess, MemoryType::DeviceLocal
+            );
+            mpDispatchArgs->setName("VolumePathTracer::mpDispatchArgs");
+        }
+        pRenderContext->clearUAV(mpScatterCount->getUAV().get(), uint4(0, 0, 0, 0));
     }
 
-    for (auto channel : kOutputChannels)
-        var[channel.texname] = renderData.getTexture(channel.name);
+    // Per-frame bindings, shared by the fused/phase-A kernel and the shade
+    // kernel. Every loose global goes through findMember: the two programs
+    // reference different subsets and reflection strips the rest.
+    auto bindFrame = [&](const ShaderVar& var)
+    {
+        var["CB"]["gFrameCount"] = mFrameCount;
+        var["CB"]["gFrameDim"] = targetDim;
+        var["CB"]["gFootprintSpread"] = footprintSpread;
+        var["CB"]["gPrevViewProj"] = mPrevViewProj;
+        var["CB"]["gPrevCamPos"] = mPrevCamPos;
+        var["CB"]["gTemporalEnable"] = (temporalActive && mPrevCamValid) ? 1u : 0u;
+        var["CB"]["gTemporalMCap"] = mTemporalMCap;
+        var["CB"]["gSpatialRadiusPx"] = mSpatialRadiusPx;
+        var["CB"]["gRisTargetFloor"] = mRisTargetFloor;
 
-    // With both stat defines off the shader never references gRisStats and
-    // reflection may strip it, so bind through findMember instead of the
-    // throwing operator[].
-    if (auto statsVar = var.findMember("gRisStats"); statsVar.isValid())
-        statsVar = mpRisStats;
+        if (mUseBrickTlas && mBrickBlasesValid && mpBrickTlas)
+        {
+            if (auto v = var.findMember("gBrickTlas"); v.isValid())
+                v.setAccelerationStructure(mpBrickTlas);
+            if (auto v = var.findMember("gBrickTlasInstances"); v.isValid())
+                v = mpBrickInstanceInfo;
+            if (auto v = var.findMember("gBrickAABBs"); v.isValid())
+                v = mpBrickAABBs;
+        }
+
+        if (temporalCompiled)
+        {
+            if (auto v = var.findMember("gReservoirPrev"); v.isValid())
+                v = mpReservoir[mReservoirFrame & 1];
+            if (auto v = var.findMember("gReservoirCurr"); v.isValid())
+                v = mpReservoir[(mReservoirFrame + 1) & 1];
+        }
+
+        // Merged coarse tail: baked summed-field grid + its constants.
+        if (mUseMergedTail && mpTailTex)
+        {
+            if (auto v = var.findMember("gTailTex"); v.isValid())
+                v = mpTailTex;
+            if (auto tcb = var.findMember("TailCB"); tcb.isValid())
+            {
+                tcb["gTailOrigin"] = mTailOrigin;
+                tcb["gTailFootprintGate"] = mTailGateVoxels * mTailMinVoxWorld;
+                tcb["gTailCellSize"] = mTailCellSize;
+                tcb["gTailEnabled"] = 1u;
+                tcb["gTailDim"] = mTailDim;
+            }
+        }
+
+        for (auto channel : kOutputChannels)
+        {
+            if (auto v = var.findMember(channel.texname); v.isValid())
+                v = renderData.getTexture(channel.name);
+        }
+
+        if (auto v = var.findMember("gRisStats"); v.isValid())
+            v = mpRisStats;
+
+        if (compactionActive)
+        {
+            if (auto v = var.findMember("gScatterQueue"); v.isValid())
+                v = mpScatterQueue;
+            if (auto v = var.findMember("gScatterCount"); v.isValid())
+                v = mpScatterCount;
+        }
+    };
 
     // Log the RIS branch histogram every mRisStatsInterval frames. The readback
     // needs a full GPU sync, so it is throttled rather than run every frame.
@@ -989,13 +1080,29 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
     if (logThisFrame)
         pRenderContext->clearUAV(mpRisStats->getUAV().get(), uint4(0, 0, 0, 0));
 
-    // Time the dispatch on the GPU. A CPU timer here would measure command
+    // Time the dispatches on the GPU. A CPU timer here would measure command
     // submission, not the work, and would report near-zero regardless of cost.
+    // Under compaction the timer brackets ALL THREE dispatches, so gpuMs stays
+    // the whole-pipeline number the log has always reported.
     const bool timeThisFrame = mLogWorkStats && mpGpuTimer && logThisFrame;
     if (timeThisFrame)
         mpGpuTimer->begin();
 
+    bindFrame(mpPass->getRootVar());
     mpPass->execute(pRenderContext, uint3(targetDim, 1));
+
+    if (compactionActive)
+    {
+        // Queue count -> indirect args (one thread), then the dense shade
+        // dispatch. Falcor inserts the UAV barriers between dispatches.
+        auto argsVar = mpPassArgs->getRootVar();
+        argsVar["gScatterCount"] = mpScatterCount;
+        argsVar["gDispatchArgs"] = mpDispatchArgs;
+        mpPassArgs->execute(pRenderContext, uint3(1, 1, 1));
+
+        bindFrame(mpPassShade->getRootVar());
+        mpPassShade->executeIndirect(pRenderContext, mpDispatchArgs.get());
+    }
 
     if (timeThisFrame)
     {
@@ -1196,6 +1303,14 @@ void VolumePathTracer::renderUI(Gui::Widgets& widget)
                 "Defensive floor on the RIS target, relative to a fully-lit isotropic\n"
                 "vertex. Bounds the L/Lhat firefly mechanism (matrix: isolated 800-2200x\n"
                 "pixels at 1 spp). Unbiased for any value; 0 = raw target.",
+                true
+            );
+            rebuild |= group.checkbox("Compacted shading (two-phase)", mUseCompaction);
+            group.tooltip(
+                "Stream compaction (ReSTIR PT Enhanced 6.2.2 / UE): per-pixel phase A\n"
+                "queues the ~13% of pixels whose reservoir scattered; an indirect\n"
+                "phase B shades one thread per REAL path in dense waves instead of\n"
+                "87%-idle warps. Estimator-identical (matrix config 15).",
                 true
             );
             rebuild |= group.var("Coarse mip", mRisMip, 0u, 3u);

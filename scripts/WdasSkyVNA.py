@@ -64,6 +64,11 @@ def render_graph_VNA():
         # L/Lhat firefly mechanism the validation matrix isolated (single
         # 800-2200x pixels at 1 spp). Unbiased at any value.
         'risTargetFloor': 0.01,
+        # Stream compaction (ReSTIR PT Enhanced 6.2.2 / UE dense-dispatch):
+        # phase A queues the ~13% of pixels that scatter, an indirect phase B
+        # shades one thread per real path. Attacks the measured 87%-idle
+        # warp divergence in the shading/bounce buckets.
+        'useCompaction': True,
         # Section 4: HW-BVH brick TLAS (UE HeterogeneousVolumes port) with
         # per-instance projected-error mip selection.
         'useBrickTlas': True,

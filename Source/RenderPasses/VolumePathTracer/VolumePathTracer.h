@@ -51,6 +51,14 @@ private:
 
     ref<Scene> mpScene;
     ref<ComputePass> mpPass;
+    // Stream compaction pipeline (phase A = mpPass with USE_COMPACTION=1):
+    // argsMain turns the survivor count into indirect args, shadeMain shades
+    // one thread per queued path in dense waves. Null when compaction is off.
+    ref<ComputePass> mpPassShade;
+    ref<ComputePass> mpPassArgs;
+    ref<Buffer> mpScatterQueue;  ///< RIS survivors (16 B each), sized to pixel count.
+    ref<Buffer> mpScatterCount;  ///< Single uint: queued path count.
+    ref<Buffer> mpDispatchArgs;  ///< uint3 indirect dispatch args for shadeMain.
     ref<SampleGenerator> mpSampleGenerator;
     std::unique_ptr<GridVolumeSampler> mpVolumeSampler;
     std::unique_ptr<EnvMapSampler> mpEnvMapSampler;
@@ -189,6 +197,13 @@ private:
     uint32_t mSpatialNeighbors = 2u;
     /// Gaussian sigma of the neighbor offsets, in pixels (live, no rebuild).
     float mSpatialRadiusPx = 16.f;
+    /// Stream compaction (ReSTIR PT Enhanced 6.2.2 / UE classify->compact->
+    /// dense-dispatch): split the fused kernel at the reservoir selection.
+    /// Phase A (per pixel) generates candidates + merges reservoirs and
+    /// queues the ~13% of pixels that scatter; phase B shades them one
+    /// thread per real path in dense waves. Estimator-identical: matrix
+    /// config 15 gates converged-identity. Requires RIS.
+    bool mUseCompaction = false;
     /// Defensive RIS target floor, relative to a fully-lit isotropic vertex
     /// (1/4pi). Bounds the L/Lhat firefly mechanism measured in the matrix
     /// (isolated 800-2200x pixels at 1 spp). Unbiased for any value, but it
