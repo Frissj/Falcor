@@ -73,8 +73,11 @@ struct RtInstanceDesc
     /**
      * Sets the transform matrix using a float4x4 value.
      * @param[in] matrix A 4x4 matrix to set into transform.
+     * FALCOR_API: implemented in Falcor's DLL; without the export only
+     * in-module code (Scene.cpp) could link it - render-pass plugins are
+     * legitimate callers when they build their own acceleration structures.
      */
-    RtInstanceDesc& setTransform(const float4x4& matrix);
+    FALCOR_API RtInstanceDesc& setTransform(const float4x4& matrix);
 };
 
 enum class RtAccelerationStructureKind
