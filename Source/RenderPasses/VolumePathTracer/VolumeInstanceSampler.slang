@@ -1086,6 +1086,113 @@ struct VolumeInstanceSampler
             }
         }
     }
+
+    /** FUSED escape transmittance + M candidate processes, ONE traversal.
+
+        evalTransmittanceRQ and sampleCandidatesRQ walk the SAME primary ray
+        through the SAME bricks back to back, paying BVH traversal and brick
+        setup twice for identical geometry. This walks it once: per brick the
+        ratio/residual tracker advances Tr AND every candidate process
+        delta-tracks its own chain. No hit is committed - transmittance needs
+        the full ray anyway - so candidate pruning degrades to the per-process
+        interval clamp, which is strictly cheaper than a second traversal.
+
+        Estimator-identical to the two-pass form: per-brick transmittance
+        factors are independent (memoryless free flights), each candidate
+        process keeps its own independent draws, and the two estimators never
+        share randomness beyond the sampler stream position. Both marginals
+        equal their standalone versions exactly.
+    */
+    [mutating] float evalEscapeAndCandidatesRQ<S : ISampleGenerator>(const Ray ray, const uint numProcesses, inout S sg, out CandidateSet cands)
+    {
+        cands = {};
+        cands.count = 0;
+        statRays++;
+
+#if USE_MERGED_TAIL
+        // Same tail dispatch as the unfused entries: far rays march the
+        // summed grid for BOTH the escape term and the candidates.
+        if (tailGate(ray))
+        {
+            statTailRays++;
+            const IntervalList tailList = gatherIntervals(ray);
+            if (tailList.count == 0) return 1.f;
+            sampleCandidatesTail(tailList, ray, numProcesses, sg, cands);
+            return evalTransmittanceTail(tailList, ray, sg);
+        }
+#endif
+
+        GridVolumeSampler gvs = {};
+
+        const uint nProc = min(numProcesses, kRisM);
+        float bestT[kRisM];
+        uint bestInst[kRisM];
+        for (uint j = 0; j < kRisM; ++j)
+        {
+            bestT[j] = FLT_MAX;
+            bestInst[j] = 0;
+        }
+
+        float Tr = 1.f;
+
+        RayDesc rd;
+        rd.Origin = ray.origin;
+        rd.TMin = ray.tMin;
+        rd.Direction = ray.dir;
+        rd.TMax = ray.tMax;
+
+        RayQuery<RAY_FLAG_NONE> q;
+        q.TraceRayInline(gBrickTlas, RAY_FLAG_NONE, 0xff, rd);
+        while (q.Proceed())
+        {
+            if (q.CandidateType() != CANDIDATE_PROCEDURAL_PRIMITIVE) continue;
+
+            const BrickTlasInstanceInfo info = gBrickTlasInstances[q.CandidateInstanceIndex()];
+            const BrickAABB bb = gBrickAABBs[info.aabbOffset + q.CandidatePrimitiveIndex()];
+            const float2 tt = intersectBrickAABB(q.CandidateObjectRayOrigin(), q.CandidateObjectRayDirection(), bb, ray.tMin, ray.tMax);
+            if (tt.x >= tt.y) continue;
+
+            statSegments++;
+            const GridVolume gridVolume = gScene.getGridVolume(info.gridVolumeIdx);
+
+            // Escape term: identical per-brick factor to evalTransmittanceRQ.
+            // Tr hitting zero stops the tracker but NOT the traversal - the
+            // candidate processes still need the remaining bricks.
+            if (Tr > 0.f)
+            {
+                if (GridVolumeSampler::kTransmittanceEstimator == TransmittanceEstimator::ResidualRatioTrackingLocalMajorant)
+                    Tr *= gvs.evalTransmittanceResidualRatioTrackingLocalDDA(gridVolume, ray.origin, ray.dir, tt, sg,
+                        selectResidualMip(gridVolume, ray.dir, tt.x));
+                else
+                    Tr *= gvs.evalTransmittanceRatioTrackingLocalDDA(gridVolume, ray.origin, ray.dir, tt, sg);
+            }
+
+            // Candidates: identical per-brick min construction to
+            // sampleCandidatesRQ, clamped per process instead of committed.
+            for (uint j = 0; j < nProc; ++j)
+            {
+                if (tt.x >= bestT[j]) continue;
+                GridVolumeSampler::DistanceSample gds;
+                if (gvs.sampleDistanceDeltaTrackingLocalDDA(gridVolume, ray.origin, ray.dir, float2(tt.x, min(tt.y, bestT[j])), sg, gds) &&
+                    gds.t < bestT[j])
+                {
+                    bestT[j] = gds.t;
+                    bestInst[j] = info.gridVolumeIdx;
+                }
+            }
+        }
+
+        for (uint j = 0; j < nProc; ++j)
+        {
+            if (bestT[j] < FLT_MAX)
+            {
+                cands.t[cands.count] = bestT[j];
+                cands.inst[cands.count] = bestInst[j];
+                cands.count++;
+            }
+        }
+        return max(Tr, 0.f);
+    }
 #endif // USE_BRICK_TLAS
 
 #if USE_MERGED_TAIL

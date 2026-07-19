@@ -44,7 +44,7 @@ def render_graph_VNA():
         # Section 5 Stage A: RIS on the primary vertex, candidates generated
         # as real collisions in ONE shared traversal.
         'useRIS': True,
-        'risCandidates': 4,
+        'risCandidates': 2,  # cut 4->2 under exact-MIS temporal reuse; converged-identical (p8_m2, -0.09%)
         'risMip': 2,
         'useSharedCandidateSweep': True,
         # Transmittance-adaptive candidate budget: nearly-transparent rays run
@@ -57,13 +57,13 @@ def render_graph_VNA():
         # Stage C: spatial reuse - prev-frame reservoirs from Gaussian-offset
         # neighbors merge through the exact Stage B shift/guard/weight.
         # Sigma 16 px matches the classic 30 px disk (ReSTIR PT Enhanced).
-        'useSpatialReuse': False,  # HELD AT GATE: -1.4% converged (constant-MIS hole; needs exact pairwise MIS)
+        'useSpatialReuse': False,  # HELD: cross-ray volume reuse needs the sigmaT_c(y')/sigmaT_i(y_i) reweight (measured -2.2%/neighbor even under exact pairwise MIS)
         'spatialNeighbors': 2,
         'spatialRadiusPx': 16.0,
         # Defensive RIS target floor (x fully-lit isotropic). Bounds the
         # L/Lhat firefly mechanism the validation matrix isolated (single
         # 800-2200x pixels at 1 spp). Unbiased at any value.
-        'risTargetFloor': 0.0,    # HELD AT GATE: -1.1% converged via reservoir feedback; same pairwise-MIS fix
+        'risTargetFloor': 0.01,   # firefly bound; CLEAN under exact pairwise MIS (+0.08%, p8_m2_floor) - the old -1.1% was the constant-MIS feedback
         # Stream compaction (ReSTIR PT Enhanced 6.2.2 / UE dense-dispatch):
         # phase A queues the ~13% of pixels that scatter, an indirect phase B
         # shades one thread per real path. Attacks the measured 87%-idle

@@ -29,3 +29,26 @@ PROBE probe2_no_floor done
 PROBE COMPLETE
 PROBE probe3_ship_final done
 PROBE COMPLETE
+PROBE probe4_perf_compact done
+PROBE probe4_perf_nocompact done
+PROBE COMPLETE
+PROBE probe5_base done
+PROBE probe5_mip3 done
+PROBE probe5_fp2 done
+PROBE probe5_both done
+PROBE COMPLETE
+PROBE p6_spatial_mis done
+PROBE p6_spatial_floor done
+PROBE p6_floor_m2 done
+PROBE COMPLETE
+PROBE p7_temp_mis done
+PROBE p7_spat1_mis done
+PROBE COMPLETE
+PROBE p8_m2 done
+PROBE p8_m2_floor done
+PROBE COMPLETE
+PROBE p9_fused done
+PROBE p9_spatial_rw done
+PROBE COMPLETE
+PROBE p10_spatial_pad done
+PROBE COMPLETE

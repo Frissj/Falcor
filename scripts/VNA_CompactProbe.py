@@ -40,7 +40,7 @@ SHIP = {
 }
 
 CONFIGS = [
-    ("probe3_ship_final", dict(SHIP, useSpatialReuse=False, risTargetFloor=0.0)),
+    ("p10_spatial_pad", dict(SHIP, risCandidates=2, logWorkStats=True, risStatsInterval=64)),
 ]
 
 def render_graph_Probe():

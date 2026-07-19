@@ -42,6 +42,9 @@ cbuffer CB
     /// Stage C spatial reuse: Gaussian sigma (in pixels) of the neighbor
     /// offsets drawn around the reprojected pixel. ReSTIR PT Enhanced found
     /// Gaussian sigma 16 matches (and slightly beats) the classic 30 px disk.
+    /// NOTE: spatial reuse currently FAILS the converged-identity gate
+    /// (best measured +0.52%..+1.0% with sigmaT reweights; -5.6% without) -
+    /// ship configs keep it OFF until the cross-ray sigmaT problem is solved.
     float gSpatialRadiusPx;
     /// Defensive floor on the RIS target, relative to a fully-lit isotropic
     /// vertex (1/4pi). Bounds the L/Lhat mismatch ratio: measured fireflies
@@ -71,6 +74,14 @@ cbuffer CB
 #ifndef USE_COMPACTION
 #define USE_COMPACTION 0
 #endif
+// Fused escape+candidate traversal. Derived, not host-fed: the two TLAS
+// RayQuery passes per pixel walked the SAME primary ray (measured 3.5
+// samplerCalls and 14.4 AABB tests per pixel), so when every prerequisite
+// is compiled in, one traversal serves both. Temporal history is required
+// because the adaptive-M budget switches to LAST frame's transmittance
+// (MegaLights-style feedback, stored in the reservoir pad) - that is what
+// breaks the Tfull -> M -> candidates dependency chain.
+#define USE_FUSED_SWEEP (USE_RIS && USE_BRICK_TLAS && USE_SHARED_CANDIDATE_SWEEP && USE_TEMPORAL_REUSE && MAX_BOUNCES > 0)
 
 /** Snapshot accessors for the sampler-internal work counters. Compile to 0
     when GRID_VOLUME_SAMPLER_STATS is off, so all bucket math folds away.
@@ -489,6 +500,7 @@ void main(uint3 dispatchThreadId: SV_DispatchThreadID)
         // so footprint-driven residual-mip selection (UE projected-error rule)
         // applies here and is reset immediately after: NEE shadow rays measure
         // distance from the vertex, not the camera, and would misuse it.
+#if !USE_FUSED_SWEEP
         volumeSampler.footprintSpread = gFootprintSpread;
         const float Tfull = volumeSampler.evalTransmittance(ray, sg);
         volumeSampler.footprintSpread = 0.f;
@@ -499,6 +511,7 @@ void main(uint3 dispatchThreadId: SV_DispatchThreadID)
         tapsT = gvsTapsNow() - tapsMark;
         cellsMark = gvsCellsNow();
         tapsMark = gvsTapsNow();
+#endif
 
         // ---- Scatter term: RIS over the primary vertex. ----
         //
@@ -544,12 +557,28 @@ void main(uint3 dispatchThreadId: SV_DispatchThreadID)
             const VolumeInstanceSampler::IntervalList primaryList = volumeSampler.gatherIntervals(ray);
 
             // ---- Candidate generation: M real delta-tracking collisions. ----
+#if USE_FUSED_SWEEP
+            // MegaLights temporal feedback: the budget comes from LAST
+            // frame's transmittance at this pixel (reservoir pad), so escape
+            // and candidates can share one traversal below. Any M in
+            // [1, kRisM] is unbiased - the reservoir weight divides by the M
+            // actually used - so a stale hint moves cost, never the mean.
+            // Cleared/invalid history (T hint 0) uses the full budget.
+            uint mUsed = VolumeInstanceSampler::kRisM;
+            if (kUseAdaptiveM && gTemporalEnable != 0)
+            {
+                const float tHint = gReservoirPrev[pixel.y * gFrameDim.x + pixel.x]._pad0;
+                if (tHint > 0.f)
+                    mUsed = clamp(uint(ceil(float(VolumeInstanceSampler::kRisM) * saturate(1.f - tHint))), 1u, VolumeInstanceSampler::kRisM);
+            }
+#else
             // Per-pixel candidate budget from the transmittance just computed
             // (see kUseAdaptiveM above). The reservoir weight divides by this
             // exact value, which is what keeps per-pixel M unbiased.
             const uint mUsed = kUseAdaptiveM
                 ? clamp(uint(ceil(float(VolumeInstanceSampler::kRisM) * saturate(1.f - Tfull))), 1u, VolumeInstanceSampler::kRisM)
                 : VolumeInstanceSampler::kRisM;
+#endif
             risMUsed = mUsed;
 
             // Primary-ray footprint applies here exactly as it did for the
@@ -559,7 +588,14 @@ void main(uint3 dispatchThreadId: SV_DispatchThreadID)
             // camera.
             volumeSampler.footprintSpread = gFootprintSpread;
             VolumeInstanceSampler::CandidateSet cands;
-#if USE_SHARED_CANDIDATE_SWEEP
+#if USE_FUSED_SWEEP
+            // ONE traversal for the escape term AND the M candidate chains
+            // (they used to walk the same primary ray twice). Estimator-
+            // identical to the two-pass form; matrix/probe gates the claim.
+            const float Tfull = volumeSampler.evalEscapeAndCandidatesRQ(ray, mUsed, sg, cands);
+            primaryT = Tfull;
+            radiance += Tfull * primaryBg;
+#elif USE_SHARED_CANDIDATE_SWEEP
             // One traversal, M processes (UE lesson: share the walk, keep the
             // chains independent). Distribution identical to the M-walk loop
             // below - VNA_RisValidate.py is the gate for that claim.
@@ -608,8 +644,14 @@ void main(uint3 dispatchThreadId: SV_DispatchThreadID)
                 }
             }
 
-            // ---- Stage B: merge last frame's reservoir (see kUseTemporalReuse). ----
-            float mTotal = float(mUsed);
+            // ---- Fresh-stage unbiased contribution weight (Stage A). ----
+            // W = (1/M sum w) / Lhat(y) over the fresh candidates only. The
+            // reuse chain below REPLACES W step by step; it never divides by
+            // a pooled confidence again (that constant-MIS normalization was
+            // the measured -1.4%/-4% darkening: sources that cannot cover the
+            // whole ray still swallowed 1/mTotal of everyone's mass).
+            float W = selW > 0.f ? wSum / (float(mUsed) * selW) : 0.f;
+            float confTotal = float(mUsed);
 #if USE_TEMPORAL_REUSE
             if (gTemporalEnable != 0)
             {
@@ -638,18 +680,18 @@ void main(uint3 dispatchThreadId: SV_DispatchThreadID)
                         const float2 prevUv = (prevClip.xy / prevClip.w) * float2(0.5f, -0.5f) + 0.5f;
                         const int2 prevPixCenter = int2(floor(prevUv * float2(gFrameDim)));
 
-                        // ---- Stage C: spatial reuse rides the SAME merge. ----
-                        // Source 0 is the temporal reprojection (Stage B,
-                        // validated converged-identical). Sources 1..K are
-                        // prev-frame reservoirs at Gaussian offsets around the
-                        // reprojected pixel. The shift, Jacobian, domain guard
-                        // and ratio-space weight below are source-agnostic:
-                        // every stored vertex was distributed along its own
-                        // ray from gPrevCamPos, so re-expressing it on THIS
-                        // ray is the same 1D map regardless of which pixel
-                        // stored it. One estimator, more sources - the
-                        // measure-space lesson holds because every w entering
-                        // the reservoir is Lhat*W*M*J, nothing else.
+                        // ---- Stage B/C reuse chain: sequential EXACT pairwise MIS. ----
+                        // Source 0 is the temporal reprojection, sources 1..K
+                        // are prev-frame reservoirs at Gaussian offsets. Each
+                        // source merges as a textbook TWO-technique GRIS step
+                        // against the current reservoir, with the balance
+                        // heuristic evaluated pointwise: m_src(y) + m_cur(y)
+                        // = 1 for the SAME y, so no mass is lost when a
+                        // source cannot cover part of the ray. Confidence
+                        // only weights the m's; it never divides the
+                        // estimate. Temporal validated at -0.09% (p7/p8).
+                        // SPATIAL sources still fail the gate (sigmaT ratio;
+                        // see the CB note) and stay OFF in ship configs.
                         const uint kMergeSources = 1 + (USE_SPATIAL_REUSE != 0 ? SPATIAL_NEIGHBORS : 0);
                         for (uint src = 0; src < kMergeSources; ++src)
                         {
@@ -674,87 +716,139 @@ void main(uint3 dispatchThreadId: SV_DispatchThreadID)
                                 continue;
 
                             const TemporalReservoir prev = gReservoirPrev[prevPix.y * gFrameDim.x + prevPix.x];
-                            // Confidence cap PER SOURCE KIND. Spatial neighbors
-                            // must NOT get the temporal cap: their shifted
-                            // vertex frequently projects off-cloud, and each
-                            // guard failure merges zero weight but FULL
-                            // confidence - at cap 20 x 2 neighbors that
-                            // deflates W enough to darken the cloud ~4%
-                            // (measured, probe vs reference). A small spatial
-                            // cap bounds that deflation the same way the
-                            // temporal cap bounds staleness: it is the knob of
-                            // the same validated approximation, not new math.
                             const float srcCap = (src == 0) ? gTemporalMCap : 2.f;
-                            const float mPrev = min(prev.M, srcCap * float(mUsed));
-                            if (mPrev > 0.f)
-                            {
-                                float wPrev = 0.f;
-                                float lhatPrev = 0.f;
-                                float tNew = 0.f;
-                                if (prev.W > 0.f)
-                                {
-                                    // t-shift: re-express the previous survivor on
-                                    // the current primary ray; Jacobian of the 1D
-                                    // domain map is dot(prevDir, newDir).
-                                    tNew = dot(prev.pos - ray.origin, ray.dir);
-                                    const float jac = dot(normalize(prev.pos - gPrevCamPos), ray.dir);
-                                    if (tNew > ray.tMin && jac > 0.f)
-                                    {
-                                        // RATIO-SPACE merge weight. Current candidates
-                                        // carry w = p-hat/p = Lhat (the pdf-cancelled
-                                        // form), and the stored W is in the SAME ratio
-                                        // space - so the history merges as
-                                        //     w_prev = Lhat(y') * W_prev * M_prev * J.
-                                        // Multiplying sigma*T back in (the first
-                                        // attempt) double-counted the factor the
-                                        // ratio form had already cancelled and crushed
-                                        // every contribution by ~1/(1+Mcap): the
-                                        // measured "very dark" image. The implicit
-                                        // (sigmaT)_new/(sigmaT)_prev shift ratio is
-                                        // EXACTLY 1 for a static camera and the
-                                        // standard shift approximation under motion.
-                                        //
-                                        // Domain guard: DETERMINISTIC coarse-mean tap
-                                        // at the shifted point - zero means the vertex
-                                        // no longer sits in cloud (camera moved), and
-                                        // a deterministic w = 0 is bias-safe.
-                                        const float3 posNew = ray.origin + tNew * ray.dir;
-                                        const uint mask = volumeSampler.coveringMask(primaryList, tNew);
-                                        float meanSigma = 0.f;
-                                        for (uint i = 0; i < primaryList.count; ++i)
-                                        {
-                                            if ((mask & (1u << i)) == 0) continue;
-                                            const GridVolume gvI = gScene.getGridVolume(primaryList.ids[i]);
-                                            Grid gridI;
-                                            gScene.getGrid(gvI.getDensityGrid(), gridI);
-                                            const float3 iposI = mul(gvI.data.invTransform, float4(posNew, 1.f)).xyz - gridI.getMinIndex();
-                                            meanSigma += volumeSampler.instanceSigmaMean(gvI, gridI, iposI);
-                                        }
-                                        if (meanSigma > 0.f)
-                                        {
-                                            lhatPrev = evalTargetLhat(prev.inst, tNew, ray, wi, haveTargetLight, targetLight, volumeSampler);
-                                            wPrev = lhatPrev * prev.W * mPrev * jac;
-                                        }
-                                    }
-                                }
+                            const float cSrc = min(prev.M, srcCap * float(mUsed));
+                            if (cSrc <= 0.f)
+                                continue;
 
-                                // Confidence merges even when the shift failed or
-                                // the history was empty: those are mPrev genuine
-                                // zero-weight candidates.
-                                mTotal += mPrev;
-                                if (wPrev > 0.f)
+                            // ---- Forward shift: source sample onto our ray. ----
+                            // The t-map is affine (t_c = const + t_i * jac), so
+                            // jac serves both directions exactly (1/jac back).
+                            float wSrc = 0.f;
+                            float lhatPrev = 0.f;
+                            float tNew = 0.f;
+                            float jac = 0.f;
+                            float3 dirSrc = float3(0.f);
+                            const float3 srcVec = prev.pos - gPrevCamPos;
+                            const float srcDist = length(srcVec);
+                            if (srcDist > 0.f)
+                            {
+                                dirSrc = srcVec / srcDist;
+                                jac = dot(dirSrc, ray.dir);
+                            }
+                            // jac floor: below it the affine map is too
+                            // oblique to be a useful bijection; the source is
+                            // treated as unable to generate here (m_src = 0
+                            // AND q_rev = 0 below - support stays consistent).
+                            const bool mapOk = jac > 0.1f;
+
+                            if (prev.W > 0.f && mapOk)
+                            {
+                                tNew = dot(prev.pos - ray.origin, ray.dir);
+                                if (tNew > ray.tMin)
                                 {
-                                    risTemporalMerged = 1;
-                                    wSum += wPrev;
-                                    if (sampleNext1D(sg) * wSum < wPrev)
+                                    // Domain guard: DETERMINISTIC coarse-mean tap
+                                    // at the shifted point - zero means the vertex
+                                    // no longer sits in cloud; the partition hands
+                                    // that mass back to the current sample instead
+                                    // of losing it.
+                                    const float3 posNew = ray.origin + tNew * ray.dir;
+                                    const uint mask = volumeSampler.coveringMask(primaryList, tNew);
+                                    float meanSigma = 0.f;
+                                    for (uint i = 0; i < primaryList.count; ++i)
                                     {
-                                        selDs.t = tNew;
-                                        selDs.instance = prev.inst;
-                                        selDs.thp = gScene.getGridVolume(prev.inst).data.albedo;
-                                        selW = lhatPrev;
+                                        if ((mask & (1u << i)) == 0) continue;
+                                        const GridVolume gvI = gScene.getGridVolume(primaryList.ids[i]);
+                                        Grid gridI;
+                                        gScene.getGrid(gvI.getDensityGrid(), gridI);
+                                        const float3 iposI = mul(gvI.data.invTransform, float4(posNew, 1.f)).xyz - gridI.getMinIndex();
+                                        meanSigma += volumeSampler.instanceSigmaMean(gvI, gridI, iposI);
+                                    }
+                                    if (meanSigma > 0.f)
+                                    {
+                                        lhatPrev = evalTargetLhat(prev.inst, tNew, ray, wi, haveTargetLight, targetLight, volumeSampler);
+                                        if (lhatPrev > 0.f)
+                                        {
+                                            // Exact 2-way balance at the shifted
+                                            // point y': source density is
+                                            // c_i*qSrc/jac (its own-domain target
+                                            // mapped into ours), current density
+                                            // is confTotal*Lhat_c(y').
+                                            const Ray srcRay = Ray(gPrevCamPos, dirSrc, 0.f, FLT_MAX);
+                                            const float qSrc = evalTargetLhat(prev.inst, srcDist, srcRay, -dirSrc, haveTargetLight, targetLight, volumeSampler);
+                                            const float a = cSrc * qSrc / jac;
+                                            const float b = confTotal * lhatPrev;
+                                            const float mSrc = (a + b) > 0.f ? a / (a + b) : 0.f;
+
+                                            // sigma-T reweight for CROSS-RAY shifts:
+                                            // stored W's live in the ratio space of
+                                            // their OWN ray; a spatial shift needs
+                                            // sigmaT_c(y')/sigmaT_i(y_i) (measured
+                                            // -2.2%/neighbor when omitted). The
+                                            // denominator is the source pixel's
+                                            // write-time certificate (_pad1). Best
+                                            // measured residual so far: +0.5..1.0%
+                                            // converged - still above the gate, so
+                                            // spatial ships OFF; kept for iteration.
+                                            float shiftRatio = 1.f;
+#if USE_SPATIAL_REUSE
+                                            if (src > 0)
+                                            {
+                                                const float odC = volumeSampler.coarseOpticalDepth(Ray(ray.origin, ray.dir, 0.f, tNew));
+                                                const float num = meanSigma * exp(-odC);
+                                                const float den = prev._pad1;
+                                                shiftRatio = den > 1e-8f ? clamp(num / den, 0.f, 8.f) : 0.f;
+                                            }
+#endif
+                                            // GRIS resampling weight of the shifted
+                                            // sample in OUR domain:
+                                            //   w = m * Lhat_c(y') * W_prev * jac.
+                                            wSrc = mSrc * lhatPrev * prev.W * jac * shiftRatio;
+                                        }
                                     }
                                 }
                             }
+
+                            // ---- Our current sample, defended pairwise. ----
+                            // Same partition evaluated at OUR sample x_c: the
+                            // source's density there comes from the exact
+                            // affine inverse (reverse shift). If the source
+                            // cannot reach x_c (bad map, behind its camera,
+                            // zero target), m_cur = 1 and nothing is lost.
+                            float wCur = 0.f;
+                            if (selW > 0.f && W > 0.f)
+                            {
+                                float qRev = 0.f;
+                                if (mapOk)
+                                {
+                                    const float tSrc = (selDs.t - dot(gPrevCamPos - ray.origin, ray.dir)) / jac;
+                                    if (tSrc > 0.f)
+                                    {
+                                        const Ray srcRay = Ray(gPrevCamPos, dirSrc, 0.f, FLT_MAX);
+                                        qRev = evalTargetLhat(selDs.instance, tSrc, srcRay, -dirSrc, haveTargetLight, targetLight, volumeSampler);
+                                    }
+                                }
+                                const float aC = mapOk ? cSrc * qRev / jac : 0.f;
+                                const float bC = confTotal * selW;
+                                const float mCur = (aC + bC) > 0.f ? bC / (aC + bC) : 0.f;
+                                wCur = mCur * selW * W;
+                            }
+
+                            // ---- One streaming 2-way merge step. ----
+                            const float wTot = wCur + wSrc;
+                            if (wTot > 0.f)
+                            {
+                                if (wSrc > 0.f && sampleNext1D(sg) * wTot < wSrc)
+                                {
+                                    selDs.t = tNew;
+                                    selDs.instance = prev.inst;
+                                    selDs.thp = gScene.getGridVolume(prev.inst).data.albedo;
+                                    selW = lhatPrev;
+                                    risTemporalMerged = 1;
+                                }
+                                W = wTot / selW;
+                            }
+                            confTotal += cSrc;
                         }
                     }
                 }
@@ -772,10 +866,9 @@ void main(uint3 dispatchThreadId: SV_DispatchThreadID)
             risWSum = wSum;
             risExit = (nReal == 0) ? kRisExitNoCandidate : kRisExitZeroTarget;
 
-            // W = (1/M sum w) / Lhat(y), with M = TOTAL confidence (current
-            // budget + capped history). The universal form holds for fresh and
-            // reused survivors alike - see the Stage B header for why.
-            const float W = selW > 0.f ? wSum / (mTotal * selW) : 0.f;
+            // W already holds the final unbiased contribution weight: the
+            // fresh-stage value, refined in place by each exact pairwise
+            // merge step above. No pooled-confidence division exists anymore.
 
 #if USE_TEMPORAL_REUSE
             if (gTemporalEnable != 0)
@@ -785,10 +878,37 @@ void main(uint3 dispatchThreadId: SV_DispatchThreadID)
                 TemporalReservoir cur;
                 cur.pos = ray.origin + selDs.t * ray.dir;
                 cur.W = W;
-                cur.M = mTotal;
+                cur.M = confTotal;
                 cur.inst = selDs.instance;
-                cur._pad0 = 0.f;
+                // T hint for next frame's fused-sweep candidate budget
+                // (MegaLights temporal feedback).
+                cur._pad0 = primaryT;
+#if USE_SPATIAL_REUSE
+                // Cross-ray shift certificate: sigma-hat * T-hat of the
+                // stored sample on THIS ray, so next frame's neighbors get
+                // the reweight denominator for free.
+                float selfH = 0.f;
+                if (selW > 0.f && W > 0.f)
+                {
+                    float sigmaSelf = 0.f;
+                    for (uint gi = 0; gi < gScene.getGridVolumeCount(); ++gi)
+                    {
+                        const GridVolume gvS = gScene.getGridVolume(gi);
+                        Grid gridS;
+                        gScene.getGrid(gvS.getDensityGrid(), gridS);
+                        const float3 iposS = mul(gvS.data.invTransform, float4(cur.pos, 1.f)).xyz - gridS.getMinIndex();
+                        sigmaSelf += volumeSampler.instanceSigmaMean(gvS, gridS, iposS);
+                    }
+                    if (sigmaSelf > 0.f)
+                    {
+                        const float odSelf = volumeSampler.coarseOpticalDepth(Ray(ray.origin, ray.dir, 0.f, selDs.t));
+                        selfH = sigmaSelf * exp(-odSelf);
+                    }
+                }
+                cur._pad1 = selfH;
+#else
                 cur._pad1 = 0.f;
+#endif
                 gReservoirCurr[pixel.y * gFrameDim.x + pixel.x] = cur;
             }
 #endif
