@@ -674,7 +674,18 @@ void main(uint3 dispatchThreadId: SV_DispatchThreadID)
                                 continue;
 
                             const TemporalReservoir prev = gReservoirPrev[prevPix.y * gFrameDim.x + prevPix.x];
-                            const float mPrev = min(prev.M, gTemporalMCap * float(mUsed));
+                            // Confidence cap PER SOURCE KIND. Spatial neighbors
+                            // must NOT get the temporal cap: their shifted
+                            // vertex frequently projects off-cloud, and each
+                            // guard failure merges zero weight but FULL
+                            // confidence - at cap 20 x 2 neighbors that
+                            // deflates W enough to darken the cloud ~4%
+                            // (measured, probe vs reference). A small spatial
+                            // cap bounds that deflation the same way the
+                            // temporal cap bounds staleness: it is the knob of
+                            // the same validated approximation, not new math.
+                            const float srcCap = (src == 0) ? gTemporalMCap : 2.f;
+                            const float mPrev = min(prev.M, srcCap * float(mUsed));
                             if (mPrev > 0.f)
                             {
                                 float wPrev = 0.f;
@@ -787,21 +798,21 @@ void main(uint3 dispatchThreadId: SV_DispatchThreadID)
                 risW = W;
 #if USE_COMPACTION
                 // Phase A ends here: append the survivor and let the dense
-                // shade dispatch do the rest. ONE atomic per wave (the UE
-                // wave-coherent append), not one per thread: lanes reserve
-                // contiguous slots via prefix count.
+                // shade dispatch do the rest. Plain per-thread atomic append:
+                // the wave-aggregated form (prefix count + one atomic per
+                // wave) collapsed to one surviving entry per wave on this
+                // driver - the measured symptom was a regular grid of lit
+                // dots on a black cloud. ~266k appends/frame is noise next
+                // to the marching cost; correctness wins.
                 risExit = kRisExitContributed;
-                const uint laneSlot = WavePrefixCountBits(true);
-                uint waveBase = 0;
-                if (WaveIsFirstLane())
-                    InterlockedAdd(gScatterCount[0], WaveActiveCountBits(true), waveBase);
-                waveBase = WaveReadLaneFirst(waveBase);
+                uint slot = 0;
+                InterlockedAdd(gScatterCount[0], 1u, slot);
                 ScatterEntry entry;
                 entry.pixel = pixel.x | (pixel.y << 16);
                 entry.t = selDs.t;
                 entry.inst = selDs.instance;
                 entry.W = W;
-                gScatterQueue[waveBase + laneSlot] = entry;
+                gScatterQueue[slot] = entry;
 #else
                 const GridVolume gv = gScene.getGridVolume(selDs.instance);
                 // ds.thp carries the instance albedo, exactly as the reference

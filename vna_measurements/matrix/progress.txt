@@ -20,3 +20,12 @@ BISECT b2_ris_tlas_temporal done (256 frames)
 BISECT b3_plus_footprint done (256 frames)
 BISECT b4_plus_singlenee done (256 frames)
 BISECT COMPLETE
+PROBE probe_compact_on done
+PROBE probe_compact_off done
+PROBE COMPLETE
+PROBE probe2_ship done
+PROBE probe2_no_spatial done
+PROBE probe2_no_floor done
+PROBE COMPLETE
+PROBE probe3_ship_final done
+PROBE COMPLETE

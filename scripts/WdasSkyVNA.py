@@ -57,13 +57,13 @@ def render_graph_VNA():
         # Stage C: spatial reuse - prev-frame reservoirs from Gaussian-offset
         # neighbors merge through the exact Stage B shift/guard/weight.
         # Sigma 16 px matches the classic 30 px disk (ReSTIR PT Enhanced).
-        'useSpatialReuse': True,
+        'useSpatialReuse': False,  # HELD AT GATE: -1.4% converged (constant-MIS hole; needs exact pairwise MIS)
         'spatialNeighbors': 2,
         'spatialRadiusPx': 16.0,
         # Defensive RIS target floor (x fully-lit isotropic). Bounds the
         # L/Lhat firefly mechanism the validation matrix isolated (single
         # 800-2200x pixels at 1 spp). Unbiased at any value.
-        'risTargetFloor': 0.01,
+        'risTargetFloor': 0.0,    # HELD AT GATE: -1.1% converged via reservoir feedback; same pairwise-MIS fix
         # Stream compaction (ReSTIR PT Enhanced 6.2.2 / UE dense-dispatch):
         # phase A queues the ~13% of pixels that scatter, an indirect phase B
         # shades one thread per real path. Attacks the measured 87%-idle
