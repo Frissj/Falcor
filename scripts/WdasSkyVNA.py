@@ -50,6 +50,10 @@ def render_graph_VNA():
         # Transmittance-adaptive candidate budget: nearly-transparent rays run
         # 1 process instead of M (82-88% of fixed-M processes were escaping).
         'useAdaptiveM': True,
+        # Stage B: temporal reservoir reuse of the primary scatter vertex
+        # (t-shift + confidence-capped merge). Effective M grows over frames.
+        'useTemporalReuse': True,
+        'temporalMCap': 20.0,
         # Section 4: HW-BVH brick TLAS (UE HeterogeneousVolumes port) with
         # per-instance projected-error mip selection.
         'useBrickTlas': True,
@@ -59,6 +63,15 @@ def render_graph_VNA():
         'useMergedTail': True,
         'tailRes': 64,
         'tailGateVoxels': 32.0,
+        # Diagnostics OFF for the shipping path. Logging every frame costs a
+        # full GPU sync (submit-and-wait) per frame: measured 24 ms of GPU
+        # work stretching to a 77 ms wall frame (13 fps) from the stall
+        # alone, and work-stats additionally recompile the sampler with
+        # per-step counters. Re-enable in the UI (or here) to diagnose cost;
+        # the interval keeps any re-enabled logging to one sync per 60 frames.
+        'logWorkStats': False,
+        'logRisStats': False,
+        'risStatsInterval': 60,
     })
     g.addPass(VolumePathTracer, "VolumePathTracer")
 

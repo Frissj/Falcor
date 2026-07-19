@@ -32,6 +32,13 @@ cbuffer CB
     /// World-space pixel-footprint growth per unit distance
     /// (2*tan(fovY/2)/resY * user scale). 0 = footprint-driven residual mip off.
     float gFootprintSpread;
+    /// Stage B temporal reuse: previous frame's camera.
+    float4x4 gPrevViewProj;
+    float3 gPrevCamPos;
+    uint gTemporalEnable; ///< 0 until the host has valid history buffers + camera.
+    /// Confidence cap: prev M is clamped to this multiple of the CURRENT
+    /// candidate budget, bounding how long stale history can dominate.
+    float gTemporalMCap;
 }
 
 /** Snapshot accessors for the sampler-internal work counters. Compile to 0
@@ -104,6 +111,8 @@ RWTexture2D<float4> gRisDebug;
            tail = s[24], RayQuery/intervals = s[15] - s[24])
     [25] = sum of per-pixel candidate budgets actually used (adaptive M:
            s[25]/pixels = average M; equals kRisM when the feature is off)
+    [26] = pixels whose reservoir merged a previous-frame sample (Stage B
+           temporal reuse activity; 0 when history is invalid or disabled)
 */
 RWStructuredBuffer<uint> gRisStats;
 
@@ -163,14 +172,21 @@ static const bool kUseAdaptiveM = USE_ADAPTIVE_M;
     of UE MegaLights' temporal feedback). Last frame's surviving primary
     scatter vertex is shifted onto this frame's ray (t-shift: t' = projection
     of its world position onto the new ray; Jacobian = dot(prevDir, newDir))
-    and merged into the current reservoir with confidence-capped weight
-        w_prev = sigma(t') * T(0->t') * Lhat(t') * W_prev * M_prev * J.
-    sigma/T are evaluated with ONE stochastic tap and ONE bounded real march;
-    the SAME realization implicitly appears in the survivor's f/p-hat, so it
-    cancels exactly and the estimator keeps its universal form
-        W = wSum / (M_total * Lhat_sel).
+    and merged into the current reservoir in RATIO SPACE - the same space the
+    fresh candidates' weights live in (w = p-hat/p = Lhat, the pdf-cancelled
+    form) and the same space the stored W is expressed in:
+        w_prev = Lhat(t') * W_prev * M_prev_capped * J.
+    The implicit (sigmaT)_new/(sigmaT)_prev shift ratio is exactly 1 for a
+    static camera and is the standard shift approximation under motion.
+    (History note: multiplying sigma*T into w_prev - mixing canonical-UCW
+    units into ratio space - double-counted the cancelled factor; history
+    then never won proportionally to its confidence while M_total still grew,
+    darkening every contribution by ~1/(1+cap). Measured and fixed.)
+    The estimator keeps its universal form W = wSum / (M_total * Lhat_sel).
     Empty previous reservoirs contribute confidence only (M adds, wSum does
     not) - they are M genuine zero-weight candidates, so this stays unbiased.
+    Domain guard for shifted samples: a DETERMINISTIC coarse-mean tap (zero
+    mean = vertex left the cloud), never a stochastic test.
     MIS note: confidence weights (M-capping) approximate the generalized
     balance heuristic, the same approximation every shipped ReSTIR (including
     Volumetric ReSTIR) uses; exact pairwise MIS is the documented follow-up.
@@ -265,6 +281,32 @@ float3 evalNEE<S : ISampleGenerator>(
         return float3(0.f);
 
     return fp * lightSample.Le * Tr / lightSample.pdf;
+}
+
+/** Target weight Lhat for the RIS reservoir: cheap lighting guess at a
+    candidate primary-scatter vertex. Shared by fresh candidates and by
+    temporally reused samples so both are weighed under the SAME target.
+*/
+float evalTargetLhat(
+    const uint inst,
+    const float t,
+    const Ray ray,
+    const float3 wi,
+    const bool haveTargetLight,
+    const EnvMapSample targetLight,
+    inout VolumeInstanceSampler volumeSampler
+)
+{
+    if (!haveTargetLight) return 1.f;
+    const float gj = gScene.getGridVolume(inst).data.anisotropy;
+    const float3 fp = HenyeyGreensteinPhaseFunction(gj).eval(wi, targetLight.dir);
+    const float3 posJ = ray.origin + t * ray.dir;
+    const float tauShadow = volumeSampler.coarseOpticalDepth(Ray(posJ, targetLight.dir, 0.f, FLT_MAX));
+    // Floored: deep points are lit by multiple scattering, which this
+    // single-scatter target cannot see. Without the floor exp(-tau)
+    // underflows to 0 and the target collapses.
+    const float kTargetMinVisibility = 1e-3f;
+    return (fp.x + fp.y + fp.z) * (1.f / 3.f) * max(exp(-tauShadow), kTargetMinVisibility);
 }
 
 /** Shade one scatter vertex and set up the continuation ray.
@@ -379,6 +421,7 @@ void main(uint3 dispatchThreadId: SV_DispatchThreadID)
     uint risExit = kRisExitNoMedium;
     float risCount = 0.f;
     uint risMUsed = 0; ///< Candidate budget actually used this pixel (adaptive M diagnostics).
+    uint risTemporalMerged = 0; ///< 1 if a previous-frame sample merged into this pixel's reservoir.
     float risWSum = 0.f;
     float risW = 0.f;
 
@@ -486,11 +529,6 @@ void main(uint3 dispatchThreadId: SV_DispatchThreadID)
 #endif
             volumeSampler.footprintSpread = 0.f;
 
-            cellsCand = gvsCellsNow() - cellsMark;
-            tapsCand = gvsTapsNow() - tapsMark;
-            cellsMark = gvsCellsNow();
-            tapsMark = gvsTapsNow();
-
             // ---- Streaming reservoir over the candidates. ----
             float wSum = 0.f;
             float selW = 0.f;
@@ -502,19 +540,7 @@ void main(uint3 dispatchThreadId: SV_DispatchThreadID)
                 // Lhat: the cheap lighting guess. Any strictly positive value is
                 // unbiased (spec section 2, P1) - it only decides which real
                 // collision is kept.
-                float w = 1.f;
-                if (haveTargetLight)
-                {
-                    const float gj = gScene.getGridVolume(cands.inst[j]).data.anisotropy;
-                    const float3 fp = HenyeyGreensteinPhaseFunction(gj).eval(wi, targetLight.dir);
-                    const float3 posJ = ray.origin + cands.t[j] * ray.dir;
-                    const float tauShadow = volumeSampler.coarseOpticalDepth(Ray(posJ, targetLight.dir, 0.f, FLT_MAX));
-                    // Floored: deep points are lit by multiple scattering, which
-                    // this single-scatter target cannot see. Without the floor
-                    // exp(-tau) underflows to 0 and the target collapses.
-                    const float kTargetMinVisibility = 1e-3f;
-                    w = (fp.x + fp.y + fp.z) * (1.f / 3.f) * max(exp(-tauShadow), kTargetMinVisibility);
-                }
+                const float w = evalTargetLhat(cands.inst[j], cands.t[j], ray, wi, haveTargetLight, targetLight, volumeSampler);
 
                 wSum += w;
                 if (w > 0.f && sampleNext1D(sg) * wSum < w)
@@ -528,16 +554,148 @@ void main(uint3 dispatchThreadId: SV_DispatchThreadID)
                 }
             }
 
+            // ---- Stage B: merge last frame's reservoir (see kUseTemporalReuse). ----
+            float mTotal = float(mUsed);
+#if USE_TEMPORAL_REUSE
+            if (gTemporalEnable != 0)
+            {
+                // Fetch location: the previous pixel that saw our representative
+                // point. The choice only decides WHICH history we try to reuse -
+                // the merge weight below re-validates it - so a heuristic here
+                // can cost variance, never correctness.
+                float tRep = selDs.t;
+                if (selW <= 0.f && primaryList.count > 0)
+                {
+                    float tEnter = FLT_MAX;
+                    float tExit = 0.f;
+                    for (uint i = 0; i < primaryList.count; ++i)
+                    {
+                        tEnter = min(tEnter, primaryList.t0[i]);
+                        tExit = max(tExit, primaryList.t1[i]);
+                    }
+                    tRep = 0.5f * (tEnter + tExit);
+                }
+
+                if (tRep > 0.f)
+                {
+                    const float4 prevClip = mul(gPrevViewProj, float4(ray.origin + tRep * ray.dir, 1.f));
+                    if (prevClip.w > 0.f)
+                    {
+                        const float2 prevUv = (prevClip.xy / prevClip.w) * float2(0.5f, -0.5f) + 0.5f;
+                        const int2 prevPix = int2(floor(prevUv * float2(gFrameDim)));
+                        if (all(prevPix >= 0) && all(prevPix < int2(gFrameDim)))
+                        {
+                            const TemporalReservoir prev = gReservoirPrev[prevPix.y * gFrameDim.x + prevPix.x];
+                            const float mPrev = min(prev.M, gTemporalMCap * float(mUsed));
+                            if (mPrev > 0.f)
+                            {
+                                float wPrev = 0.f;
+                                float lhatPrev = 0.f;
+                                float tNew = 0.f;
+                                if (prev.W > 0.f)
+                                {
+                                    // t-shift: re-express the previous survivor on
+                                    // the current primary ray; Jacobian of the 1D
+                                    // domain map is dot(prevDir, newDir).
+                                    tNew = dot(prev.pos - ray.origin, ray.dir);
+                                    const float jac = dot(normalize(prev.pos - gPrevCamPos), ray.dir);
+                                    if (tNew > ray.tMin && jac > 0.f)
+                                    {
+                                        // RATIO-SPACE merge weight. Current candidates
+                                        // carry w = p-hat/p = Lhat (the pdf-cancelled
+                                        // form), and the stored W is in the SAME ratio
+                                        // space - so the history merges as
+                                        //     w_prev = Lhat(y') * W_prev * M_prev * J.
+                                        // Multiplying sigma*T back in (the first
+                                        // attempt) double-counted the factor the
+                                        // ratio form had already cancelled and crushed
+                                        // every contribution by ~1/(1+Mcap): the
+                                        // measured "very dark" image. The implicit
+                                        // (sigmaT)_new/(sigmaT)_prev shift ratio is
+                                        // EXACTLY 1 for a static camera and the
+                                        // standard shift approximation under motion.
+                                        //
+                                        // Domain guard: DETERMINISTIC coarse-mean tap
+                                        // at the shifted point - zero means the vertex
+                                        // no longer sits in cloud (camera moved), and
+                                        // a deterministic w = 0 is bias-safe.
+                                        const float3 posNew = ray.origin + tNew * ray.dir;
+                                        const uint mask = volumeSampler.coveringMask(primaryList, tNew);
+                                        float meanSigma = 0.f;
+                                        for (uint i = 0; i < primaryList.count; ++i)
+                                        {
+                                            if ((mask & (1u << i)) == 0) continue;
+                                            const GridVolume gvI = gScene.getGridVolume(primaryList.ids[i]);
+                                            Grid gridI;
+                                            gScene.getGrid(gvI.getDensityGrid(), gridI);
+                                            const float3 iposI = mul(gvI.data.invTransform, float4(posNew, 1.f)).xyz - gridI.getMinIndex();
+                                            meanSigma += volumeSampler.instanceSigmaMean(gvI, gridI, iposI);
+                                        }
+                                        if (meanSigma > 0.f)
+                                        {
+                                            lhatPrev = evalTargetLhat(prev.inst, tNew, ray, wi, haveTargetLight, targetLight, volumeSampler);
+                                            wPrev = lhatPrev * prev.W * mPrev * jac;
+                                        }
+                                    }
+                                }
+
+                                // Confidence merges even when the shift failed or
+                                // the history was empty: those are mPrev genuine
+                                // zero-weight candidates.
+                                mTotal += mPrev;
+                                if (wPrev > 0.f)
+                                {
+                                    risTemporalMerged = 1;
+                                    wSum += wPrev;
+                                    if (sampleNext1D(sg) * wSum < wPrev)
+                                    {
+                                        selDs.t = tNew;
+                                        selDs.instance = prev.inst;
+                                        selDs.thp = gScene.getGridVolume(prev.inst).data.albedo;
+                                        selW = lhatPrev;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+#endif // USE_TEMPORAL_REUSE
+
+            // candGen bucket = candidate generation + target weighting +
+            // temporal merge: everything that SELECTS the primary vertex.
+            cellsCand = gvsCellsNow() - cellsMark;
+            tapsCand = gvsTapsNow() - tapsMark;
+            cellsMark = gvsCellsNow();
+            tapsMark = gvsTapsNow();
+
             risCount = float(nReal);
             risWSum = wSum;
             risExit = (nReal == 0) ? kRisExitNoCandidate : kRisExitZeroTarget;
 
+            // W = (1/M sum w) / Lhat(y), with M = TOTAL confidence (current
+            // budget + capped history). The universal form holds for fresh and
+            // reused survivors alike - see the Stage B header for why.
+            const float W = selW > 0.f ? wSum / (mTotal * selW) : 0.f;
+
+#if USE_TEMPORAL_REUSE
+            if (gTemporalEnable != 0)
+            {
+                // Persist this pixel's merged reservoir for the next frame.
+                // Empty (W == 0) reservoirs still carry confidence.
+                TemporalReservoir cur;
+                cur.pos = ray.origin + selDs.t * ray.dir;
+                cur.W = W;
+                cur.M = mTotal;
+                cur.inst = selDs.instance;
+                cur._pad0 = 0.f;
+                cur._pad1 = 0.f;
+                gReservoirCurr[pixel.y * gFrameDim.x + pixel.x] = cur;
+            }
+#endif
+
             if (selW > 0.f)
             {
-                // W = (1/M sum w) / Lhat(y), with M = the count ACTUALLY used
-                // this pixel (adaptive or fixed). Bounded and well-conditioned:
-                // with equal weights it is exactly nReal/M, plain delta tracking.
-                const float W = wSum / (float(mUsed) * selW);
                 risW = W;
 
                 const GridVolume gv = gScene.getGridVolume(selDs.instance);
@@ -643,6 +801,9 @@ void main(uint3 dispatchThreadId: SV_DispatchThreadID)
         const uint nM = WaveActiveSum(risMUsed);
         if (WaveIsFirstLane() && nM > 0)
             InterlockedAdd(gRisStats[25], nM);
+        const uint nT = WaveActiveCountBits(risTemporalMerged != 0);
+        if (WaveIsFirstLane() && nT > 0)
+            InterlockedAdd(gRisStats[26], nT);
     }
 #endif
 

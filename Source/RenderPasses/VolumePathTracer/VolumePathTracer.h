@@ -148,6 +148,17 @@ private:
     /// the gate (mTailGateVoxels * this) tracks UI changes without a rebake.
     float mTailMinVoxWorld = 0.f;
 
+    // Stage B temporal reservoir history: ping-pong per-pixel reservoirs
+    // (32 B each) plus last frame's camera for reprojection. Cleared on
+    // resize, scene change, or (re)enabling the feature - a cleared reservoir
+    // has M = 0 and is ignored by the shader.
+    ref<Buffer> mpReservoir[2];
+    uint32_t mReservoirFrame = 0;
+    uint2 mReservoirDim = uint2(0);
+    float4x4 mPrevViewProj = float4x4::identity();
+    float3 mPrevCamPos = float3(0.f);
+    bool mPrevCamValid = false;
+
     // [LOD] log state: what the projected-error selection actually decided,
     // captured by updateBrickTlas so claims about LoD behaviour come from the
     // log, not from arithmetic.
@@ -159,6 +170,15 @@ private:
     /// unbiased (the reservoir weight divides by the M actually used).
     /// Measured motivation: 82-88% of fixed-M candidate processes escape.
     bool mUseAdaptiveM = false;
+    /// Stage B: temporal reservoir reuse of the primary scatter vertex
+    /// (t-shift + confidence-capped merge; the principled form of UE
+    /// MegaLights' temporal feedback). OFF by default: Stage A alone is the
+    /// validated baseline; VNA_RisValidate.py gates this before it is trusted.
+    bool mUseTemporalReuse = false;
+    /// Confidence cap: previous M clamped to this multiple of the current
+    /// per-pixel candidate budget. Bounds stale-history influence (variance,
+    /// not bias) and the reservoir's memory length.
+    float mTemporalMCap = 20.f;
     /// Mip of the coarse mean field used for the TARGET's shadow estimate (0..3).
     /// Candidates no longer come from this field (they are real delta-tracking
     /// collisions), so this only decides how cheap/crude the "is this candidate
@@ -174,21 +194,23 @@ private:
     // GridVolumeSampler (DDA cells + real density taps) attributed to the
     // escape term, candidate generation, and shading/NEE - the work the
     // original [WORK] line was measured to be blind to.
-    static const uint32_t kRisStatSlots = 26;
+    static const uint32_t kRisStatSlots = 27;
     ref<Buffer> mpRisStats;         ///< Device-local counters (atomics).
     ref<Buffer> mpRisStatsReadback; ///< CPU-visible copy.
-    bool mLogRisStats = true;       ///< Log the histogram while RIS is on.
-    /// Frames between log lines. 1 = every frame, which is the useful default
-    /// while the frame time is pathological: at 2 fps a 60-frame interval is
-    /// one line every 30 seconds. The readback costs a GPU sync per logged
-    /// frame - irrelevant next to a 500 ms frame, so raise this only once the
-    /// renderer is fast again.
-    uint32_t mRisStatsInterval = 1;
+    bool mLogRisStats = false;      ///< Log the histogram while RIS is on.
+    /// Frames between log lines. The readback costs a full GPU sync
+    /// (submit-and-wait) per logged frame: at interval 1 the GPU never has a
+    /// second frame in flight, and a ~24 ms pass was measured to become a
+    /// ~77 ms wall-clock frame (13 fps) from the stall alone. The interval-1
+    /// era was only defensible when the frame itself was ~500 ms.
+    uint32_t mRisStatsInterval = 60;
 
     /// Work profiling: real GPU milliseconds for this pass plus the operation
-    /// counts that time is spent on. On by default - a renderer whose cost is
-    /// unexplained is not one you can optimise.
-    bool mLogWorkStats = true;
+    /// counts that time is spent on. Off by default for the shipping path:
+    /// enabling it recompiles the sampler with per-step counters AND turns on
+    /// the throttled readback sync above. Flip it (UI or script) to explain
+    /// cost; leave it off to measure shipping fps.
+    bool mLogWorkStats = false;
     ref<GpuTimer> mpGpuTimer;
     double mLastGpuMs = 0.0;
 

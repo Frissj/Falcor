@@ -58,11 +58,16 @@ const char kFootprintMip[] = "footprintMip";
 const char kFootprintScale[] = "footprintScale";
 const char kUseSingleNeePerPath[] = "useSingleNeePerPath";
 const char kUseAdaptiveM[] = "useAdaptiveM";
+const char kUseTemporalReuse[] = "useTemporalReuse";
+const char kTemporalMCap[] = "temporalMCap";
 const char kUseBrickTlas[] = "useBrickTlas";
 const char kMipPixelThreshold[] = "mipPixelThreshold";
 const char kUseMergedTail[] = "useMergedTail";
 const char kTailRes[] = "tailRes";
 const char kTailGateVoxels[] = "tailGateVoxels";
+const char kLogWorkStats[] = "logWorkStats";
+const char kLogRisStats[] = "logRisStats";
+const char kRisStatsInterval[] = "risStatsInterval";
 } // namespace
 
 VolumePathTracer::VolumePathTracer(ref<Device> pDevice, const Properties& props) : RenderPass(pDevice)
@@ -105,6 +110,10 @@ void VolumePathTracer::parseProperties(const Properties& props)
             mUseSingleNeePerPath = value;
         else if (key == kUseAdaptiveM)
             mUseAdaptiveM = value;
+        else if (key == kUseTemporalReuse)
+            mUseTemporalReuse = value;
+        else if (key == kTemporalMCap)
+            mTemporalMCap = value;
         else if (key == kUseBrickTlas)
             mUseBrickTlas = value;
         else if (key == kMipPixelThreshold)
@@ -115,6 +124,12 @@ void VolumePathTracer::parseProperties(const Properties& props)
             mTailRes = value;
         else if (key == kTailGateVoxels)
             mTailGateVoxels = value;
+        else if (key == kLogWorkStats)
+            mLogWorkStats = value;
+        else if (key == kLogRisStats)
+            mLogRisStats = value;
+        else if (key == kRisStatsInterval)
+            mRisStatsInterval = std::max(1u, (uint32_t)value);
         else
             logWarning("Unknown property '{}' in VolumePathTracer properties.", key);
     }
@@ -137,11 +152,16 @@ Properties VolumePathTracer::getProperties() const
     props[kFootprintScale] = mFootprintScale;
     props[kUseSingleNeePerPath] = mUseSingleNeePerPath;
     props[kUseAdaptiveM] = mUseAdaptiveM;
+    props[kUseTemporalReuse] = mUseTemporalReuse;
+    props[kTemporalMCap] = mTemporalMCap;
     props[kUseBrickTlas] = mUseBrickTlas;
     props[kMipPixelThreshold] = mMipPixelThreshold;
     props[kUseMergedTail] = mUseMergedTail;
     props[kTailRes] = mTailRes;
     props[kTailGateVoxels] = mTailGateVoxels;
+    props[kLogWorkStats] = mLogWorkStats;
+    props[kLogRisStats] = mLogRisStats;
+    props[kRisStatsInterval] = mRisStatsInterval;
     return props;
 }
 
@@ -756,6 +776,7 @@ void VolumePathTracer::prepareProgram(RenderContext* pRenderContext)
     defines.add("USE_ENV_LIGHT", mpEnvMapSampler ? "1" : "0");
     defines.add("USE_RIS", mUseRIS ? "1" : "0");
     defines.add("USE_ADAPTIVE_M", (mUseRIS && mUseAdaptiveM) ? "1" : "0");
+    defines.add("USE_TEMPORAL_REUSE", (mUseRIS && mUseTemporalReuse) ? "1" : "0");
     defines.add("USE_RIS_STATS", (mUseRIS && mLogRisStats) ? "1" : "0");
     defines.add("USE_WORK_STATS", mLogWorkStats ? "1" : "0");
     // Enables GridVolumeSampler's internal cell/tap counters - the marching
@@ -891,6 +912,36 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
         }
     }
 
+    // Stage B temporal reservoir history: (re)create + clear on resize or
+    // first use, ping-pong the bindings, and feed last frame's camera.
+    // Buffers are bound whenever the DEFINE is active (the shader statically
+    // references them); gTemporalEnable additionally gates actual use.
+    const bool temporalCompiled = mUseRIS && mUseTemporalReuse;
+    const bool temporalActive = temporalCompiled && mMaxBounces > 0;
+    if (temporalCompiled)
+    {
+        const uint32_t pixelCount = targetDim.x * targetDim.y;
+        if (!mpReservoir[0] || any(mReservoirDim != targetDim))
+        {
+            for (uint32_t i = 0; i < 2; ++i)
+            {
+                mpReservoir[i] = mpDevice->createStructuredBuffer(
+                    32, pixelCount, ResourceBindFlags::UnorderedAccess | ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal
+                );
+                mpReservoir[i]->setName(i == 0 ? "VolumePathTracer::mpReservoir0" : "VolumePathTracer::mpReservoir1");
+                pRenderContext->clearUAV(mpReservoir[i]->getUAV().get(), uint4(0));
+            }
+            mReservoirDim = targetDim;
+            mPrevCamValid = false; // History cleared: do not reproject into it.
+        }
+        var["gReservoirPrev"] = mpReservoir[mReservoirFrame & 1];
+        var["gReservoirCurr"] = mpReservoir[(mReservoirFrame + 1) & 1];
+    }
+    var["CB"]["gPrevViewProj"] = mPrevViewProj;
+    var["CB"]["gPrevCamPos"] = mPrevCamPos;
+    var["CB"]["gTemporalEnable"] = (temporalActive && mPrevCamValid) ? 1u : 0u;
+    var["CB"]["gTemporalMCap"] = mTemporalMCap;
+
     // Merged coarse tail: bind the baked summed-field grid + its constants.
     if (mUseMergedTail && mpTailTex)
     {
@@ -905,7 +956,11 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
     for (auto channel : kOutputChannels)
         var[channel.texname] = renderData.getTexture(channel.name);
 
-    var["gRisStats"] = mpRisStats;
+    // With both stat defines off the shader never references gRisStats and
+    // reflection may strip it, so bind through findMember instead of the
+    // throwing operator[].
+    if (auto statsVar = var.findMember("gRisStats"); statsVar.isValid())
+        statsVar = mpRisStats;
 
     // Log the RIS branch histogram every mRisStatsInterval frames. The readback
     // needs a full GPU sync, so it is throttled rather than run every frame.
@@ -944,10 +999,10 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
             {
                 logInfo(
                     "[RIS] frame {} pixels {} inMedium {} | noMedium {} noCand {} zeroTarget {} zeroDensity {} "
-                    "zeroTrans {} terminated {} contributed {} | avgCandidates {:.2f} avgM {:.2f}",
+                    "zeroTrans {} terminated {} contributed {} | avgCandidates {:.2f} avgM {:.2f} temporalMerged {}",
                     mFrameCount, pixels, inMedium,
                     s[0], s[1], s[2], s[3], s[4], s[5], s[6],
-                    avgCand, pixels > 0 ? double(s[25]) / pixels : 0.0
+                    avgCand, pixels > 0 ? double(s[25]) / pixels : 0.0, s[26]
                 );
             }
 
@@ -1012,6 +1067,16 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
         }
     }
 
+    // Cache this frame's camera for next frame's reprojection, and flip the
+    // reservoir ping-pong AFTER the dispatch consumed the bindings.
+    if (mpScene->getCamera())
+    {
+        mPrevViewProj = mpScene->getCamera()->getViewProjMatrixNoJitter();
+        mPrevCamPos = mpScene->getCamera()->getPosition();
+        mPrevCamValid = true;
+    }
+    mReservoirFrame++;
+
     mFrameCount++;
 }
 
@@ -1044,7 +1109,7 @@ void VolumePathTracer::renderUI(Gui::Widgets& widget)
     widget.tooltip("Writes a [WORK] line: real GPU ms for this pass plus the per-pixel operation\ncounts that time is spent on. Costs a GPU sync on logged frames only.", true);
     // Governs BOTH the [WORK] and [RIS] lines, so it lives outside the RIS group.
     widget.var("Log interval (frames)", mRisStatsInterval, 1u, 600u);
-    widget.tooltip("1 = every frame (the default while frame times are pathological).\nRaise it once the renderer is fast again.", true);
+    widget.tooltip("Frames between log lines. Each logged frame costs a full GPU sync:\nat interval 1 the stall alone was measured to turn a 24 ms pass into a\n77 ms frame. Keep this high unless single-frame counters are needed.", true);
     if (mLogWorkStats)
         widget.text("Last GPU ms: " + std::to_string(mLastGpuMs));
 
@@ -1077,6 +1142,20 @@ void VolumePathTracer::renderUI(Gui::Widgets& widget)
                 "to M independent walks; toggle OFF to A/B cost and convergence.",
                 true
             );
+            rebuild |= group.checkbox("Temporal reuse (Stage B)", mUseTemporalReuse);
+            group.tooltip(
+                "Merge last frame's surviving scatter vertex into this frame's\n"
+                "reservoir (t-shift + confidence-capped weight, re-validated with a\n"
+                "real density tap and bounded transmittance march). Effective M\n"
+                "grows over frames for the cost of ~one extra bounded march.\n"
+                "Gate: converged image must match Stage A exactly.",
+                true
+            );
+            if (mUseTemporalReuse)
+            {
+                group.var("Temporal M cap (x budget)", mTemporalMCap, 1.f, 100.f);
+                group.tooltip("History confidence cap as a multiple of the current per-pixel\ncandidate budget. Longer memory = smoother but slower reaction.", true);
+            }
             rebuild |= group.var("Coarse mip", mRisMip, 0u, 3u);
             group.tooltip("Mean-pyramid mip for the target's shadow walks.\nCoarser = cheaper, cruder 'is this candidate lit' guess.", true);
             rebuild |= group.checkbox("Log branch histogram", mLogRisStats);
