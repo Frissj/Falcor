@@ -147,7 +147,18 @@ namespace Mogwai
         renderer.def(kResizeFrameBuffer.c_str(), resizeFrameBuffer);
         renderer.def("resizeSwapChain", resizeFrameBuffer); // PYTHONDEPRECATED
 
-        auto renderFrame = [](Renderer* pRenderer) { pRenderer->getProgressBar().close(); pRenderer->renderFrame(); };
+        auto renderFrame = [](Renderer* pRenderer)
+        {
+            pRenderer->getProgressBar().close();
+            // Scripts loop renderFrame() thousands of times without returning
+            // to Window::msgLoop(), so nothing pumps OS messages and Windows
+            // flags the app as hung (AppHangB1) - inviting the user to kill a
+            // healthy overnight run. Pump events here; glfwPollEvents only
+            // dispatches input/resize callbacks, never a re-entrant render.
+            if (auto* pWindow = pRenderer->getWindow())
+                pWindow->pollForEvents();
+            pRenderer->renderFrame();
+        };
         renderer.def(kRenderFrame.c_str(), renderFrame);
 
         renderer.def_property_readonly(kScene.c_str(), &Renderer::getScene);

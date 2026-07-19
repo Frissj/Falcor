@@ -179,6 +179,22 @@ private:
     /// per-pixel candidate budget. Bounds stale-history influence (variance,
     /// not bias) and the reservoir's memory length.
     float mTemporalMCap = 20.f;
+    /// Stage C: spatial reuse of prev-frame reservoirs at Gaussian offsets
+    /// around the reprojected pixel. Same ratio-space merge, shift, Jacobian
+    /// and deterministic domain guard as Stage B - one estimator, more
+    /// sources. Requires temporal reuse (it reads the same history buffer).
+    /// OFF by default: the matrix (VNA_Matrix.py config 13) gates it.
+    bool mUseSpatialReuse = false;
+    /// Spatial neighbors per pixel (compile-time loop bound).
+    uint32_t mSpatialNeighbors = 2u;
+    /// Gaussian sigma of the neighbor offsets, in pixels (live, no rebuild).
+    float mSpatialRadiusPx = 16.f;
+    /// Defensive RIS target floor, relative to a fully-lit isotropic vertex
+    /// (1/4pi). Bounds the L/Lhat firefly mechanism measured in the matrix
+    /// (isolated 800-2200x pixels at 1 spp). Unbiased for any value, but it
+    /// IS an estimator change, so the conservative default is 0 (raw target);
+    /// the everything-on shortcut sets 0.01 explicitly per house policy.
+    float mRisTargetFloor = 0.f;
     /// Mip of the coarse mean field used for the TARGET's shadow estimate (0..3).
     /// Candidates no longer come from this field (they are real delta-tracking
     /// collisions), so this only decides how cheap/crude the "is this candidate

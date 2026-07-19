@@ -68,6 +68,10 @@ const char kTailGateVoxels[] = "tailGateVoxels";
 const char kLogWorkStats[] = "logWorkStats";
 const char kLogRisStats[] = "logRisStats";
 const char kRisStatsInterval[] = "risStatsInterval";
+const char kUseSpatialReuse[] = "useSpatialReuse";
+const char kSpatialNeighbors[] = "spatialNeighbors";
+const char kSpatialRadiusPx[] = "spatialRadiusPx";
+const char kRisTargetFloor[] = "risTargetFloor";
 } // namespace
 
 VolumePathTracer::VolumePathTracer(ref<Device> pDevice, const Properties& props) : RenderPass(pDevice)
@@ -130,6 +134,14 @@ void VolumePathTracer::parseProperties(const Properties& props)
             mLogRisStats = value;
         else if (key == kRisStatsInterval)
             mRisStatsInterval = std::max(1u, (uint32_t)value);
+        else if (key == kUseSpatialReuse)
+            mUseSpatialReuse = value;
+        else if (key == kSpatialNeighbors)
+            mSpatialNeighbors = std::clamp((uint32_t)value, 1u, 8u);
+        else if (key == kSpatialRadiusPx)
+            mSpatialRadiusPx = value;
+        else if (key == kRisTargetFloor)
+            mRisTargetFloor = value;
         else
             logWarning("Unknown property '{}' in VolumePathTracer properties.", key);
     }
@@ -162,6 +174,10 @@ Properties VolumePathTracer::getProperties() const
     props[kLogWorkStats] = mLogWorkStats;
     props[kLogRisStats] = mLogRisStats;
     props[kRisStatsInterval] = mRisStatsInterval;
+    props[kUseSpatialReuse] = mUseSpatialReuse;
+    props[kSpatialNeighbors] = mSpatialNeighbors;
+    props[kSpatialRadiusPx] = mSpatialRadiusPx;
+    props[kRisTargetFloor] = mRisTargetFloor;
     return props;
 }
 
@@ -777,6 +793,9 @@ void VolumePathTracer::prepareProgram(RenderContext* pRenderContext)
     defines.add("USE_RIS", mUseRIS ? "1" : "0");
     defines.add("USE_ADAPTIVE_M", (mUseRIS && mUseAdaptiveM) ? "1" : "0");
     defines.add("USE_TEMPORAL_REUSE", (mUseRIS && mUseTemporalReuse) ? "1" : "0");
+    // Stage C rides the Stage B history buffer, so it requires temporal on.
+    defines.add("USE_SPATIAL_REUSE", (mUseRIS && mUseTemporalReuse && mUseSpatialReuse) ? "1" : "0");
+    defines.add("SPATIAL_NEIGHBORS", std::to_string(mSpatialNeighbors));
     defines.add("USE_RIS_STATS", (mUseRIS && mLogRisStats) ? "1" : "0");
     defines.add("USE_WORK_STATS", mLogWorkStats ? "1" : "0");
     // Enables GridVolumeSampler's internal cell/tap counters - the marching
@@ -941,6 +960,8 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
     var["CB"]["gPrevCamPos"] = mPrevCamPos;
     var["CB"]["gTemporalEnable"] = (temporalActive && mPrevCamValid) ? 1u : 0u;
     var["CB"]["gTemporalMCap"] = mTemporalMCap;
+    var["CB"]["gSpatialRadiusPx"] = mSpatialRadiusPx;
+    var["CB"]["gRisTargetFloor"] = mRisTargetFloor;
 
     // Merged coarse tail: bind the baked summed-field grid + its constants.
     if (mUseMergedTail && mpTailTex)
@@ -1155,7 +1176,28 @@ void VolumePathTracer::renderUI(Gui::Widgets& widget)
             {
                 group.var("Temporal M cap (x budget)", mTemporalMCap, 1.f, 100.f);
                 group.tooltip("History confidence cap as a multiple of the current per-pixel\ncandidate budget. Longer memory = smoother but slower reaction.", true);
+                rebuild |= group.checkbox("Spatial reuse (Stage C)", mUseSpatialReuse);
+                group.tooltip(
+                    "Merge prev-frame reservoirs from Gaussian-offset NEIGHBOR pixels\n"
+                    "through the exact Stage B shift/guard/weight. Effective M grows\n"
+                    "spatially AND temporally; fresh candidate work can then shrink.\n"
+                    "Gate: converged image must match Stage A exactly (matrix config 13).",
+                    true
+                );
+                if (mUseSpatialReuse)
+                {
+                    rebuild |= group.var("Spatial neighbors", mSpatialNeighbors, 1u, 8u);
+                    group.var("Spatial sigma (px)", mSpatialRadiusPx, 1.f, 64.f);
+                    group.tooltip("Gaussian sigma of the neighbor offsets. ~16 px matches the\nclassic 30 px uniform disk (ReSTIR PT Enhanced, Fig. 7).", true);
+                }
             }
+            group.var("Target floor (x isotropic)", mRisTargetFloor, 0.f, 1.f);
+            group.tooltip(
+                "Defensive floor on the RIS target, relative to a fully-lit isotropic\n"
+                "vertex. Bounds the L/Lhat firefly mechanism (matrix: isolated 800-2200x\n"
+                "pixels at 1 spp). Unbiased for any value; 0 = raw target.",
+                true
+            );
             rebuild |= group.var("Coarse mip", mRisMip, 0u, 3u);
             group.tooltip("Mean-pyramid mip for the target's shadow walks.\nCoarser = cheaper, cruder 'is this candidate lit' guess.", true);
             rebuild |= group.checkbox("Log branch histogram", mLogRisStats);

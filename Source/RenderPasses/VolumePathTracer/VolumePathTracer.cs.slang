@@ -39,7 +39,26 @@ cbuffer CB
     /// Confidence cap: prev M is clamped to this multiple of the CURRENT
     /// candidate budget, bounding how long stale history can dominate.
     float gTemporalMCap;
+    /// Stage C spatial reuse: Gaussian sigma (in pixels) of the neighbor
+    /// offsets drawn around the reprojected pixel. ReSTIR PT Enhanced found
+    /// Gaussian sigma 16 matches (and slightly beats) the classic 30 px disk.
+    float gSpatialRadiusPx;
+    /// Defensive floor on the RIS target, relative to a fully-lit isotropic
+    /// vertex (1/4pi). Bounds the L/Lhat mismatch ratio: measured fireflies
+    /// (single pixels at 800-2200x the mean) are candidates whose coarse
+    /// target said "dark" (backscatter phase x floored visibility ~ 1e-6)
+    /// while the survivor's real NEE found light. Any strictly positive
+    /// target is unbiased, so flooring trades a little selection quality in
+    /// dark regions for a bounded weight spread.
+    float gRisTargetFloor;
 }
+
+#ifndef USE_SPATIAL_REUSE
+#define USE_SPATIAL_REUSE 0
+#endif
+#ifndef SPATIAL_NEIGHBORS
+#define SPATIAL_NEIGHBORS 0
+#endif
 
 /** Snapshot accessors for the sampler-internal work counters. Compile to 0
     when GRID_VOLUME_SAMPLER_STATS is off, so all bucket math folds away.
@@ -306,7 +325,14 @@ float evalTargetLhat(
     // single-scatter target cannot see. Without the floor exp(-tau)
     // underflows to 0 and the target collapses.
     const float kTargetMinVisibility = 1e-3f;
-    return (fp.x + fp.y + fp.z) * (1.f / 3.f) * max(exp(-tauShadow), kTargetMinVisibility);
+    const float lhat = (fp.x + fp.y + fp.z) * (1.f / 3.f) * max(exp(-tauShadow), kTargetMinVisibility);
+    // Defensive mixture floor (see gRisTargetFloor): the visibility floor
+    // above bounds the SHADOW side, but the PHASE side can still push Lhat
+    // to ~1e-6 on backscatter vertices. W divides by Lhat(selected) and the
+    // shading multiplies by L/Lhat, so an underestimated target is the one
+    // mechanism that produces unbounded weights. Floor relative to the
+    // fully-lit isotropic value 1/(4pi).
+    return max(lhat, gRisTargetFloor * M_1_4PI);
 }
 
 /** Shade one scatter vertex and set up the continuation ray.
@@ -582,9 +608,43 @@ void main(uint3 dispatchThreadId: SV_DispatchThreadID)
                     if (prevClip.w > 0.f)
                     {
                         const float2 prevUv = (prevClip.xy / prevClip.w) * float2(0.5f, -0.5f) + 0.5f;
-                        const int2 prevPix = int2(floor(prevUv * float2(gFrameDim)));
-                        if (all(prevPix >= 0) && all(prevPix < int2(gFrameDim)))
+                        const int2 prevPixCenter = int2(floor(prevUv * float2(gFrameDim)));
+
+                        // ---- Stage C: spatial reuse rides the SAME merge. ----
+                        // Source 0 is the temporal reprojection (Stage B,
+                        // validated converged-identical). Sources 1..K are
+                        // prev-frame reservoirs at Gaussian offsets around the
+                        // reprojected pixel. The shift, Jacobian, domain guard
+                        // and ratio-space weight below are source-agnostic:
+                        // every stored vertex was distributed along its own
+                        // ray from gPrevCamPos, so re-expressing it on THIS
+                        // ray is the same 1D map regardless of which pixel
+                        // stored it. One estimator, more sources - the
+                        // measure-space lesson holds because every w entering
+                        // the reservoir is Lhat*W*M*J, nothing else.
+                        const uint kMergeSources = 1 + (USE_SPATIAL_REUSE != 0 ? SPATIAL_NEIGHBORS : 0);
+                        for (uint src = 0; src < kMergeSources; ++src)
                         {
+                            int2 prevPix = prevPixCenter;
+#if USE_SPATIAL_REUSE
+                            if (src > 0)
+                            {
+                                // Gaussian offset via Box-Muller: matches the
+                                // ReSTIR-PT-Enhanced finding that a Gaussian
+                                // (sigma ~16 px) selects more compatible
+                                // neighbors than a uniform disk.
+                                const float2 u = sampleNext2D(sg);
+                                const float rad = gSpatialRadiusPx * sqrt(-2.f * log(max(u.x, 1e-6f)));
+                                const float ang = M_2PI * u.y;
+                                prevPix += int2(round(float2(rad * cos(ang), rad * sin(ang))));
+                            }
+#endif
+                            // Off-screen source: skip entirely. A pixel that
+                            // does not exist is NOT a zero-weight candidate,
+                            // so it must not add confidence either.
+                            if (any(prevPix < 0) || any(prevPix >= int2(gFrameDim)))
+                                continue;
+
                             const TemporalReservoir prev = gReservoirPrev[prevPix.y * gFrameDim.x + prevPix.x];
                             const float mPrev = min(prev.M, gTemporalMCap * float(mUsed));
                             if (mPrev > 0.f)

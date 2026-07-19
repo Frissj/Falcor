@@ -54,6 +54,16 @@ def render_graph_VNA():
         # (t-shift + confidence-capped merge). Effective M grows over frames.
         'useTemporalReuse': True,
         'temporalMCap': 20.0,
+        # Stage C: spatial reuse - prev-frame reservoirs from Gaussian-offset
+        # neighbors merge through the exact Stage B shift/guard/weight.
+        # Sigma 16 px matches the classic 30 px disk (ReSTIR PT Enhanced).
+        'useSpatialReuse': True,
+        'spatialNeighbors': 2,
+        'spatialRadiusPx': 16.0,
+        # Defensive RIS target floor (x fully-lit isotropic). Bounds the
+        # L/Lhat firefly mechanism the validation matrix isolated (single
+        # 800-2200x pixels at 1 spp). Unbiased at any value.
+        'risTargetFloor': 0.01,
         # Section 4: HW-BVH brick TLAS (UE HeterogeneousVolumes port) with
         # per-instance projected-error mip selection.
         'useBrickTlas': True,
