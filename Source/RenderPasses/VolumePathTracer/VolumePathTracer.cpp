@@ -56,6 +56,7 @@ const char kRisMip[] = "risMip";
 const char kUseSharedCandidateSweep[] = "useSharedCandidateSweep";
 const char kFootprintMip[] = "footprintMip";
 const char kFootprintScale[] = "footprintScale";
+const char kUseSingleNeePerPath[] = "useSingleNeePerPath";
 const char kUseBrickTlas[] = "useBrickTlas";
 const char kMipPixelThreshold[] = "mipPixelThreshold";
 const char kUseMergedTail[] = "useMergedTail";
@@ -99,6 +100,8 @@ void VolumePathTracer::parseProperties(const Properties& props)
             mFootprintMip = value;
         else if (key == kFootprintScale)
             mFootprintScale = value;
+        else if (key == kUseSingleNeePerPath)
+            mUseSingleNeePerPath = value;
         else if (key == kUseBrickTlas)
             mUseBrickTlas = value;
         else if (key == kMipPixelThreshold)
@@ -129,6 +132,7 @@ Properties VolumePathTracer::getProperties() const
     props[kUseSharedCandidateSweep] = mUseSharedCandidateSweep;
     props[kFootprintMip] = mFootprintMip;
     props[kFootprintScale] = mFootprintScale;
+    props[kUseSingleNeePerPath] = mUseSingleNeePerPath;
     props[kUseBrickTlas] = mUseBrickTlas;
     props[kMipPixelThreshold] = mMipPixelThreshold;
     props[kUseMergedTail] = mUseMergedTail;
@@ -735,6 +739,7 @@ void VolumePathTracer::prepareProgram(RenderContext* pRenderContext)
     defines.add(mpVolumeSampler->getDefines());
     defines.add("MAX_BOUNCES", std::to_string(mMaxBounces));
     defines.add("USE_NEE", mUseNEE ? "1" : "0");
+    defines.add("USE_SINGLE_NEE", mUseSingleNeePerPath ? "1" : "0");
     defines.add("USE_RUSSIAN_ROULETTE", mUseRussianRoulette ? "1" : "0");
     defines.add("USE_ENV_LIGHT", mpEnvMapSampler ? "1" : "0");
     defines.add("USE_RIS", mUseRIS ? "1" : "0");
@@ -987,6 +992,19 @@ void VolumePathTracer::renderUI(Gui::Widgets& widget)
 
     rebuild |= widget.checkbox("Use NEE", mUseNEE);
     widget.tooltip("Next-event estimation to the environment map.", true);
+
+    if (mUseNEE)
+    {
+        rebuild |= widget.checkbox("Single NEE per path (MegaLights budget)", mUseSingleNeePerPath);
+        widget.tooltip(
+            "ONE reservoir-picked vertex does NEE per path - one shadow ray per\n"
+            "pixel instead of one per vertex - weighted by vertex count.\n"
+            "Unbiased (converged image must match per-vertex NEE exactly);\n"
+            "trades the dominant [COST] bucket for noise that temporal\n"
+            "accumulation absorbs. The MegaLights fixed-budget shape.",
+            true
+        );
+    }
 
     rebuild |= widget.checkbox("Use Russian roulette", mUseRussianRoulette);
 

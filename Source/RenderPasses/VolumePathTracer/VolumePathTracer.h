@@ -65,6 +65,12 @@ private:
     uint32_t mMaxBounces = 64u;    ///< Cloud multiple scattering needs many bounces; this is a reference renderer.
     bool mUseNEE = true;           ///< Next-event estimation to the environment.
     bool mUseRussianRoulette = true;
+    /// UE MegaLights lesson: ONE reservoir-picked vertex does NEE per path
+    /// (one shadow ray per pixel), weighted by vertex count - unbiased, fixed
+    /// budget. OFF by default: per-vertex NEE is the reference estimator, and
+    /// [COST] measured it as the dominant bucket (shadeNEE ~43 cells/30 taps
+    /// per pixel), which is exactly what this trades against variance.
+    bool mUseSingleNeePerPath = false;
 
     // VNA section 5, Stage A (RIS on the primary scatter vertex).
     // OFF by default: the plain path is the reference ground truth.

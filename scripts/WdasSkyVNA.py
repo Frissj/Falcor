@@ -2,12 +2,19 @@
 # together, on the nine-instance sky:
 #
 #   section 3   cloudlet instancing            (scene: 9 instances, 1 grid)
-#   section 4   segment/overlap traversal      (VolumeInstanceSampler)
+#   section 3   merged coarse tail             (far rays march ONE summed grid)
+#   section 4   HW-BVH brick TLAS              (RayQuery over per-brick AABBs,
+#                                               per-instance projected-error mip)
 #   section 2   residual ratio tracking        (analytic T_c over the mean pyramid)
-#   section 5   Stage-A RIS primary scatter    (coarse candidates -> exact shade)
+#   section 2/5 footprint-driven residual mip  (UE projected-error rule)
+#   section 5   Stage-A RIS primary scatter    (M real collisions, shared sweep)
+#   section 9   MegaLights NEE budget          (one shadow ray per path)
 #   section 6   demodulated reconstruction     (accum(Lin) + accum(T) * bg)
 #
 #   Mogwai.exe --script scripts/WdasSkyVNA.py
+#
+# EVERY feature is set EXPLICITLY here - never rely on C++ defaults, so this
+# launcher stays "everything on" even if a default changes.
 #
 # The reference shortcuts stay untouched on purpose: THIS graph is the fast
 # path, THOSE are the ground truth it must match. If this image ever looks
@@ -23,13 +30,32 @@ def render_graph_VNA():
     VolumePathTracer = createPass("VolumePathTracer", {
         'maxBounces': 64,
         'useNEE': True,
+        # UE MegaLights lesson: one reservoir-picked vertex does NEE per path
+        # (one shadow ray/pixel instead of one per bounce). Unbiased; attacks
+        # the measured-dominant shadeNEE bucket.
+        'useSingleNeePerPath': True,
         # Section 2/P2: analytic control-variate transmittance.
         'transmittanceEstimator': 'ResidualRatioTrackingLocalMajorant',
         'residualMip': 0,
-        # Section 5 Stage A: RIS on the primary vertex.
+        # UE projected-error rule: per instance+segment, coarsest mean/range
+        # mip whose cell stays under the pixel footprint. Unbiased at any mip.
+        'footprintMip': True,
+        'footprintScale': 1.0,
+        # Section 5 Stage A: RIS on the primary vertex, candidates generated
+        # as real collisions in ONE shared traversal.
         'useRIS': True,
         'risCandidates': 4,
         'risMip': 2,
+        'useSharedCandidateSweep': True,
+        # Section 4: HW-BVH brick TLAS (UE HeterogeneousVolumes port) with
+        # per-instance projected-error mip selection.
+        'useBrickTlas': True,
+        'mipPixelThreshold': 1.0,
+        # Section 3: merged coarse tail (UE Nanite Assemblies lesson) - far
+        # rays march one world-space summed grid.
+        'useMergedTail': True,
+        'tailRes': 64,
+        'tailGateVoxels': 32.0,
     })
     g.addPass(VolumePathTracer, "VolumePathTracer")
 

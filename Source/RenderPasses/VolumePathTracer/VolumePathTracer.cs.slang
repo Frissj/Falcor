@@ -127,6 +127,31 @@ static const bool kUseNEE = USE_NEE;
 static const bool kUseRussianRoulette = USE_RUSSIAN_ROULETTE;
 static const bool kUseEnvLight = USE_ENV_LIGHT;
 
+/** UE MegaLights lesson (spec section 9: "a fixed per-pixel ray budget is the
+    shippable shape"): instead of one NEE shadow ray at EVERY path vertex -
+    measured as the dominant [COST] bucket (shadeNEE ~43 cells / ~30 taps per
+    pixel) - keep ONE uniformly reservoir-sampled vertex per path and trace ONE
+    shadow ray at path end, weighted by the vertex count.
+
+    Unbiased: for vertices v_1..v_N, E[N * NEE(v_K)] with K uniform equals
+    sum_k NEE(v_k) exactly. The trade is variance for a fixed budget, which
+    temporal accumulation absorbs - the same bet MegaLights ships.
+*/
+static const bool kSingleNeePerPath = USE_SINGLE_NEE;
+
+/** Reservoir over path vertices for the single-NEE estimator: vertex k
+    survives with probability 1/k, giving a uniform pick without knowing the
+    path length in advance. Stores everything one deferred NEE needs.
+*/
+struct NeeVertexReservoir
+{
+    uint count;       ///< Vertices seen so far (the estimator's N).
+    float3 pos;       ///< Scatter position of the kept vertex.
+    float3 wi;        ///< Direction toward the previous vertex (away from pos).
+    float g;          ///< Phase anisotropy at the kept vertex.
+    float3 thp;       ///< Path throughput AT the kept vertex (pre-continuation).
+};
+
 /** VNA spec section 5, Stage A: resampled importance sampling (RIS) of the
     PRIMARY scatter vertex. Off by default - the plain path is the reference
     ground truth and must stay untouched (handoff rule).
@@ -205,6 +230,7 @@ bool scatterAtVertex<S : ISampleGenerator>(
     inout Ray ray,
     inout float3 throughput,
     inout float3 radiance,
+    inout NeeVertexReservoir neeReservoir,
     inout VolumeInstanceSampler volumeSampler,
     inout S sg
 )
@@ -213,7 +239,24 @@ bool scatterAtVertex<S : ISampleGenerator>(
 
     if (kUseNEE)
     {
-        radiance += throughput * evalNEE(scatterPos, wi, phase, volumeSampler, sg);
+        if (kSingleNeePerPath)
+        {
+            // MegaLights-shaped budget: defer NEE. Keep this vertex with
+            // probability 1/count (streaming uniform reservoir); the single
+            // shadow ray is traced once, at path end.
+            neeReservoir.count++;
+            if (neeReservoir.count == 1 || sampleNext1D(sg) * float(neeReservoir.count) < 1.f)
+            {
+                neeReservoir.pos = scatterPos;
+                neeReservoir.wi = wi;
+                neeReservoir.g = g;
+                neeReservoir.thp = throughput;
+            }
+        }
+        else
+        {
+            radiance += throughput * evalNEE(scatterPos, wi, phase, volumeSampler, sg);
+        }
     }
 
     // Sample a new direction from the phase function.
@@ -270,6 +313,10 @@ void main(uint3 dispatchThreadId: SV_DispatchThreadID)
 
     uint bounce = 0;
     bool traceLoop = true;
+
+    // Single-NEE-per-path reservoir (UE MegaLights lesson). Resolved once,
+    // right before the outputs are written, so every path exit is covered.
+    NeeVertexReservoir neeReservoir = {};
 
     // Cost-bucket state: attribute the sampler-internal marching per phase.
     uint cellsMark = gvsCellsNow();
@@ -439,7 +486,7 @@ void main(uint3 dispatchThreadId: SV_DispatchThreadID)
 
                 const float3 scatterPos = ray.origin + selDs.t * ray.dir;
                 risExit = kRisExitTerminated;
-                if (scatterAtVertex(scatterPos, wi, gv.data.anisotropy, 0, ray, throughput, radiance, volumeSampler, sg))
+                if (scatterAtVertex(scatterPos, wi, gv.data.anisotropy, 0, ray, throughput, radiance, neeReservoir, volumeSampler, sg))
                 {
                     // Continuation bounces run the standard loop below.
                     bounce = 1;
@@ -480,10 +527,20 @@ void main(uint3 dispatchThreadId: SV_DispatchThreadID)
         // Per-instance anisotropy (spec section 3: rim vs core lobe weights).
         const float g = gScene.getGridVolume(ds.instance).data.anisotropy;
 
-        if (!scatterAtVertex(scatterPos, wi, g, bounce, ray, throughput, radiance, volumeSampler, sg))
+        if (!scatterAtVertex(scatterPos, wi, g, bounce, ray, throughput, radiance, neeReservoir, volumeSampler, sg))
             break;
 
         bounce++;
+    }
+
+    // Resolve the deferred single NEE: one shadow ray for the whole path,
+    // weighted by the number of vertices it stands in for. Placed here so
+    // every way the path can end (RIS termination, loop break, escape) is
+    // covered exactly once.
+    if (kSingleNeePerPath && kUseNEE && neeReservoir.count > 0)
+    {
+        const HenyeyGreensteinPhaseFunction phase = HenyeyGreensteinPhaseFunction(neeReservoir.g);
+        radiance += neeReservoir.thp * evalNEE(neeReservoir.pos, neeReservoir.wi, phase, volumeSampler, sg) * float(neeReservoir.count);
     }
 
     gOutputColor[pixel] = float4(radiance, 1.f);
