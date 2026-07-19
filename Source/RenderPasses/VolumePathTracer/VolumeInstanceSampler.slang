@@ -644,29 +644,36 @@ struct VolumeInstanceSampler
         emit nothing, and the caller's separately-estimated escape/background
         term carries that radiance (no double counting).
     */
-    [mutating] void sampleCandidatesSharedSweep<S : ISampleGenerator>(const IntervalList list, const Ray ray, inout S sg, out CandidateSet cands)
+    /** numProcesses (<= kRisM) is the per-pixel candidate budget - possibly
+        transmittance-adaptive (see the pass). Processes are contiguous
+        [0, numProcesses); arrays stay kRisM-sized so register layout is
+        budget-independent.
+    */
+    [mutating] void sampleCandidatesSharedSweep<S : ISampleGenerator>(const IntervalList list, const Ray ray, const uint numProcesses, inout S sg, out CandidateSet cands)
     {
         statRays++;
 #if USE_MERGED_TAIL
         if (tailGate(ray))
         {
             statTailRays++;
-            sampleCandidatesTail(list, ray, sg, cands);
+            sampleCandidatesTail(list, ray, numProcesses, sg, cands);
             return;
         }
 #endif
 #if USE_BRICK_TLAS
-        sampleCandidatesRQ(ray, sg, cands);
+        sampleCandidatesRQ(ray, numProcesses, sg, cands);
 #else
-        sampleCandidatesSweepIntervals(list, ray, sg, cands);
+        sampleCandidatesSweepIntervals(list, ray, numProcesses, sg, cands);
 #endif
     }
 
-    [mutating] void sampleCandidatesSweepIntervals<S : ISampleGenerator>(const IntervalList list, const Ray ray, inout S sg, out CandidateSet cands)
+    [mutating] void sampleCandidatesSweepIntervals<S : ISampleGenerator>(const IntervalList list, const Ray ray, const uint numProcesses, inout S sg, out CandidateSet cands)
     {
         cands = {};
         cands.count = 0;
         if (list.count == 0) return;
+
+        const uint nProc = min(numProcesses, kRisM);
 
         float bounds[2 * kMaxInstances];
         const uint nBounds = buildBoundaries(list, bounds);
@@ -674,7 +681,7 @@ struct VolumeInstanceSampler
         GridVolumeSampler gvs = {};
 
         float tauLeft[kRisM];
-        uint aliveMask = (kRisM >= 32) ? 0xffffffffu : ((1u << kRisM) - 1u);
+        uint aliveMask = (nProc >= 32) ? 0xffffffffu : ((1u << nProc) - 1u);
         for (uint j = 0; j < kRisM; ++j) tauLeft[j] = -log(1.f - sampleNext1D(sg));
 
         for (uint s = 0; s + 1 < nBounds && aliveMask != 0; ++s)
@@ -1012,12 +1019,13 @@ struct VolumeInstanceSampler
         over the per-process bests: a brick starting beyond every process's
         current best cannot improve any of them.
     */
-    [mutating] void sampleCandidatesRQ<S : ISampleGenerator>(const Ray ray, inout S sg, out CandidateSet cands)
+    [mutating] void sampleCandidatesRQ<S : ISampleGenerator>(const Ray ray, const uint numProcesses, inout S sg, out CandidateSet cands)
     {
         cands = {};
         cands.count = 0;
         GridVolumeSampler gvs = {};
 
+        const uint nProc = min(numProcesses, kRisM);
         float bestT[kRisM];
         uint bestInst[kRisM];
         for (uint j = 0; j < kRisM; ++j)
@@ -1039,7 +1047,7 @@ struct VolumeInstanceSampler
             if (q.CandidateType() != CANDIDATE_PROCEDURAL_PRIMITIVE) continue;
 
             float allBest = 0.f;
-            for (uint j = 0; j < kRisM; ++j) allBest = max(allBest, bestT[j]);
+            for (uint j = 0; j < nProc; ++j) allBest = max(allBest, bestT[j]);
 
             const BrickTlasInstanceInfo info = gBrickTlasInstances[q.CandidateInstanceIndex()];
             const BrickAABB bb = gBrickAABBs[info.aabbOffset + q.CandidatePrimitiveIndex()];
@@ -1049,7 +1057,7 @@ struct VolumeInstanceSampler
             statSegments++;
             const GridVolume gridVolume = gScene.getGridVolume(info.gridVolumeIdx);
 
-            for (uint j = 0; j < kRisM; ++j)
+            for (uint j = 0; j < nProc; ++j)
             {
                 if (tt.x >= bestT[j]) continue;
                 GridVolumeSampler::DistanceSample gds;
@@ -1062,13 +1070,13 @@ struct VolumeInstanceSampler
             }
 
             float newMax = 0.f;
-            for (uint j = 0; j < kRisM; ++j) newMax = max(newMax, bestT[j]);
+            for (uint j = 0; j < nProc; ++j) newMax = max(newMax, bestT[j]);
             // Only commit once every process has a real collision (else the
             // max is FLT_MAX and there is nothing safe to prune against).
             if (newMax < ray.tMax) q.CommitProceduralPrimitiveHit(newMax);
         }
 
-        for (uint j = 0; j < kRisM; ++j)
+        for (uint j = 0; j < nProc; ++j)
         {
             if (bestT[j] < FLT_MAX)
             {
@@ -1301,7 +1309,7 @@ struct VolumeInstanceSampler
     /** M candidate processes sharing one tail DDA - the tail counterpart of
         sampleCandidatesSweepIntervals, same independence argument.
     */
-    [mutating] void sampleCandidatesTail<S : ISampleGenerator>(const IntervalList list, const Ray ray, inout S sg, out CandidateSet cands)
+    [mutating] void sampleCandidatesTail<S : ISampleGenerator>(const IntervalList list, const Ray ray, const uint numProcesses, inout S sg, out CandidateSet cands)
     {
         cands = {};
         cands.count = 0;
@@ -1310,8 +1318,9 @@ struct VolumeInstanceSampler
         const float2 span = tailSpan(ray);
         if (span.x >= span.y) return;
 
+        const uint nProc = min(numProcesses, kRisM);
         float tauLeft[kRisM];
-        uint aliveMask = (kRisM >= 32) ? 0xffffffffu : ((1u << kRisM) - 1u);
+        uint aliveMask = (nProc >= 32) ? 0xffffffffu : ((1u << nProc) - 1u);
         for (uint j = 0; j < kRisM; ++j) tauLeft[j] = -log(1.f - sampleNext1D(sg));
 
         float t = span.x;

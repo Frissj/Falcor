@@ -57,6 +57,7 @@ const char kUseSharedCandidateSweep[] = "useSharedCandidateSweep";
 const char kFootprintMip[] = "footprintMip";
 const char kFootprintScale[] = "footprintScale";
 const char kUseSingleNeePerPath[] = "useSingleNeePerPath";
+const char kUseAdaptiveM[] = "useAdaptiveM";
 const char kUseBrickTlas[] = "useBrickTlas";
 const char kMipPixelThreshold[] = "mipPixelThreshold";
 const char kUseMergedTail[] = "useMergedTail";
@@ -102,6 +103,8 @@ void VolumePathTracer::parseProperties(const Properties& props)
             mFootprintScale = value;
         else if (key == kUseSingleNeePerPath)
             mUseSingleNeePerPath = value;
+        else if (key == kUseAdaptiveM)
+            mUseAdaptiveM = value;
         else if (key == kUseBrickTlas)
             mUseBrickTlas = value;
         else if (key == kMipPixelThreshold)
@@ -133,6 +136,7 @@ Properties VolumePathTracer::getProperties() const
     props[kFootprintMip] = mFootprintMip;
     props[kFootprintScale] = mFootprintScale;
     props[kUseSingleNeePerPath] = mUseSingleNeePerPath;
+    props[kUseAdaptiveM] = mUseAdaptiveM;
     props[kUseBrickTlas] = mUseBrickTlas;
     props[kMipPixelThreshold] = mMipPixelThreshold;
     props[kUseMergedTail] = mUseMergedTail;
@@ -394,19 +398,21 @@ void VolumePathTracer::buildBrickBlases(RenderContext* pRenderContext)
     );
 }
 
-uint32_t VolumePathTracer::selectInstanceMip(const GridVolume& volume, const float3& cameraPos, float footprintSpread) const
+uint32_t VolumePathTracer::selectInstanceMip(const GridVolume& volume, const float3& cameraPos, float footprintSpread, float& outFootprintWorld) const
 {
     // UE Nanite projected-error selection, one decision per INSTANCE per frame:
     // error of mip m = its cell size in world units; pick the coarsest mip
     // whose projected cell stays under mMipPixelThreshold pixels at the
     // instance's NEAREST point (conservative, like GetProjectedEdgeScales'
     // min scale). Whole instances flip coherently - the anti-crack rule.
+    outFootprintWorld = 0.f;
     if (footprintSpread <= 0.f) return 0;
 
     const AABB& bounds = volume.getBounds();
     const float3 center = bounds.center();
     const float radius = length(bounds.extent()) * 0.5f;
     const float dist = std::max(0.f, length(center - cameraPos) - radius);
+    outFootprintWorld = footprintSpread * dist;
     if (dist <= 0.f) return 0; // Camera inside the bounds: finest structure.
 
     // World size of one fine voxel for this instance: smallest basis length of
@@ -443,11 +449,17 @@ void VolumePathTracer::updateBrickTlas(RenderContext* pRenderContext, const uint
     }
 
     // Select per-instance mips; rebuild only when the selection changed.
+    // Footprints are recorded every frame so the [LOD] log reflects what the
+    // selection actually saw, not a reconstruction.
+    mLastSpread = spread;
+    mInstanceFootprint.assign(volumes.size(), 0.f);
     bool changed = (mpBrickTlas == nullptr);
     std::vector<uint32_t> newMips(volumes.size());
     for (size_t i = 0; i < volumes.size(); ++i)
     {
-        newMips[i] = volumes[i]->getDensityGrid() ? selectInstanceMip(*volumes[i], cameraPos, spread) : 0;
+        float footprint = 0.f;
+        newMips[i] = volumes[i]->getDensityGrid() ? selectInstanceMip(*volumes[i], cameraPos, spread, footprint) : 0;
+        mInstanceFootprint[i] = footprint;
         changed |= (newMips[i] != mInstanceMip[i]);
     }
     if (!changed) return;
@@ -743,6 +755,7 @@ void VolumePathTracer::prepareProgram(RenderContext* pRenderContext)
     defines.add("USE_RUSSIAN_ROULETTE", mUseRussianRoulette ? "1" : "0");
     defines.add("USE_ENV_LIGHT", mpEnvMapSampler ? "1" : "0");
     defines.add("USE_RIS", mUseRIS ? "1" : "0");
+    defines.add("USE_ADAPTIVE_M", (mUseRIS && mUseAdaptiveM) ? "1" : "0");
     defines.add("USE_RIS_STATS", (mUseRIS && mLogRisStats) ? "1" : "0");
     defines.add("USE_WORK_STATS", mLogWorkStats ? "1" : "0");
     // Enables GridVolumeSampler's internal cell/tap counters - the marching
@@ -931,10 +944,10 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
             {
                 logInfo(
                     "[RIS] frame {} pixels {} inMedium {} | noMedium {} noCand {} zeroTarget {} zeroDensity {} "
-                    "zeroTrans {} terminated {} contributed {} | avgCandidates {:.2f}",
+                    "zeroTrans {} terminated {} contributed {} | avgCandidates {:.2f} avgM {:.2f}",
                     mFrameCount, pixels, inMedium,
                     s[0], s[1], s[2], s[3], s[4], s[5], s[6],
-                    avgCand
+                    avgCand, pixels > 0 ? double(s[25]) / pixels : 0.0
                 );
             }
 
@@ -975,6 +988,25 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
                     s[15] > 0 ? double(s[24]) / s[15] : 0.0,
                     totalCells, totalTaps
                 );
+
+                // What the projected-error LoD actually decided this frame:
+                // per-pixel footprint growth, the tail gate in the same units,
+                // and per-instance "mip@footprint" - so LoD questions are
+                // answered by the log, not by trigonometry.
+                if (mUseBrickTlas && mBrickBlasesValid && !mInstanceFootprint.empty())
+                {
+                    std::string perInstance;
+                    for (size_t i = 0; i < mInstanceFootprint.size(); ++i)
+                    {
+                        perInstance += fmt::format("{}@{:.1f}{}", mInstanceMip[i], mInstanceFootprint[i], i + 1 < mInstanceFootprint.size() ? " " : "");
+                    }
+                    logInfo(
+                        "[LOD] frame {} | spread {:.5f} wu/dist | voxel {:.2f} wu, mip0 cell {:.2f} wu | tail gate {:.1f} wu "
+                        "| per-instance mip@footprintWu: {}",
+                        mFrameCount, mLastSpread, mTailMinVoxWorld, 8.f * mTailMinVoxWorld,
+                        mTailGateVoxels * mTailMinVoxWorld, perInstance
+                    );
+                }
             }
             mpRisStatsReadback->unmap();
         }
@@ -1030,6 +1062,14 @@ void VolumePathTracer::renderUI(Gui::Widgets& widget)
         if (mUseRIS)
         {
             rebuild |= group.var("Candidates (M)", mRisCandidates, 1u, 16u);
+            rebuild |= group.checkbox("Adaptive M (from transmittance)", mUseAdaptiveM);
+            group.tooltip(
+                "Per-pixel candidate budget M = clamp(ceil(Mmax * (1 - T)), 1, Mmax),\n"
+                "decided from the escape term's transmittance before the candidate RNG.\n"
+                "Unbiased (the reservoir weight divides by the M actually used).\n"
+                "Measured: 82-88% of fixed-M processes escape - this stops paying them.",
+                true
+            );
             rebuild |= group.checkbox("Shared candidate sweep", mUseSharedCandidateSweep);
             group.tooltip(
                 "ON: all M delta-tracking processes share ONE majorant-DDA traversal\n"

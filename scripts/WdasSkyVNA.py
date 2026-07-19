@@ -47,6 +47,9 @@ def render_graph_VNA():
         'risCandidates': 4,
         'risMip': 2,
         'useSharedCandidateSweep': True,
+        # Transmittance-adaptive candidate budget: nearly-transparent rays run
+        # 1 process instead of M (82-88% of fixed-M processes were escaping).
+        'useAdaptiveM': True,
         # Section 4: HW-BVH brick TLAS (UE HeterogeneousVolumes port) with
         # per-instance projected-error mip selection.
         'useBrickTlas': True,

@@ -44,7 +44,7 @@ private:
     // HW-BVH brick backend (VNA section 4; see VNA_UE_SOURCE_LESSONS.md).
     void buildBrickBlases(RenderContext* pRenderContext);
     void updateBrickTlas(RenderContext* pRenderContext, const uint2 targetDim);
-    uint32_t selectInstanceMip(const GridVolume& volume, const float3& cameraPos, float footprintSpread) const;
+    uint32_t selectInstanceMip(const GridVolume& volume, const float3& cameraPos, float footprintSpread, float& outFootprintWorld) const;
 
     // Merged coarse tail (VNA section 3).
     void bakeMergedTail();
@@ -147,6 +147,18 @@ private:
     /// Smallest fine-voxel world size over all instances, captured at bake so
     /// the gate (mTailGateVoxels * this) tracks UI changes without a rebake.
     float mTailMinVoxWorld = 0.f;
+
+    // [LOD] log state: what the projected-error selection actually decided,
+    // captured by updateBrickTlas so claims about LoD behaviour come from the
+    // log, not from arithmetic.
+    float mLastSpread = 0.f;                    ///< World footprint growth per unit distance.
+    std::vector<float> mInstanceFootprint;      ///< Per instance: footprint (wu) at its nearest point.
+    /// Transmittance-adaptive candidate budget: M per pixel =
+    /// clamp(ceil(kRisM * (1 - Tfull)), 1, kRisM), decided from the escape
+    /// term's transmittance BEFORE the candidate RNG runs - so it is exactly
+    /// unbiased (the reservoir weight divides by the M actually used).
+    /// Measured motivation: 82-88% of fixed-M candidate processes escape.
+    bool mUseAdaptiveM = false;
     /// Mip of the coarse mean field used for the TARGET's shadow estimate (0..3).
     /// Candidates no longer come from this field (they are real delta-tracking
     /// collisions), so this only decides how cheap/crude the "is this candidate
@@ -162,7 +174,7 @@ private:
     // GridVolumeSampler (DDA cells + real density taps) attributed to the
     // escape term, candidate generation, and shading/NEE - the work the
     // original [WORK] line was measured to be blind to.
-    static const uint32_t kRisStatSlots = 25;
+    static const uint32_t kRisStatSlots = 26;
     ref<Buffer> mpRisStats;         ///< Device-local counters (atomics).
     ref<Buffer> mpRisStatsReadback; ///< CPU-visible copy.
     bool mLogRisStats = true;       ///< Log the histogram while RIS is on.

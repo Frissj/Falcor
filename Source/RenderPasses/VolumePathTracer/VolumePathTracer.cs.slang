@@ -102,6 +102,8 @@ RWTexture2D<float4> gRisDebug;
     [22] = overlap null-collision steps    [23] = overlap density lookups
     [24] = entries that took the merged-tail path (backend attribution:
            tail = s[24], RayQuery/intervals = s[15] - s[24])
+    [25] = sum of per-pixel candidate budgets actually used (adaptive M:
+           s[25]/pixels = average M; equals kRisM when the feature is off)
 */
 RWStructuredBuffer<uint> gRisStats;
 
@@ -138,6 +140,55 @@ static const bool kUseEnvLight = USE_ENV_LIGHT;
     temporal accumulation absorbs - the same bet MegaLights ships.
 */
 static const bool kSingleNeePerPath = USE_SINGLE_NEE;
+
+/** Transmittance-adaptive candidate count (our extension of the MegaLights
+    fixed-budget idea; UE's own next step would be temporal feedback, which for
+    this renderer is Stage B reservoir reuse).
+
+    Measured: 82-88% of candidate processes march to ESCAPE (avgCandidates
+    0.48 at M=4), i.e. most of the dominant candGen bucket is spent proving
+    that nearly-transparent rays scatter nothing. The escape term already
+    computes Tfull BEFORE candidates run - a fresher signal than any
+    reprojected history - so M is chosen per pixel from it:
+        M = clamp(ceil(Mmax * (1 - Tfull)), 1, Mmax).
+
+    Unbiased: M depends only on draws made BEFORE the candidate RNG, and the
+    scatter estimator is unbiased conditioned on ANY M >= 1 (the reservoir
+    weight divides by the M actually used), so the total expectation is exact.
+    M never reaches 0: a stochastic Tfull == 1 does not prove empty space.
+*/
+static const bool kUseAdaptiveM = USE_ADAPTIVE_M;
+
+/** Stage B: temporal reservoir reuse (VNA spec section 5; the principled form
+    of UE MegaLights' temporal feedback). Last frame's surviving primary
+    scatter vertex is shifted onto this frame's ray (t-shift: t' = projection
+    of its world position onto the new ray; Jacobian = dot(prevDir, newDir))
+    and merged into the current reservoir with confidence-capped weight
+        w_prev = sigma(t') * T(0->t') * Lhat(t') * W_prev * M_prev * J.
+    sigma/T are evaluated with ONE stochastic tap and ONE bounded real march;
+    the SAME realization implicitly appears in the survivor's f/p-hat, so it
+    cancels exactly and the estimator keeps its universal form
+        W = wSum / (M_total * Lhat_sel).
+    Empty previous reservoirs contribute confidence only (M adds, wSum does
+    not) - they are M genuine zero-weight candidates, so this stays unbiased.
+    MIS note: confidence weights (M-capping) approximate the generalized
+    balance heuristic, the same approximation every shipped ReSTIR (including
+    Volumetric ReSTIR) uses; exact pairwise MIS is the documented follow-up.
+*/
+static const bool kUseTemporalReuse = USE_TEMPORAL_REUSE;
+
+struct TemporalReservoir
+{
+    float3 pos; ///< Survivor's world position (re-expressed on the ray that kept it).
+    float W;    ///< Unbiased contribution weight of the survivor (0 = empty reservoir).
+    float M;    ///< Confidence: total candidates this reservoir stands for.
+    uint inst;  ///< Survivor's instance (albedo/anisotropy source).
+    float _pad0;
+    float _pad1;
+};
+
+RWStructuredBuffer<TemporalReservoir> gReservoirPrev; ///< Last frame's reservoirs (read).
+RWStructuredBuffer<TemporalReservoir> gReservoirCurr; ///< This frame's reservoirs (written).
 
 /** Reservoir over path vertices for the single-NEE estimator: vertex k
     survives with probability 1/k, giving a uniform pick without knowing the
@@ -327,6 +378,7 @@ void main(uint3 dispatchThreadId: SV_DispatchThreadID)
     // RIS probe state (written to gRisDebug at the end).
     uint risExit = kRisExitNoMedium;
     float risCount = 0.f;
+    uint risMUsed = 0; ///< Candidate budget actually used this pixel (adaptive M diagnostics).
     float risWSum = 0.f;
     float risW = 0.f;
 
@@ -395,6 +447,14 @@ void main(uint3 dispatchThreadId: SV_DispatchThreadID)
             const VolumeInstanceSampler::IntervalList primaryList = volumeSampler.gatherIntervals(ray);
 
             // ---- Candidate generation: M real delta-tracking collisions. ----
+            // Per-pixel candidate budget from the transmittance just computed
+            // (see kUseAdaptiveM above). The reservoir weight divides by this
+            // exact value, which is what keeps per-pixel M unbiased.
+            const uint mUsed = kUseAdaptiveM
+                ? clamp(uint(ceil(float(VolumeInstanceSampler::kRisM) * saturate(1.f - Tfull))), 1u, VolumeInstanceSampler::kRisM)
+                : VolumeInstanceSampler::kRisM;
+            risMUsed = mUsed;
+
             // Primary-ray footprint applies here exactly as it did for the
             // escape term: it drives the merged-tail gate and the residual-mip
             // choice inside the marchers. Reset after - the target's shadow
@@ -406,13 +466,13 @@ void main(uint3 dispatchThreadId: SV_DispatchThreadID)
             // One traversal, M processes (UE lesson: share the walk, keep the
             // chains independent). Distribution identical to the M-walk loop
             // below - VNA_RisValidate.py is the gate for that claim.
-            volumeSampler.sampleCandidatesSharedSweep(primaryList, ray, sg, cands);
+            volumeSampler.sampleCandidatesSharedSweep(primaryList, ray, mUsed, sg, cands);
 #else
             // Reference variant: M independent full walks along the same ray.
             // Kept selectable for A/B of both cost and correctness.
             cands = {};
             cands.count = 0;
-            for (uint j = 0; j < VolumeInstanceSampler::kRisM; ++j)
+            for (uint j = 0; j < mUsed; ++j)
             {
                 VolumeInstanceSampler::DistanceSample ds;
                 // Escaped candidates are not scatter events: weight 0. The
@@ -474,9 +534,10 @@ void main(uint3 dispatchThreadId: SV_DispatchThreadID)
 
             if (selW > 0.f)
             {
-                // W = (1/M sum w) / Lhat(y). Bounded and well-conditioned: with
-                // equal weights it is exactly nReal/M, i.e. plain delta tracking.
-                const float W = wSum / (float(VolumeInstanceSampler::kRisM) * selW);
+                // W = (1/M sum w) / Lhat(y), with M = the count ACTUALLY used
+                // this pixel (adaptive or fixed). Bounded and well-conditioned:
+                // with equal weights it is exactly nReal/M, plain delta tracking.
+                const float W = wSum / (float(mUsed) * selW);
                 risW = W;
 
                 const GridVolume gv = gScene.getGridVolume(selDs.instance);
@@ -579,6 +640,9 @@ void main(uint3 dispatchThreadId: SV_DispatchThreadID)
         const uint nMedium = WaveActiveCountBits(risExit != kRisExitNoMedium);
         if (WaveIsFirstLane() && nMedium > 0)
             InterlockedAdd(gRisStats[8], nMedium);
+        const uint nM = WaveActiveSum(risMUsed);
+        if (WaveIsFirstLane() && nM > 0)
+            InterlockedAdd(gRisStats[25], nM);
     }
 #endif
 
