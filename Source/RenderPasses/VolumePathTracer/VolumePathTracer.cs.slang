@@ -100,6 +100,8 @@ RWTexture2D<float4> gRisDebug;
     [20] = shading/march DDA cells (NEE + continuation + reference path)
     [21] = shading/march real taps
     [22] = overlap null-collision steps    [23] = overlap density lookups
+    [24] = entries that took the merged-tail path (backend attribution:
+           tail = s[24], RayQuery/intervals = s[15] - s[24])
 */
 RWStructuredBuffer<uint> gRisStats;
 
@@ -548,6 +550,7 @@ void main(uint3 dispatchThreadId: SV_DispatchThreadID)
         const uint h5 = WaveActiveSum(tapsShade);
         const uint h6 = WaveActiveSum(volumeSampler.statOverlapSteps);
         const uint h7 = WaveActiveSum(volumeSampler.statOverlapLookups);
+        const uint h8 = WaveActiveSum(volumeSampler.statTailRays);
         if (WaveIsFirstLane())
         {
             if (a > 0) InterlockedAdd(gRisStats[9], a);
@@ -565,6 +568,7 @@ void main(uint3 dispatchThreadId: SV_DispatchThreadID)
             if (h5 > 0) InterlockedAdd(gRisStats[21], h5);
             if (h6 > 0) InterlockedAdd(gRisStats[22], h6);
             if (h7 > 0) InterlockedAdd(gRisStats[23], h7);
+            if (h8 > 0) InterlockedAdd(gRisStats[24], h8);
         }
     }
 #endif

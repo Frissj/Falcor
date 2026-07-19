@@ -139,6 +139,7 @@ struct VolumeInstanceSampler
     uint statCoarseCells;   ///< DDA cells stepped across ALL coarse walks. The dominant RIS cost if it dominates.
     uint statCandCells;     ///< Majorant DDA cells stepped by the shared candidate sweep.
     uint statRealTaps;      ///< Real (raw-VDB) density taps made by the shared candidate sweep.
+    uint statTailRays;      ///< Public entries that took the merged-tail path (subset of statRays).
 
     /** Footprint-driven residual-mip selection (UE Nanite lesson: LoD level is
         chosen by PROJECTED ERROR, where a voxel level's error is simply its
@@ -305,6 +306,7 @@ struct VolumeInstanceSampler
 #if USE_MERGED_TAIL
         if (tailGate(ray))
         {
+            statTailRays++;
             const IntervalList tailList = gatherIntervals(ray);
             if (tailList.count == 0) return 1.f;
             return evalTransmittanceTail(tailList, ray, sg);
@@ -423,6 +425,7 @@ struct VolumeInstanceSampler
 #if USE_MERGED_TAIL
         if (tailGate(ray))
         {
+            statTailRays++;
             ds = {};
             const IntervalList tailList = gatherIntervals(ray);
             if (tailList.count == 0) return false;
@@ -647,6 +650,7 @@ struct VolumeInstanceSampler
 #if USE_MERGED_TAIL
         if (tailGate(ray))
         {
+            statTailRays++;
             sampleCandidatesTail(list, ray, sg, cands);
             return;
         }

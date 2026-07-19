@@ -637,7 +637,8 @@ void VolumePathTracer::bakeMergedTail()
                 {
                     const float3 cellMin = mTailOrigin + float3(float(x), float(y), float(z)) * cell;
                     const float3 cellMax = cellMin + cell;
-                    const AABB cellBounds(cellMin, cellMax);
+                    // Non-const: AABB::overlaps() is a non-const member in Falcor.
+                    AABB cellBounds(cellMin, cellMax);
 
                     float sumMaj = 0.f;
                     float sumMean = 0.f;
@@ -961,11 +962,12 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
                 logInfo(
                     "[COST] frame {} | per-pixel cells/taps: escapeT {:.1f}/{:.1f} candGen {:.1f}/{:.1f} "
                     "shadeNEE {:.1f}/{:.1f} sweep {:.1f}/{:.1f} | overlap steps {:.2f} lookups {:.2f} "
-                    "| totals: cells {} taps {}",
+                    "| tailRays {:.2f}/entry | totals: cells {} taps {}",
                     mFrameCount,
                     s[16] / px, s[17] / px, s[18] / px, s[19] / px,
                     s[20] / px, s[21] / px, s[13] / px, s[14] / px,
                     s[22] / px, s[23] / px,
+                    s[15] > 0 ? double(s[24]) / s[15] : 0.0,
                     totalCells, totalTaps
                 );
             }
