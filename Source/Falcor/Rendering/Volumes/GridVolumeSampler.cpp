@@ -43,6 +43,7 @@ namespace Falcor
         defines.add("GRID_VOLUME_SAMPLER_USE_BRICKEDGRID", std::to_string((uint32_t)mOptions.useBrickedGrid));
         defines.add("GRID_VOLUME_SAMPLER_TRANSMITTANCE_ESTIMATOR", std::to_string((uint32_t)mOptions.transmittanceEstimator));
         defines.add("GRID_VOLUME_SAMPLER_DISTANCE_SAMPLER", std::to_string((uint32_t)mOptions.distanceSampler));
+        defines.add("GRID_VOLUME_SAMPLER_RESIDUAL_MIP", std::to_string(mOptions.residualMip));
         return defines;
     }
 
@@ -75,6 +76,13 @@ namespace Falcor
             // Enable bricked grid if the chosen mode requires it.
             if (requiresBrickedGrid(mOptions.distanceSampler)) mOptions.useBrickedGrid = true;
             dirty = true;
+        }
+        if (mOptions.transmittanceEstimator == TransmittanceEstimator::ResidualRatioTrackingLocalMajorant)
+        {
+            // Mip of the control-variate (mean) field. Unbiased at every level;
+            // sweeping it should change noise/speed but NOT the converged image.
+            dirty |= widget.var("Residual mip", mOptions.residualMip, 0u, 3u);
+            widget.tooltip("Mean-pyramid level for residual ratio tracking.\n0 = per-brick (8^3) mean, 3 = coarsest (64^3).\nThe converged image must be identical at every level.", true);
         }
 
         return dirty;

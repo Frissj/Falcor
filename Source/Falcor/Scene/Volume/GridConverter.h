@@ -111,6 +111,11 @@ namespace Falcor
         std::vector<uint32_t> mRangeData;
         std::vector<uint32_t> mPtrData;
         std::vector<TexelType> mAtlasData;
+        // Per-brick mean density (f16), same 4-mip layout as mRangeData. This is
+        // the control-variate field sigma_c for residual ratio tracking (VNA
+        // spec section 2 / P2). It is a MEAN pyramid; mRangeData's mips are a
+        // max/min pyramid - a different quantity that cannot substitute for it.
+        std::vector<uint16_t> mMeanData;
         std::atomic_uint32_t mNonEmptyCount;
     };
 
@@ -137,6 +142,7 @@ namespace Falcor
         uint leafTexelCount = atlasSizePixels.x * atlasSizePixels.y * atlasSizePixels.z;
         mRangeData.resize(mLeafCount[3]);
         mPtrData.resize(mLeafCount[0]);
+        mMeanData.resize(mLeafCount[3]);
         mAtlasData.resize(kBC4Compress ? (leafTexelCount / 16) : leafTexelCount);
     }
 
@@ -151,6 +157,7 @@ namespace Falcor
         size_t offset = z * mLeafDim[0].x * mLeafDim[0].y;
         uint32_t* rangedst = mRangeData.data() + offset;
         uint32_t* ptrdst = mPtrData.data() + offset;
+        uint16_t* meandst = mMeanData.data() + offset;
         auto a = mpFloatGrid->getAccessor();
         for (int y = 0; y < mLeafDim[0].y; ++y)
         {
@@ -160,12 +167,17 @@ namespace Falcor
                 auto val = a.getValue(ijk);
                 auto leaf = a.probeLeaf(ijk);
                 float minorant = val, majorant = val;
+                double valueSum = 0.0; // Mean of the brick's 8x8x8 voxels (control variate, VNA spec section 2).
                 uint myleaf = 0;
                 if (leaf)
                 {
                     // Nanovdb only stores minorant/majorant for active voxels, but we need all of them... Grab the central 8x8x8 first the quick way.
                     const float* data = leaf->data()->mValues;
-                    for (int i = 0; i < kBrickSize * kBrickSize * kBrickSize; ++i) expandMinorantMajorant(data[i], minorant, majorant);
+                    for (int i = 0; i < kBrickSize * kBrickSize * kBrickSize; ++i)
+                    {
+                        expandMinorantMajorant(data[i], minorant, majorant);
+                        valueSum += data[i];
+                    }
                     // We also need the 1-halo from neighbouring bricks. Fetch them in an order that maximises nanovdb's internal cache reuse.
                     for (int j = -1; j <= kBrickSize; ++j) for (int i = 0; i < kBrickSize; ++i) expandMinorantMajorant(a.getValue(ijk + nanovdb::Coord(i, j, -1)), minorant, majorant);
                     for (int j = -1; j <= kBrickSize; ++j) for (int i = 0; i < kBrickSize; ++i) expandMinorantMajorant(a.getValue(ijk + nanovdb::Coord(i, j, kBrickSize)), minorant, majorant);
@@ -184,9 +196,18 @@ namespace Falcor
                 {
                     *rangedst++ = f32tof16(majorant) + (f32tof16(majorant) << 16); // force identical major and minor
                     *ptrdst++ = 0;
+                    // With a collapsed range the sampler returns exactly 'majorant'
+                    // everywhere in this brick, so that IS the runtime mean. Writing
+                    // it makes the residual identically zero here: transmittance
+                    // through uniform/empty bricks becomes purely analytic.
+                    *meandst++ = (uint16_t)f32tof16(majorant);
                 }
                 else
                 {
+                    // True mean of the brick's voxels. Any value in [minorant,majorant]
+                    // keeps residual tracking unbiased (control variate); the mean
+                    // minimises the residual and thus the variance.
+                    *meandst++ = (uint16_t)f32tof16(float(valueSum * (1.0 / (kBrickSize * kBrickSize * kBrickSize))));
                     const float* data = leaf->data()->mValues;
                     majorant = f16tof32(f32tof16(majorant) + 1);
                     minorant = f16tof32(f32tof16(minorant));
@@ -253,6 +274,11 @@ namespace Falcor
     {
         uint32_t* rangedst = mRangeData.data() + mLeafCount[mip - 1];
         uint32_t* rangesrc = mRangeData.data() + ((mip > 1) ? mLeafCount[mip - 2] : 0);
+        // Mean pyramid walks the same brick layout. Children are equal-size
+        // regions, so the average of the 8 child means IS the exact mean of the
+        // parent region - the pyramid is exact at every level, not an estimate.
+        uint16_t* meandst = mMeanData.data() + mLeafCount[mip - 1];
+        uint16_t* meansrc = mMeanData.data() + ((mip > 1) ? mLeafCount[mip - 2] : 0);
         int3 leafdim_src = mLeafDim[mip - 1];
         uint32_t rowstride_src = leafdim_src.x;
         uint32_t slicestride_src = leafdim_src.y * rowstride_src;
@@ -261,11 +287,11 @@ namespace Falcor
         uint32_t rowstride_tgt = leafdim_tgt.x;
         uint32_t slicestride_tgt = leafdim_tgt.y * rowstride_tgt;
 
-        for (int z = 0; z < leafdim_tgt.z; ++z, rangesrc += slicestride_src)
+        for (int z = 0; z < leafdim_tgt.z; ++z, rangesrc += slicestride_src, meansrc += slicestride_src)
         {
-            for (int y = 0; y < leafdim_tgt.y; ++y, rangesrc += rowstride_src)
+            for (int y = 0; y < leafdim_tgt.y; ++y, rangesrc += rowstride_src, meansrc += rowstride_src)
             {
-                for (int x = 0; x < leafdim_tgt.x; ++x, rangesrc += 2)
+                for (int x = 0; x < leafdim_tgt.x; ++x, rangesrc += 2, meansrc += 2)
                 {
                     float2 majmin_dst = combineMajMin(
                         combineMajMin(
@@ -278,6 +304,13 @@ namespace Falcor
                         )
                     );
                     *rangedst++ = f32tof16(majmin_dst.x) + (f32tof16(majmin_dst.y) << 16);
+
+                    const float meanSum =
+                        f16tof32(meansrc[0]) + f16tof32(meansrc[1]) +
+                        f16tof32(meansrc[rowstride_src]) + f16tof32(meansrc[1 + rowstride_src]) +
+                        f16tof32(meansrc[slicestride_src]) + f16tof32(meansrc[slicestride_src + 1]) +
+                        f16tof32(meansrc[slicestride_src + rowstride_src]) + f16tof32(meansrc[slicestride_src + 1 + rowstride_src]);
+                    *meandst++ = (uint16_t)f32tof16(meanSum * 0.125f);
                 } // x
             } // y
         } // z
@@ -295,6 +328,18 @@ namespace Falcor
         bricks.range = pDevice->createTexture3D(mLeafDim[0].x, mLeafDim[0].y, mLeafDim[0].z, ResourceFormat::RG16Float, 4, mRangeData.data(), ResourceBindFlags::ShaderResource);
         bricks.indirection = pDevice->createTexture3D(mLeafDim[0].x, mLeafDim[0].y, mLeafDim[0].z, ResourceFormat::RGBA8Uint, 1, mPtrData.data(), ResourceBindFlags::ShaderResource);
         bricks.atlas = pDevice->createTexture3D(getAtlasSizePixels().x, getAtlasSizePixels().y, getAtlasSizePixels().z, getAtlasFormat(), 1, mAtlasData.data(), ResourceBindFlags::ShaderResource);
+        bricks.mean = pDevice->createTexture3D(mLeafDim[0].x, mLeafDim[0].y, mLeafDim[0].z, ResourceFormat::R16Float, 4, mMeanData.data(), ResourceBindFlags::ShaderResource);
+
+        // Hand the CPU pyramids to the BrickedGrid (moved, not copied - the
+        // converter is done with them). Needed by the HW-BVH brick-AABB
+        // extraction and the merged-tail bake; see BrickedGrid.h.
+        for (uint32_t i = 0; i < 4; ++i)
+        {
+            bricks.leafDim[i] = mLeafDim[i];
+            bricks.leafOffset[i] = i ? mLeafCount[i - 1] : 0;
+        }
+        bricks.rangeData = std::move(mRangeData);
+        bricks.meanData = std::move(mMeanData);
 
         double dt = CpuTimer::calcDuration(t0, CpuTimer::getCurrentTimePoint());
         logDebug("Converted '{}' in {:.4}ms: mNonEmptyCount {} vs max {}", mpFloatGrid->gridName(), dt, mNonEmptyCount.load(), getAtlasMaxBrick());

@@ -1,0 +1,581 @@
+/***************************************************************************
+ # Reference volumetric path tracer for NanoVDB grid volumes.
+ #
+ # Brute-force, unbiased-by-construction: null-collision distance sampling
+ # through ALL grid volume instances in the scene (VolumeInstanceSampler),
+ # Henyey-Greenstein scattering with per-instance anisotropy, and next-event
+ # estimation to the environment with ratio-tracked shadow transmittance.
+ #
+ # There is deliberately no reuse, no LoD and no resampling here. This is the
+ # ground-truth image that faster estimators get validated against.
+ **************************************************************************/
+#include "Utils/Math/MathConstants.slangh"
+
+// Provides is_valid(name) for optional render-pass I/O.
+#define is_valid(name) (is_valid_##name != 0)
+
+import Scene.Scene;
+import Utils.Math.Ray;
+import Utils.Math.MathHelpers;
+import Utils.Sampling.SampleGenerator;
+import Rendering.Lights.EnvMapSampler;
+import Rendering.Volumes.PhaseFunction;
+// Imported directly (imports are not transitive) for the gGvsStat* per-thread
+// work counters that attribute the marching cost done inside the sampler.
+import Rendering.Volumes.GridVolumeSampler;
+import VolumeInstanceSampler;
+
+cbuffer CB
+{
+    uint gFrameCount;
+    uint2 gFrameDim;
+    /// World-space pixel-footprint growth per unit distance
+    /// (2*tan(fovY/2)/resY * user scale). 0 = footprint-driven residual mip off.
+    float gFootprintSpread;
+}
+
+/** Snapshot accessors for the sampler-internal work counters. Compile to 0
+    when GRID_VOLUME_SAMPLER_STATS is off, so all bucket math folds away.
+*/
+uint gvsCellsNow()
+{
+#if GRID_VOLUME_SAMPLER_STATS
+    return gGvsStatCells;
+#else
+    return 0;
+#endif
+}
+uint gvsTapsNow()
+{
+#if GRID_VOLUME_SAMPLER_STATS
+    return gGvsStatTaps;
+#else
+    return 0;
+#endif
+}
+
+/** Resource-bearing parameters must live in a ParameterBlock, not as bare
+    globals. EnvMapSampler holds a SamplerState and a Texture2D; declaring it at
+    global scope makes Slang lay it out as loose root parameters, which fails at
+    dispatch. This mirrors how PathTracer.slang holds its EnvMapSampler.
+*/
+struct VolumePathTracerParams
+{
+    EnvMapSampler envMapSampler;
+};
+
+ParameterBlock<VolumePathTracerParams> gParams;
+
+RWTexture2D<float4> gOutputColor;
+
+/** Demodulated split (spec section 6): color = Lin + T * bg, exactly.
+    Lin is what a denoiser is allowed to blur; T is the sharp wisp channel
+    (temporal accumulation only); bg is deterministic and noise-free.
+*/
+RWTexture2D<float4> gOutputLin;
+RWTexture2D<float4> gOutputT;
+RWTexture2D<float4> gOutputBg;
+
+/** Raw RIS probe. R = exit code (below), G = candidate count, B = target
+    weight sum, A = RIS weight W. No thresholds, no normalisation.
+*/
+RWTexture2D<float4> gRisDebug;
+
+/** GPU-side tallies, read back and logged by the host.
+    [0..6] = RIS exit-code histogram
+    [7]    = total candidates emitted
+    [8]    = pixels whose primary ray actually entered the medium
+    WORK counters (this is the "where do the milliseconds go" data):
+    [9]  = instance AABB tests      [10] = segments marched
+    [11] = coarse shadow walks      [12] = coarse cells stepped (shadow walks)
+    [13] = candidate-sweep majorant DDA cells stepped
+    [14] = candidate-sweep real density taps
+    [15] = sampler entry calls (sampleDistance + evalTransmittance)
+    COST buckets: the marching done INSIDE GridVolumeSampler, attributed per
+    phase by snapshotting its per-thread counters around each call region.
+    This is the work the old [WORK] line was blind to (measured: a ~470 ms
+    frame with every counted term near-flat).
+    [16] = escape-term (Tfull) DDA cells   [17] = escape-term real taps
+    [18] = candidate-phase DDA cells       [19] = candidate-phase real taps
+    [20] = shading/march DDA cells (NEE + continuation + reference path)
+    [21] = shading/march real taps
+    [22] = overlap null-collision steps    [23] = overlap density lookups
+*/
+RWStructuredBuffer<uint> gRisStats;
+
+// Where the RIS block stopped. Each value is a DIFFERENT bug with a different
+// fix, which is why this is measured rather than assumed.
+static const uint kRisExitNoMedium    = 0; ///< Ray missed every instance, or maxBounces == 0.
+static const uint kRisExitNoCandidate = 1; ///< All M delta-tracking walks escaped: no real collision on this ray (legitimate for thin regions).
+static const uint kRisExitZeroTarget  = 2; ///< Real collisions found but every weight was 0: target collapsed.
+static const uint kRisExitZeroDensity = 3; ///< UNUSED since candidates became real collisions - must stay 0 in the log.
+static const uint kRisExitZeroTrans   = 4; ///< UNUSED since the transmittance factor cancels analytically - must stay 0.
+static const uint kRisExitTerminated  = 5; ///< Vertex shaded, but phase sampling / RR ended the path.
+static const uint kRisExitContributed = 6; ///< Full contribution made.
+
+/** Raw per-pixel work counters. Not normalised, not thresholded: read exact
+    values with Mogwai's pixel inspector, or scale them for a heatmap.
+      R = segments marched          G = overlap null-collision steps
+      B = instance AABB tests       A = max instances covering one segment
+*/
+RWTexture2D<float4> gWorkDebug;
+
+static const uint kMaxBounces = MAX_BOUNCES;
+static const bool kUseNEE = USE_NEE;
+static const bool kUseRussianRoulette = USE_RUSSIAN_ROULETTE;
+static const bool kUseEnvLight = USE_ENV_LIGHT;
+
+/** VNA spec section 5, Stage A: resampled importance sampling (RIS) of the
+    PRIMARY scatter vertex. Off by default - the plain path is the reference
+    ground truth and must stay untouched (handoff rule).
+
+    With RIS on, the pixel estimate splits into two independently estimated,
+    non-overlapping terms:
+      escape term   T * bg      - T estimated by the transmittance estimator
+                                  (continuous value, lower variance than the
+                                  binary escape event of the plain path);
+      scatter term  RIS         - M cheap candidates from the coarse field
+                                  (exact analytic pdfs), one survivor shaded
+                                  with the REAL raw-VDB field. Unbiased for any
+                                  target by the RIS identity (spec section 2, P1).
+*/
+static const bool kUseRIS = USE_RIS;
+
+/** Radiance arriving from direction 'dir' when a ray escapes the medium.
+*/
+float3 evalEnvironment(const float3 dir)
+{
+    if (!kUseEnvLight)
+        return float3(0.f);
+    return gScene.envMap.eval(dir);
+}
+
+/** Next-event estimation: connect a scatter vertex to the environment.
+
+    Importance-samples the env map, then estimates transmittance along the
+    shadow ray by ratio tracking through all instances. The phase function is
+    evaluated for the sampled direction and divided by the env-map pdf.
+*/
+float3 evalNEE<S : ISampleGenerator>(
+    const float3 pos,
+    const float3 wi,
+    const HenyeyGreensteinPhaseFunction phase,
+    inout VolumeInstanceSampler volumeSampler,
+    inout S sg
+)
+{
+    if (!kUseEnvLight)
+        return float3(0.f);
+
+    EnvMapSample lightSample;
+    if (!gParams.envMapSampler.sample(sampleNext2D(sg), lightSample))
+        return float3(0.f);
+    if (lightSample.pdf <= 0.f)
+        return float3(0.f);
+
+    // Phase function value for the light direction.
+    // Convention: both directions point away from the scatter point.
+    const float3 fp = phase.eval(wi, lightSample.dir);
+    if (all(fp <= 0.f))
+        return float3(0.f);
+
+    // Shadow ray through the medium. FLT_MAX so it leaves every volume entirely
+    // rather than being clipped by the camera far plane.
+    Ray shadowRay = Ray(pos, lightSample.dir, 0.f, FLT_MAX);
+    const float Tr = volumeSampler.evalTransmittance(shadowRay, sg);
+    if (Tr <= 0.f)
+        return float3(0.f);
+
+    return fp * lightSample.Le * Tr / lightSample.pdf;
+}
+
+/** Shade one scatter vertex and set up the continuation ray.
+
+    Shared by the reference path and the RIS primary path (VNA spec section 5,
+    Stage A) so both run byte-identical vertex shading: NEE, phase sampling,
+    Russian roulette. Returns false if the path terminates here.
+*/
+bool scatterAtVertex<S : ISampleGenerator>(
+    const float3 scatterPos,
+    const float3 wi,
+    const float g,
+    const uint bounce,
+    inout Ray ray,
+    inout float3 throughput,
+    inout float3 radiance,
+    inout VolumeInstanceSampler volumeSampler,
+    inout S sg
+)
+{
+    const HenyeyGreensteinPhaseFunction phase = HenyeyGreensteinPhaseFunction(g);
+
+    if (kUseNEE)
+    {
+        radiance += throughput * evalNEE(scatterPos, wi, phase, volumeSampler, sg);
+    }
+
+    // Sample a new direction from the phase function.
+    float3 wo;
+    float pdf;
+    float3 weight;
+    if (!phase.sample(wi, wo, pdf, weight, sg))
+        return false;
+    throughput *= weight;
+
+    if (kUseRussianRoulette && bounce > 3)
+    {
+        const float maxThp = max(throughput.x, max(throughput.y, throughput.z));
+        const float q = max(0.05f, 1.f - maxThp);
+        if (sampleNext1D(sg) < q)
+            return false;
+        throughput /= (1.f - q);
+    }
+
+    if (all(throughput <= 0.f))
+        return false;
+
+    ray = Ray(scatterPos, wo, 0.f, FLT_MAX);
+    return true;
+}
+
+[numthreads(16, 16, 1)]
+void main(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    const uint2 pixel = dispatchThreadId.xy;
+    if (any(pixel >= gFrameDim))
+        return;
+
+    SampleGenerator sg = SampleGenerator(pixel, gFrameCount);
+    VolumeInstanceSampler volumeSampler = {};
+
+    // Primary ray. Extend tMax past the camera far plane: the far plane is a
+    // rasterization concept and would otherwise clip the volume.
+    Ray ray = gScene.camera.computeRayPinhole(pixel, gFrameDim);
+    ray.tMax = FLT_MAX;
+
+    float3 radiance = float3(0.f);
+    float3 throughput = float3(1.f);
+
+    // Section 6 demodulation. The environment along the PRIMARY direction is a
+    // deterministic lookup, so it is evaluated once here, noise-free. primaryT
+    // holds an unbiased estimate of the primary transmittance: on the plain
+    // path it is the binary escape outcome of the first free flight; on the
+    // RIS path it is the continuous ratio-tracked value (same expectation,
+    // lower variance). Either way it only ever needs TEMPORAL averaging.
+    // Everything else the path gathers is in-scattered radiance.
+    const float3 primaryBg = evalEnvironment(ray.dir);
+    float primaryT = 0.f;
+
+    uint bounce = 0;
+    bool traceLoop = true;
+
+    // Cost-bucket state: attribute the sampler-internal marching per phase.
+    uint cellsMark = gvsCellsNow();
+    uint tapsMark = gvsTapsNow();
+    uint cellsT = 0, tapsT = 0;
+    uint cellsCand = 0, tapsCand = 0;
+
+    // RIS probe state (written to gRisDebug at the end).
+    uint risExit = kRisExitNoMedium;
+    float risCount = 0.f;
+    float risWSum = 0.f;
+    float risW = 0.f;
+
+    if (kUseRIS)
+    {
+        // ---- Escape/background term: continuous transmittance estimate. ----
+        // Replaces the plain path's binary escape event with the (residual)
+        // ratio-tracked value: same expectation, strictly lower variance, and
+        // it feeds the section-6 T channel directly.
+        // The primary ray is the one place the pixel footprint is well defined,
+        // so footprint-driven residual-mip selection (UE projected-error rule)
+        // applies here and is reset immediately after: NEE shadow rays measure
+        // distance from the vertex, not the camera, and would misuse it.
+        volumeSampler.footprintSpread = gFootprintSpread;
+        const float Tfull = volumeSampler.evalTransmittance(ray, sg);
+        volumeSampler.footprintSpread = 0.f;
+        primaryT = Tfull;
+        radiance += Tfull * primaryBg;
+
+        cellsT = gvsCellsNow() - cellsMark;
+        tapsT = gvsTapsNow() - tapsMark;
+        cellsMark = gvsCellsNow();
+        tapsMark = gvsTapsNow();
+
+        // ---- Scatter term: RIS over the primary vertex. ----
+        //
+        // CANDIDATES ARE REAL COLLISIONS. Each candidate comes from a full
+        // null-collision (delta-tracking) walk, so it is by construction a
+        // genuine scatter event in the real medium. The previous design drew
+        // candidates from the majorant CDF, which places points anywhere in an
+        // occupied 8^3 brick - and measurement showed 87% of survivors landed
+        // on ZERO real density (that ratio IS the null-collision rate; delta
+        // tracking survives it by CONTINUING to march, a single RIS pick does
+        // not). Generating candidates this way removes that failure entirely
+        // rather than compensating for it.
+        //
+        // THE ALGEBRA COLLAPSES. Delta tracking samples distance with
+        //     p(t) = sigma_t(t) * T(t)
+        // and the true integrand is f(t) = T(t) * sigma_t(t) * albedo * L(t).
+        // Choosing the target p-hat(t) = p(t) * Lhat(t) makes the RIS weight
+        //     w = p-hat/p = Lhat
+        // so p CANCELS - it is never evaluated - and the final estimate is
+        //     f(y)/p-hat(y) * (1/M) sum(w) = albedo * L(y)/Lhat(y) * (1/M) sum(w)
+        // i.e. just albedo * (sum(w) / (M * w_sel)), with L supplied by the
+        // normal vertex shading. No pdf, no transmittance estimate to the
+        // vertex, no huge 1/pdf weights - all sources of the fireflies.
+        traceLoop = false;
+        if (kMaxBounces > 0)
+        {
+            // One shared target light direction per pixel. It only shapes the
+            // TARGET (which candidate wins); the surviving vertex does its own
+            // fresh NEE, so no correlation enters the result.
+            EnvMapSample targetLight = {};
+            bool haveTargetLight = false;
+            if (kUseEnvLight)
+            {
+                haveTargetLight = gParams.envMapSampler.sample(sampleNext2D(sg), targetLight) && targetLight.pdf > 0.f;
+            }
+
+            const float3 wi = -ray.dir;
+
+            // All M candidate walks travel the SAME primary ray, so the instance
+            // intervals are identical for every one of them: gather once. Doing
+            // it per walk cost 130 AABB tests/pixel (271M/frame) - measured as
+            // the largest work term in the pass.
+            const VolumeInstanceSampler::IntervalList primaryList = volumeSampler.gatherIntervals(ray);
+
+            // ---- Candidate generation: M real delta-tracking collisions. ----
+            // Primary-ray footprint applies here exactly as it did for the
+            // escape term: it drives the merged-tail gate and the residual-mip
+            // choice inside the marchers. Reset after - the target's shadow
+            // walks and the survivor's NEE measure from the vertex, not the
+            // camera.
+            volumeSampler.footprintSpread = gFootprintSpread;
+            VolumeInstanceSampler::CandidateSet cands;
+#if USE_SHARED_CANDIDATE_SWEEP
+            // One traversal, M processes (UE lesson: share the walk, keep the
+            // chains independent). Distribution identical to the M-walk loop
+            // below - VNA_RisValidate.py is the gate for that claim.
+            volumeSampler.sampleCandidatesSharedSweep(primaryList, ray, sg, cands);
+#else
+            // Reference variant: M independent full walks along the same ray.
+            // Kept selectable for A/B of both cost and correctness.
+            cands = {};
+            cands.count = 0;
+            for (uint j = 0; j < VolumeInstanceSampler::kRisM; ++j)
+            {
+                VolumeInstanceSampler::DistanceSample ds;
+                // Escaped candidates are not scatter events: weight 0. The
+                // escape term above already accounts for that radiance, so
+                // there is no double counting.
+                if (!volumeSampler.sampleDistanceWithList(primaryList, ray, sg, ds)) continue;
+                cands.t[cands.count] = ds.t;
+                cands.inst[cands.count] = ds.instance;
+                cands.count++;
+            }
+#endif
+            volumeSampler.footprintSpread = 0.f;
+
+            cellsCand = gvsCellsNow() - cellsMark;
+            tapsCand = gvsTapsNow() - tapsMark;
+            cellsMark = gvsCellsNow();
+            tapsMark = gvsTapsNow();
+
+            // ---- Streaming reservoir over the candidates. ----
+            float wSum = 0.f;
+            float selW = 0.f;
+            VolumeInstanceSampler::DistanceSample selDs = {};
+            uint nReal = cands.count;
+
+            for (uint j = 0; j < cands.count; ++j)
+            {
+                // Lhat: the cheap lighting guess. Any strictly positive value is
+                // unbiased (spec section 2, P1) - it only decides which real
+                // collision is kept.
+                float w = 1.f;
+                if (haveTargetLight)
+                {
+                    const float gj = gScene.getGridVolume(cands.inst[j]).data.anisotropy;
+                    const float3 fp = HenyeyGreensteinPhaseFunction(gj).eval(wi, targetLight.dir);
+                    const float3 posJ = ray.origin + cands.t[j] * ray.dir;
+                    const float tauShadow = volumeSampler.coarseOpticalDepth(Ray(posJ, targetLight.dir, 0.f, FLT_MAX));
+                    // Floored: deep points are lit by multiple scattering, which
+                    // this single-scatter target cannot see. Without the floor
+                    // exp(-tau) underflows to 0 and the target collapses.
+                    const float kTargetMinVisibility = 1e-3f;
+                    w = (fp.x + fp.y + fp.z) * (1.f / 3.f) * max(exp(-tauShadow), kTargetMinVisibility);
+                }
+
+                wSum += w;
+                if (w > 0.f && sampleNext1D(sg) * wSum < w)
+                {
+                    selDs.t = cands.t[j];
+                    selDs.instance = cands.inst[j];
+                    // Same throughput rule as the reference sampler: the chosen
+                    // instance's single-scattering albedo.
+                    selDs.thp = gScene.getGridVolume(cands.inst[j]).data.albedo;
+                    selW = w;
+                }
+            }
+
+            risCount = float(nReal);
+            risWSum = wSum;
+            risExit = (nReal == 0) ? kRisExitNoCandidate : kRisExitZeroTarget;
+
+            if (selW > 0.f)
+            {
+                // W = (1/M sum w) / Lhat(y). Bounded and well-conditioned: with
+                // equal weights it is exactly nReal/M, i.e. plain delta tracking.
+                const float W = wSum / (float(VolumeInstanceSampler::kRisM) * selW);
+                risW = W;
+
+                const GridVolume gv = gScene.getGridVolume(selDs.instance);
+                // ds.thp carries the instance albedo, exactly as the reference
+                // path uses it.
+                throughput *= selDs.thp * W;
+
+                const float3 scatterPos = ray.origin + selDs.t * ray.dir;
+                risExit = kRisExitTerminated;
+                if (scatterAtVertex(scatterPos, wi, gv.data.anisotropy, 0, ray, throughput, radiance, volumeSampler, sg))
+                {
+                    // Continuation bounces run the standard loop below.
+                    bounce = 1;
+                    traceLoop = true;
+                }
+                risExit = kRisExitContributed;
+            }
+        }
+    }
+
+    while (traceLoop)
+    {
+        VolumeInstanceSampler::DistanceSample ds;
+        const bool scattered = volumeSampler.sampleDistance(ray, sg, ds);
+
+        if (!scattered)
+        {
+            // Ray escaped the medium: pick up the environment.
+            // bounce == 0 here means the path NEVER scattered (bounce only
+            // increments after a real collision), i.e. this is the primary
+            // transmittance event: throughput is still exactly 1 and the
+            // pickup is exactly 1 * primaryBg.
+            if (bounce == 0)
+                primaryT = 1.f;
+            radiance += throughput * evalEnvironment(ray.dir);
+            break;
+        }
+
+        // Real scattering event. ds.thp carries the chosen instance's albedo.
+        throughput *= ds.thp;
+
+        const float3 scatterPos = ray.origin + ds.t * ray.dir;
+        const float3 wi = -ray.dir; // Points away from the scatter point.
+
+        if (bounce >= kMaxBounces)
+            break;
+
+        // Per-instance anisotropy (spec section 3: rim vs core lobe weights).
+        const float g = gScene.getGridVolume(ds.instance).data.anisotropy;
+
+        if (!scatterAtVertex(scatterPos, wi, g, bounce, ray, throughput, radiance, volumeSampler, sg))
+            break;
+
+        bounce++;
+    }
+
+    gOutputColor[pixel] = float4(radiance, 1.f);
+
+    // Demodulated outputs. Lin is derived by subtraction rather than being
+    // accumulated separately in the loop: the primary-escape contribution is
+    // exactly primaryT * primaryBg (throughput was still 1), so the
+    // decomposition color = Lin + T * bg is EXACT per sample, not a model.
+    if (is_valid(gOutputLin))
+        gOutputLin[pixel] = float4(radiance - primaryT * primaryBg, 1.f);
+    // T replicated into rgb so a stock Multiply composite (T * bg) works
+    // channelwise without a custom pass.
+    if (is_valid(gOutputT))
+        gOutputT[pixel] = float4(primaryT, primaryT, primaryT, 1.f);
+    if (is_valid(gOutputBg))
+        gOutputBg[pixel] = float4(primaryBg, 1.f);
+
+    if (is_valid(gRisDebug))
+        gRisDebug[pixel] = float4(float(risExit), risCount, risWSum, risW);
+
+#if USE_RIS_STATS
+    // Wave-reduce before touching memory: a per-pixel atomic on 7 addresses
+    // from millions of threads would serialise the whole dispatch. Counting
+    // within the wave first makes this ~32x fewer atomics and stays EXACT
+    // (no sampling, no estimation).
+    for (uint c = 0; c <= kRisExitContributed; ++c)
+    {
+        const uint n = WaveActiveCountBits(risExit == c);
+        if (WaveIsFirstLane() && n > 0)
+            InterlockedAdd(gRisStats[c], n);
+    }
+    {
+        const uint nCand = WaveActiveSum(uint(risCount));
+        if (WaveIsFirstLane() && nCand > 0)
+            InterlockedAdd(gRisStats[7], nCand);
+        const uint nMedium = WaveActiveCountBits(risExit != kRisExitNoMedium);
+        if (WaveIsFirstLane() && nMedium > 0)
+            InterlockedAdd(gRisStats[8], nMedium);
+    }
+#endif
+
+#if USE_WORK_STATS
+    // Work profile. Same wave-reduce trick. These counts are what the GPU time
+    // is actually spent on, so dividing the measured pass ms by them tells you
+    // which operation to attack - instead of guessing at the hot spot.
+    {
+        // Everything after the last mark is shading/marching: reference-path
+        // distance sampling, NEE shadow rays, continuation bounces.
+        const uint cellsShade = gvsCellsNow() - cellsMark;
+        const uint tapsShade = gvsTapsNow() - tapsMark;
+
+        const uint a = WaveActiveSum(volumeSampler.statAabbTests);
+        const uint b = WaveActiveSum(volumeSampler.statSegments);
+        const uint c = WaveActiveSum(volumeSampler.statCoarseWalks);
+        const uint d = WaveActiveSum(volumeSampler.statCoarseCells);
+        const uint e = WaveActiveSum(volumeSampler.statCandCells);
+        const uint f = WaveActiveSum(volumeSampler.statRealTaps);
+        const uint g = WaveActiveSum(volumeSampler.statRays);
+        const uint h0 = WaveActiveSum(cellsT);
+        const uint h1 = WaveActiveSum(tapsT);
+        const uint h2 = WaveActiveSum(cellsCand);
+        const uint h3 = WaveActiveSum(tapsCand);
+        const uint h4 = WaveActiveSum(cellsShade);
+        const uint h5 = WaveActiveSum(tapsShade);
+        const uint h6 = WaveActiveSum(volumeSampler.statOverlapSteps);
+        const uint h7 = WaveActiveSum(volumeSampler.statOverlapLookups);
+        if (WaveIsFirstLane())
+        {
+            if (a > 0) InterlockedAdd(gRisStats[9], a);
+            if (b > 0) InterlockedAdd(gRisStats[10], b);
+            if (c > 0) InterlockedAdd(gRisStats[11], c);
+            if (d > 0) InterlockedAdd(gRisStats[12], d);
+            if (e > 0) InterlockedAdd(gRisStats[13], e);
+            if (f > 0) InterlockedAdd(gRisStats[14], f);
+            if (g > 0) InterlockedAdd(gRisStats[15], g);
+            if (h0 > 0) InterlockedAdd(gRisStats[16], h0);
+            if (h1 > 0) InterlockedAdd(gRisStats[17], h1);
+            if (h2 > 0) InterlockedAdd(gRisStats[18], h2);
+            if (h3 > 0) InterlockedAdd(gRisStats[19], h3);
+            if (h4 > 0) InterlockedAdd(gRisStats[20], h4);
+            if (h5 > 0) InterlockedAdd(gRisStats[21], h5);
+            if (h6 > 0) InterlockedAdd(gRisStats[22], h6);
+            if (h7 > 0) InterlockedAdd(gRisStats[23], h7);
+        }
+    }
+#endif
+
+    if (is_valid(gWorkDebug))
+    {
+        gWorkDebug[pixel] = float4(
+            float(volumeSampler.statSegments),
+            float(volumeSampler.statOverlapSteps),
+            float(volumeSampler.statAabbTests),
+            float(volumeSampler.statMaxCover)
+        );
+    }
+}

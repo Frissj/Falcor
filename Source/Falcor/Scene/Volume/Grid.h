@@ -80,6 +80,28 @@ namespace Falcor
         */
         static ref<Grid> createBox(ref<Device> pDevice, float width, float height, float depth, float voxelSize, float blendRange = 3.f);
 
+        /** Release the NanoVDB buffer from GPU memory once the bricked grid is built.
+
+            The bricked path (GridVolumeSampler with useBrickedGrid = true, i.e. the
+            RatioTrackingLocalMajorant / DeltaTrackingLocalMajorant modes) reads only
+            rangeTex/indirectionTex/atlasTex and never touches the NanoVDB buffer, so
+            keeping it resident is pure waste: the buffer is roughly 6-7x the size of
+            the brick textures (see the "~15% increased footprint" note in the ctor).
+
+            WARNING: the plain RatioTracking / DeltaTracking sampler modes DO read the
+            NanoVDB buffer and will produce garbage if it has been released. Only enable
+            this when every consumer uses the bricked path.
+
+            Must be set BEFORE grids are loaded. Default: false (both stay resident).
+        */
+        static void setReleaseNanoVDBBufferAfterBricking(bool enable) { sReleaseNanoVDBBuffer = enable; }
+        static bool getReleaseNanoVDBBufferAfterBricking() { return sReleaseNanoVDBBuffer; }
+
+        /** True if the full NanoVDB buffer is still resident on the GPU.
+            False means this grid is bricked-path only.
+        */
+        bool isNanoVDBBufferResident() const { return mNanoVDBBufferResident; }
+
         /** Create a grid from a file.
             Currently only OpenVDB and NanoVDB grids of type float are supported.
             \param[in] pDevice GPU device.
@@ -144,13 +166,22 @@ namespace Falcor
         */
         float4x4 getInvTransform() const;
 
+        /** Get the bricked-grid representation (GPU textures + the CPU range/
+            mean pyramids kept after conversion). Used by the HW-BVH brick-AABB
+            extraction and the merged-tail bake (VNA_UE_SOURCE_LESSONS.md).
+        */
+        const BrickedGrid& getBrickedGrid() const { return mBrickedGrid; }
+
     private:
         Grid(ref<Device> pDevice, nanovdb::GridHandle<nanovdb::HostBuffer> gridHandle);
 
         static ref<Grid> createFromNanoVDBFile(ref<Device>, const std::filesystem::path& path, const std::string& gridname);
         static ref<Grid> createFromOpenVDBFile(ref<Device>, const std::filesystem::path& path, const std::string& gridname);
 
+        static bool sReleaseNanoVDBBuffer;
+
         ref<Device> mpDevice;
+        bool mNanoVDBBufferResident = true;
 
         // Host data.
         nanovdb::GridHandle<nanovdb::HostBuffer> mGridHandle;

@@ -37,12 +37,18 @@ enum class TransmittanceEstimator
     DeltaTracking,
     RatioTracking,
     RatioTrackingLocalMajorant,  // BrickedGrid only.
+    // Residual ratio tracking (Novak et al. 2014), VNA spec section 2 / P2:
+    // per DDA node, the mean density is a control variate whose transmittance
+    // is computed ANALYTICALLY (T_c = exp(-mean*dt)); only the residual
+    // |density - mean| is estimated stochastically. Unbiased at every mip.
+    ResidualRatioTrackingLocalMajorant,  // BrickedGrid only. Requires the mean pyramid.
 };
 
 FALCOR_ENUM_INFO(TransmittanceEstimator, {
     { TransmittanceEstimator::DeltaTracking, "DeltaTracking" },
     { TransmittanceEstimator::RatioTracking, "RatioTracking" },
     { TransmittanceEstimator::RatioTrackingLocalMajorant, "RatioTrackingLocalMajorant" },
+    { TransmittanceEstimator::ResidualRatioTrackingLocalMajorant, "ResidualRatioTrackingLocalMajorant" },
 });
 FALCOR_ENUM_REGISTER(TransmittanceEstimator);
 
@@ -60,7 +66,7 @@ FALCOR_ENUM_REGISTER(DistanceSampler);
 
 #ifdef HOST_CODE
 inline bool requiresBrickedGrid(DistanceSampler d) { return d == DistanceSampler::DeltaTrackingLocalMajorant; }
-inline bool requiresBrickedGrid(TransmittanceEstimator t) { return t == TransmittanceEstimator::RatioTrackingLocalMajorant; }
+inline bool requiresBrickedGrid(TransmittanceEstimator t) { return t == TransmittanceEstimator::RatioTrackingLocalMajorant || t == TransmittanceEstimator::ResidualRatioTrackingLocalMajorant; }
 #endif
 
 END_NAMESPACE_FALCOR

@@ -130,6 +130,7 @@ namespace Falcor
         var["rangeTex"] = mBrickedGrid.range;
         var["indirectionTex"] = mBrickedGrid.indirection;
         var["atlasTex"] = mBrickedGrid.atlas;
+        var["meanTex"] = mBrickedGrid.mean;
         var["minIndex"] = getMinIndex();
         var["minValue"] = getMinValue();
         var["maxIndex"] = getMaxIndex();
@@ -166,7 +167,8 @@ namespace Falcor
         const uint64_t nvdb = mpBuffer ? mpBuffer->getSize() : (uint64_t)0;
         const uint64_t bricks = (mBrickedGrid.range ? mBrickedGrid.range->getTextureSizeInBytes() : (uint64_t)0) +
             (mBrickedGrid.indirection ? mBrickedGrid.indirection->getTextureSizeInBytes() : (uint64_t)0) +
-            (mBrickedGrid.atlas ? mBrickedGrid.atlas->getTextureSizeInBytes() : (uint64_t)0);
+            (mBrickedGrid.atlas ? mBrickedGrid.atlas->getTextureSizeInBytes() : (uint64_t)0) +
+            (mBrickedGrid.mean ? mBrickedGrid.mean->getTextureSizeInBytes() : (uint64_t)0);
         return nvdb + bricks;
     }
 
@@ -223,7 +225,31 @@ namespace Falcor
         );
         using NanoVDBGridConverter = NanoVDBConverterBC4;
         mBrickedGrid = NanoVDBGridConverter(mpFloatGrid).convert(mpDevice);
+
+        // Optionally drop the NanoVDB buffer now that the bricks exist. The bricked
+        // sampler path never reads it, and it dwarfs the brick textures.
+        // A one-element placeholder replaces it rather than nullptr, so that
+        // Grid.slang's 'buf' stays bound and dispatches don't fail on a null SRV.
+        if (sReleaseNanoVDBBuffer)
+        {
+            const uint64_t freed = mpBuffer->getSize();
+            mpBuffer = mpDevice->createStructuredBuffer(
+                sizeof(uint32_t),
+                1,
+                ResourceBindFlags::ShaderResource,
+                MemoryType::DeviceLocal,
+                nullptr
+            );
+            mNanoVDBBufferResident = false;
+            logInfo(
+                "Grid: released NanoVDB buffer after bricking, freed {}. Bricked sampler path only "
+                "(plain RatioTracking/DeltaTracking modes will now be incorrect for this grid).",
+                formatByteSize(freed)
+            );
+        }
     }
+
+    bool Grid::sReleaseNanoVDBBuffer = false;
 
     ref<Grid> Grid::createFromNanoVDBFile(ref<Device> pDevice, const std::filesystem::path& path, const std::string& gridname)
     {
@@ -312,6 +338,13 @@ namespace Falcor
         grid.def_property_readonly("maxValue", &Grid::getMaxValue);
 
         grid.def("getValue", &Grid::getValue, "ijk"_a);
+        grid.def_property_readonly("nanoVDBBufferResident", &Grid::isNanoVDBBufferResident);
+
+        // Static, must be set before any grid is loaded.
+        grid.def_static(
+            "setReleaseNanoVDBBufferAfterBricking", &Grid::setReleaseNanoVDBBufferAfterBricking, "enable"_a
+        );
+        grid.def_static("getReleaseNanoVDBBufferAfterBricking", &Grid::getReleaseNanoVDBBufferAfterBricking);
 
         auto createSphere = [] (float radius, float voxelSize, float blendRange)
         {

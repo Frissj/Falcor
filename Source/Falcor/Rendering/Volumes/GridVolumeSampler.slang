@@ -51,6 +51,39 @@ import GridVolumeSamplerParams;
 #error "GRID_VOLUME_SAMPLER_USE_BRICKEDGRID not defined!"
 #endif
 
+// Mip level of the mean/range pyramids used by residual ratio tracking.
+// Optional (defaulted, not #error'd) so existing users of this module that
+// predate the residual estimator keep compiling unchanged.
+#ifndef GRID_VOLUME_SAMPLER_RESIDUAL_MIP
+#define GRID_VOLUME_SAMPLER_RESIDUAL_MIP 0
+#endif
+
+// Work counters for the ACTUAL marching this module does. Optional and off by
+// default so every existing user compiles byte-identical. When enabled, these
+// per-thread globals accumulate across every estimator call in the invocation;
+// the host pass snapshots them around call sites to attribute cost per phase.
+// Motivation (measured): the VolumePathTracer [WORK] log attributed ~0 of a
+// ~470 ms frame because all marching happens inside this module, uncounted.
+#ifndef GRID_VOLUME_SAMPLER_STATS
+#define GRID_VOLUME_SAMPLER_STATS 0
+#endif
+#if GRID_VOLUME_SAMPLER_STATS
+static uint gGvsStatCells = 0; ///< Majorant DDA cells stepped (range-tex fetch + stepDDA). The non-DDA estimators only tap, so their cost shows up entirely in taps.
+static uint gGvsStatTaps = 0;  ///< Real density taps (stochastic atlas fetches) - the memory-bound operation.
+#endif
+void gvsStatCell()
+{
+#if GRID_VOLUME_SAMPLER_STATS
+    gGvsStatCells++;
+#endif
+}
+void gvsStatTap()
+{
+#if GRID_VOLUME_SAMPLER_STATS
+    gGvsStatTaps++;
+#endif
+}
+
 /** Helper class for sampling grid volumes in the scene.
     Note: For simplicity, this sampler only uses the first volume in the scene.
 */
@@ -58,6 +91,7 @@ struct GridVolumeSampler
 {
     static const TransmittanceEstimator kTransmittanceEstimator = TransmittanceEstimator(GRID_VOLUME_SAMPLER_TRANSMITTANCE_ESTIMATOR);
     static const DistanceSampler kDistanceSampler = DistanceSampler(GRID_VOLUME_SAMPLER_DISTANCE_SAMPLER);
+    static const int kResidualMip = GRID_VOLUME_SAMPLER_RESIDUAL_MIP;
 
     uint4 _dummy;
 
@@ -156,6 +190,8 @@ struct GridVolumeSampler
             return evalTransmittanceRatioTracking(gridVolume, ray.origin, ray.dir, nearFar, tsg);
         case TransmittanceEstimator::RatioTrackingLocalMajorant:
             return evalTransmittanceRatioTrackingLocalDDA(gridVolume, ray.origin, ray.dir, nearFar, tsg);
+        case TransmittanceEstimator::ResidualRatioTrackingLocalMajorant:
+            return evalTransmittanceResidualRatioTrackingLocalDDA(gridVolume, ray.origin, ray.dir, nearFar, tsg);
         default:
             return 1.f;
         }
@@ -195,6 +231,7 @@ struct GridVolumeSampler
     float lookupDensityIndex(const GridVolume gridVolume, const float3 ipos, const float3 u, const Grid densityGrid, inout DensityAccessor densityAccessor)
     {
         logVolumeLookup();
+        gvsStatTap();
 #if GRID_VOLUME_SAMPLER_USE_BRICKEDGRID
         return gridVolume.data.densityScale * densityGrid.lookupStochasticIndexTex(ipos, u);
 #else
@@ -284,6 +321,7 @@ struct GridVolumeSampler
         // Warning: Changing the mip level based on 'tauToGo' below could potentially introduce bias, although it would not seem to be visible in practice.
         while (t < tFar)
         {
+            gvsStatCell();
             // Core DDA step.
             const int mip = round(getAccessorLevel(accessor));
             const float3 pos = ipos + idir * t;
@@ -334,6 +372,106 @@ struct GridVolumeSampler
         return Tr;
     }
 
+
+    /** Residual ratio tracking over the mean pyramid (Novak et al. 2014;
+        VNA spec section 2 / P2 "prefilter == control variate").
+
+        Per DDA node at mip kResidualMip the density is split
+            sigma = sigma_c + sigma_r,   sigma_c = node MEAN (meanTex)
+        so transmittance factorises EXACTLY: T = T_c * T_r, where
+            T_c = exp(-integral of sigma_c)   -> ANALYTIC (zero variance), and
+            T_r                               -> ratio-tracked with the residual
+        majorant sigmaRbar = max(majorant - mean, mean - minorant), which bounds
+        |sigma_r| for every lookup in the node: the converter folds the 1-voxel
+        halo into [minorant, majorant], so even stochastic-trilinear taps that
+        cross the brick border stay inside the bound.
+
+        Properties worth knowing:
+         - Unbiased at EVERY mip: the mip only changes which sigma_c is used,
+           i.e. variance, never the expectation. That is the whole P2 claim,
+           and it is directly testable by sweeping the mip against FLIP.
+         - Uniform and empty nodes have sigmaRbar == 0 and cost zero stochastic
+           work: their transmittance is purely analytic.
+         - The residual collision rate sigmaRbar <= majorant, so this never
+           takes more density taps than plain ratio tracking on the same node;
+           where the mean tracks the field well it takes far fewer.
+        The mip can now be chosen PER CALL (runtime parameter, overload below):
+        unbiasedness at every mip is exactly what makes a per-ray footprint-
+        driven choice legal - the choice is deterministic geometry, independent
+        of the random numbers, so it only moves variance/cost, never the mean.
+        The compile-time-kResidualMip signature forwards here unchanged.
+    */
+    float evalTransmittanceResidualRatioTrackingLocalDDA<S : ISampleGenerator>(const GridVolume gridVolume, const float3 rayOrigin, const float3 rayDir, const float2 nearFar, inout S sg)
+    {
+        return evalTransmittanceResidualRatioTrackingLocalDDA(gridVolume, rayOrigin, rayDir, nearFar, sg, kResidualMip);
+    }
+
+    float evalTransmittanceResidualRatioTrackingLocalDDA<S : ISampleGenerator>(const GridVolume gridVolume, const float3 rayOrigin, const float3 rayDir, const float2 nearFar, inout S sg, const int residualMip)
+    {
+        // Setup access to density grid.
+        Grid densityGrid;
+        gScene.getGrid(gridVolume.getDensityGrid(), densityGrid);
+        DensityAccessor densityAccessor = createAccessor(densityGrid);
+
+        float3 ipos, idir;
+        transformRayToIndexSpace(gridVolume, densityGrid, rayOrigin, rayDir, ipos, idir);
+        const float3 ri = 1.f / idir;
+        const float scale = gridVolume.data.densityScale;
+
+        float tauC = 0.f; ///< Accumulated analytic control optical depth: T_c = exp(-tauC).
+        float Tr = 1.f;   ///< Stochastic residual transmittance.
+
+        float t = nearFar.x;
+        while (t < nearFar.y)
+        {
+            gvsStatCell();
+            // One DDA node at the chosen mip. stepDDA's half-voxel dilation
+            // guarantees tExit > t, so the walk always makes progress (same
+            // invariant the stock local-majorant loop relies on).
+            const float3 pos = ipos + idir * t;
+            const float tExit = min(stepDDA(ipos, ri, pos, residualMip), nearFar.y);
+            const float dt = tExit - t;
+
+            logVolumeLookup();
+            const float2 majMin = densityGrid.lookupIndexLocalRangeTex(int3(pos), residualMip);
+            const float mean = densityGrid.lookupIndexLocalMeanTex(int3(pos), residualMip);
+            const float sigmaC = scale * mean;
+            const float sigmaRbar = scale * max(majMin.x - mean, mean - majMin.y);
+
+            // Control transmittance over this node: analytic, zero variance.
+            tauC += sigmaC * dt;
+
+            if (sigmaRbar > 0.f)
+            {
+                // Ratio-track the residual inside [t, tExit].
+                const float invSigmaRbar = 1.f / sigmaRbar;
+                float tt = t;
+                while (true)
+                {
+                    tt -= log(1.f - sampleNext1D(sg)) * invSigmaRbar;
+                    if (tt >= tExit) break;
+                    const float d = lookupDensityIndex(gridVolume, ipos + tt * idir, sampleNext3D(sg), densityGrid, densityAccessor);
+                    // (d - sigmaC) / sigmaRbar is in [-1, 1] by the bound above,
+                    // so the factor is in [0, 2]: Tr may legitimately exceed 1
+                    // where the control overshoots (negative residual). That is
+                    // the "prefilter is allowed to be loose" part of P2.
+                    Tr *= 1.f - (d - sigmaC) * invSigmaRbar;
+                }
+            }
+            t = tExit;
+
+            // Russian roulette on the residual factor, same guard as the stock
+            // ratio tracker. Only fires on small Tr; unbiased because the
+            // survivor is reweighted by 1/Tr and the analytic factor is
+            // deterministic.
+            if (Tr < 0.1f)
+            {
+                if (sampleNext1D(sg) >= Tr) return 0.f;
+                Tr = 1.f;
+            }
+        }
+        return exp(-tauC) * Tr;
+    }
 
     bool sampleDistanceDeltaTracking<S : ISampleGenerator>(const GridVolume gridVolume, const float3 rayOrigin, const float3 rayDir, const float2 nearFar, inout S sg, out DistanceSample ds)
     {

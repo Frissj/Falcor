@@ -44,6 +44,10 @@ struct Grid
     Texture3D<float2> rangeTex;
     Texture3D<uint4> indirectionTex;
     Texture3D<float> atlasTex;
+    // Per-brick mean density, same brick grid + 4-mip layout as rangeTex.
+    // Control-variate field for residual ratio tracking (VNA spec section 2).
+    // rangeTex mips are max/min - NOT means; do not conflate the two pyramids.
+    Texture3D<float> meanTex;
 
     /** Get the minimum index stored in the grid.
         \return Returns minimum index stored in the grid.
@@ -201,6 +205,29 @@ struct Grid
     {
         index >>= (3 + mip);
         return rangeTex.Load(int4(index, mip)).x;
+    }
+
+    /** Lookup the local (majorant, minorant) pair on a given mipmap level.
+        \param[in] index Fractional voxel index.
+        \return Returns (max, min) density over the node's region.
+    */
+    float2 lookupIndexLocalRangeTex(int3 index, const int mip)
+    {
+        index >>= (3 + mip);
+        return rangeTex.Load(int4(index, mip)).xy;
+    }
+
+    /** Lookup the local MEAN density on a given mipmap level.
+        This is the control variate sigma_c for residual ratio tracking (VNA
+        spec section 2 / P2): its transmittance is analytic, only the residual
+        against it is estimated stochastically.
+        \param[in] index Fractional voxel index.
+        \return Returns the mean density over the node's region.
+    */
+    float lookupIndexLocalMeanTex(int3 index, const int mip)
+    {
+        index >>= (3 + mip);
+        return meanTex.Load(int4(index, mip));
     }
 
     /** Lookup the grid using tri-linear sampling.

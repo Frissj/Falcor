@@ -51,6 +51,11 @@ namespace Falcor
             TransmittanceEstimator transmittanceEstimator = TransmittanceEstimator::RatioTrackingLocalMajorant;
             DistanceSampler distanceSampler = DistanceSampler::DeltaTrackingLocalMajorant;
             bool useBrickedGrid = true;
+            /// Mip of the mean/range pyramids used by residual ratio tracking
+            /// (VNA spec section 2 / P2). 0 = per-8^3-brick mean (tightest
+            /// residual bound), 3 = coarsest (64^3). Unbiased at every level;
+            /// only variance/cost change. Ignored by the other estimators.
+            uint32_t residualMip = 0;
 
             // Note: Empty constructor needed for clang due to the use of the nested struct constructor in the parent constructor.
             Options() {}
@@ -61,6 +66,7 @@ namespace Falcor
                 ar("transmittanceEstimator", transmittanceEstimator);
                 ar("distanceSampler", distanceSampler);
                 ar("useBrickedGrid", useBrickedGrid);
+                ar("residualMip", residualMip);
             }
         };
 

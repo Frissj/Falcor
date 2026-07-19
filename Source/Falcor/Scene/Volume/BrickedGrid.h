@@ -27,6 +27,9 @@
  **************************************************************************/
 #pragma once
 #include "Core/API/Texture.h"
+#include "Utils/Math/Vector.h"
+#include <cstdint>
+#include <vector>
 
 namespace Falcor
 {
@@ -35,5 +38,26 @@ namespace Falcor
         ref<Texture> range;
         ref<Texture> indirection;
         ref<Texture> atlas;
+        // Per-brick MEAN density, same brick grid and 4-mip layout as 'range'.
+        // The control-variate field for residual ratio tracking (VNA spec
+        // section 2 / P2). NOTE: 'range' stores majorant/minorant (max/min) -
+        // a different quantity; the mips of 'range' are NOT a mean pyramid.
+        ref<Texture> mean;
+
+        // CPU-side copies of the range/mean pyramids, kept after conversion.
+        // Consumers (UE-lesson ports, see VNA_UE_SOURCE_LESSONS.md):
+        //  - brick-AABB extraction for the HW-BVH: occupied bricks at a chosen
+        //    mip become procedural primitives in a per-(grid,mip) BLAS, which
+        //    is how LoD becomes a property of the acceleration structure;
+        //  - the merged-coarse-tail bake, which needs conservative per-cell
+        //    bounds of the SUM of instanced grids.
+        // Layout matches the GPU textures exactly: cumulative 4-mip brick grid,
+        // rangeData = f16 majorant | f16 minorant << 16, meanData = f16 mean.
+        // Coordinates are in SHIFTED index space (NanoVDB index minus
+        // getMinIndex()), i.e. the space the sampler marches in.
+        std::vector<uint32_t> rangeData;
+        std::vector<uint16_t> meanData;
+        int3 leafDim[4] = {};       ///< Brick-grid dimensions per mip (mip m cells are 8<<m voxels wide).
+        uint32_t leafOffset[4] = {}; ///< Start of each mip's cells within rangeData/meanData.
     };
 }
