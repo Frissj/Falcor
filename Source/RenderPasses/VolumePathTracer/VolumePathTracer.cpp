@@ -1003,6 +1003,10 @@ void VolumePathTracer::prepareProgram(RenderContext* pRenderContext)
     // binding a null acceleration structure.
     defines.add("USE_BRICK_TLAS", (mUseBrickTlas && mBrickBlasesValid) ? "1" : "0");
     defines.add("USE_MERGED_TAIL", (mUseMergedTail && mpTailTex) ? "1" : "0");
+    // Lever-2 prefetch is COMPILE-TIME: the entry costs ~9 registers whether
+    // or not a runtime flag reads it (run 137: gpuMs 26 -> 38 with identical
+    // counters = register pressure). The checkbox rebuilds the program.
+    defines.add("GVS_BRICK_PREFETCH", mUseBrickPrefetch ? "1" : "0");
     // Stream compaction: only meaningful on the RIS path (the reference path
     // stays a single fused kernel, byte-identical ground truth).
     const bool compactionCompiled = mUseRIS && mUseCompaction;
@@ -1410,7 +1414,6 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
         var["CB"]["gFrameDim"] = targetDim;
         var["CB"]["gFootprintSpread"] = footprintSpread;
         var["CB"]["gOccSkipEnable"] = mUseOccupancySkip ? 1u : 0u;
-        var["CB"]["gBrickPrefetchEnable"] = mUseBrickPrefetch ? 1u : 0u;
         var["CB"]["gPrevViewProj"] = mPrevViewProj;
         var["CB"]["gPrevCamPos"] = mPrevCamPos;
         var["CB"]["gTemporalEnable"] = (temporalActive && mPrevCamValid) ? 1u : 0u;
@@ -1818,8 +1821,8 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
                 const double swOcc = s[45] > 0 ? double(s[44]) / (double(s[45]) * 32.0) : 0.0;
                 logInfo(
                     "[SHADEOCC] frame {} | bounces occ {:.3f} laneSum {} warpMaxSum {} "
-                    "| march work occ {:.3f} laneSum {} warpMaxSum {} | warpRRkills {}",
-                    mFrameCount, sbOcc, s[42], s[43], swOcc, s[44], s[45], s[72]
+                    "| march work occ {:.3f} laneSum {} warpMaxSum {} | warpRRkills {} | queueClasses {}/{}/{}/{}",
+                    mFrameCount, sbOcc, s[42], s[43], swOcc, s[44], s[45], s[72], s[73], s[74], s[75], s[76]
                 );
 
                 // Escape-walk E-bias probe (v4), binned by the DETERMINISTIC
@@ -2247,7 +2250,7 @@ void VolumePathTracer::renderUI(Gui::Widgets& widget)
             "bigger than the effect being measured.",
             true
         );
-        group.checkbox("Brick prefetch", mUseBrickPrefetch);
+        rebuild |= group.checkbox("Brick prefetch", mUseBrickPrefetch);
         group.tooltip(
             "Lever 2 (2026-07-20): speculative next-brick prefetch in the DDA\n"
             "walks. The marching loop is a serial chain of dependent loads\n"
@@ -2256,8 +2259,11 @@ void VolumePathTracer::renderUI(Gui::Widgets& widget)
             "range/indirection/occupancy loads go in flight while the current\n"
             "cell's value is still outstanding. EXACT: promotes reuse the same\n"
             "texels; a wasted prefetch is dead loads, never wrong data.\n\n"
-            "Flip WITHIN one session; watch [COST] prefetch promote share and\n"
-            "gpuMs. Regression suspect #1 is register pressure (~9 regs).",
+            "COMPILE-TIME toggle (rebuilds the program): run 137 measured the\n"
+            "runtime-flag version at +12ms with identical counters - the ~9\n"
+            "registers of prefetch entry cost occupancy whether or not the\n"
+            "flag reads them. Same-session A/B still holds: flipping this\n"
+            "recompiles without restarting the process.",
             true
         );
         group.checkbox("Scatter-queue sort", mUseScatterSort);

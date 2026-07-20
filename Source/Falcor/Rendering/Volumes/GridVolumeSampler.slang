@@ -127,23 +127,23 @@ static uint gGvsBrickOcc = 0u;               ///< Cached occupancy mask for gGvs
 // moves when the walk arrives, and a wasted prefetch (collision ended the
 // walk) costs only the dead loads, never correctness.
 // Same single-grid validity rule as the primary entry: reset clears BOTH.
+//
+// COMPILE-TIME, not a runtime uniform (run 137 lesson): the entry costs ~9
+// registers whether or not a runtime flag reads it, and run 137 regressed
+// gpuMs 26 -> 38 with bit-identical work counters - the register-pressure
+// signature. A runtime toggle cannot A/B register pressure; only compiling
+// the entry out can. The UI checkbox rebuilds the program.
 // ---------------------------------------------------------------------------
+#ifndef GVS_BRICK_PREFETCH
+#define GVS_BRICK_PREFETCH 0
+#endif
+#if GVS_BRICK_PREFETCH
 static int3 gGvsBrickKeyN = int3(-1, -1, -1);
 static uint3 gGvsBrickPtrN = uint3(0, 0, 0);
 static float2 gGvsBrickRangeN = float2(0.f, 0.f);
 static float gGvsBrickMeanN = 0.f;
 static uint gGvsBrickOccN = 0u;
-
-/** Runtime A/B switch for the prefetch, same discipline (and reasons) as
-    gGvsOccSkipEnable below: cross-session gpuMs drifts more than the effect,
-    so the only trustworthy comparison is flipping this inside one process.
-    0 = behaviourally identical to the single-entry cache.
-*/
-static uint gGvsBrickPrefetchEnable = 1u;
-void gvsSetBrickPrefetchEnable(const uint enable)
-{
-    gGvsBrickPrefetchEnable = enable;
-}
+#endif
 
 /** Runtime A/B switch for the occupancy skip (HANDOFF_6 6.3).
 
@@ -189,7 +189,9 @@ static uint gGvsStatBrickPromotes = 0; ///< Misses answered by the prefetch entr
 void gvsBrickCacheReset()
 {
     gGvsBrickKey = int3(-1, -1, -1);
+#if GVS_BRICK_PREFETCH
     gGvsBrickKeyN = int3(-1, -1, -1);
+#endif
 }
 
 /** Make the primary entry hold `brick`: hit, promote-from-prefetch, or full
@@ -205,7 +207,8 @@ void gvsBrickEnsure(const Grid densityGrid, const int3 brick)
 #endif
         return;
     }
-    if (gGvsBrickPrefetchEnable != 0u && !any(brick != gGvsBrickKeyN))
+#if GVS_BRICK_PREFETCH
+    if (!any(brick != gGvsBrickKeyN))
     {
         // The loads were issued cells ago (gvsBrickPrefetch); by now they have
         // landed or are about to. Promotion is register moves only.
@@ -224,6 +227,7 @@ void gvsBrickEnsure(const Grid densityGrid, const int3 brick)
 #endif
         return;
     }
+#endif // GVS_BRICK_PREFETCH
     gGvsBrickKey = brick;
     const float3 rm = densityGrid.rangeMeanTex[brick].xyz;
     gGvsBrickRange = rm.xy;
@@ -242,7 +246,7 @@ void gvsBrickEnsure(const Grid densityGrid, const int3 brick)
 */
 void gvsBrickPrefetch(const Grid densityGrid, const int3 brick)
 {
-    if (gGvsBrickPrefetchEnable == 0u) return;
+#if GVS_BRICK_PREFETCH
     if (!any(brick != gGvsBrickKey) || !any(brick != gGvsBrickKeyN)) return;
     gGvsBrickKeyN = brick;
     const float3 rm = densityGrid.rangeMeanTex[brick].xyz;
@@ -250,6 +254,7 @@ void gvsBrickPrefetch(const Grid densityGrid, const int3 brick)
     gGvsBrickMeanN = rm.z;
     gGvsBrickPtrN = densityGrid.indirectionTex[brick].xyz;
     gGvsBrickOccN = densityGrid.occupancyTex[brick];
+#endif
 }
 
 /** Brick-coherent replacement for Grid::lookupStochasticIndexTex.
@@ -694,6 +699,18 @@ struct GridVolumeSampler
         float tauC = 0.f; ///< Accumulated analytic control optical depth: T_c = exp(-tauC).
         float Tr = 1.f;   ///< Stochastic residual transmittance.
 
+#if GVS_BRICK_PREFETCH
+        // Value-carry software pipeline for the per-node texel (run 137
+        // lesson: v1 routed this fetch through the FULL cache entry, which
+        // added ptr/occ loads to every no-tap node - hit rate 61.6% -> 46.4%,
+        // gpuMs 26 -> 38. This version adds ZERO loads: still exactly one
+        // rangeMean texel per node, just issued one node EARLY, so its
+        // latency hides under the current node's residual tracking. The
+        // carried value needs no key: it was loaded for ipos + idir*tExit,
+        // which IS the next iteration's pos, bitwise.)
+        float3 rmNext = float3(0.f);
+        bool rmNextValid = false;
+#endif
         float t = nearFar.x;
         while (t < nearFar.y)
         {
@@ -710,22 +727,14 @@ struct GridVolumeSampler
             // RGBA16Float texel. Reading range and mean separately cost two
             // fetches per cell at the identical address, and cells are the
             // dominant term in this pass's memory traffic.
-            // At mip 0 (the shipping residualMip, and what the footprint rule
-            // picks in this scene - [LOD] shows every instance at 0) the fetch
-            // is served through the brick cache: bitwise-identical texel, plus
-            // ptr/occ land early for the residual taps below, plus the NEXT
-            // node's texels go in flight while this node's tracking runs -
-            // this loop has real ALU work to hide the latency under, which the
-            // pure marching chain does not.
-            float3 majMinMean;
-            if (residualMip == 0)
-            {
-                majMinMean = gvsLookupRangeMeanCached(densityGrid, int3(pos));
-                if (tExit < nearFar.y)
-                    gvsBrickPrefetch(densityGrid, int3(ipos + idir * tExit) >> 3);
-            }
-            else
-                majMinMean = densityGrid.lookupIndexLocalRangeMeanTex(int3(pos), residualMip);
+#if GVS_BRICK_PREFETCH
+            const float3 majMinMean = rmNextValid ? rmNext : densityGrid.lookupIndexLocalRangeMeanTex(int3(pos), residualMip);
+            rmNextValid = tExit < nearFar.y;
+            if (rmNextValid)
+                rmNext = densityGrid.lookupIndexLocalRangeMeanTex(int3(ipos + idir * tExit), residualMip);
+#else
+            const float3 majMinMean = densityGrid.lookupIndexLocalRangeMeanTex(int3(pos), residualMip);
+#endif
             const float2 majMin = majMinMean.xy;
             const float mean = majMinMean.z;
             const float sigmaC = scale * mean;

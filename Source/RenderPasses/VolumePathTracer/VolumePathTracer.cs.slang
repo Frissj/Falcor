@@ -35,7 +35,6 @@ cbuffer CB
     /// (2*tan(fovY/2)/resY * user scale). 0 = footprint-driven residual mip off.
     float gFootprintSpread;
     uint gOccSkipEnable;    ///< 6.3 occupancy tap skip on/off. Pushed into the sampler per thread.
-    uint gBrickPrefetchEnable; ///< Lever-2 next-brick prefetch on/off. Pushed into the sampler per thread.
     /// Stage B temporal reuse: previous frame's camera.
     float4x4 gPrevViewProj;
     float3 gPrevCamPos;
@@ -704,7 +703,6 @@ bool scatterAtVertex<S : ISampleGenerator>(
 void main(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
     gvsSetOccSkipEnable(gOccSkipEnable);
-    gvsSetBrickPrefetchEnable(gBrickPrefetchEnable);
     const uint2 pixel = dispatchThreadId.xy;
     if (any(pixel >= gFrameDim))
         return;
@@ -1618,7 +1616,6 @@ void main(uint3 dispatchThreadId: SV_DispatchThreadID)
 void shadeMain(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
     gvsSetOccSkipEnable(gOccSkipEnable);
-    gvsSetBrickPrefetchEnable(gBrickPrefetchEnable);
     const uint queueIdx = dispatchThreadId.x;
     if (queueIdx >= gScatterCount[0])
         return;
@@ -1904,11 +1901,17 @@ void scatterClassMain(uint3 dispatchThreadId: SV_DispatchThreadID)
 #if USE_TEMPORAL_REUSE
     const uint2 pixel = uint2(gScatterQueue[idx].pixel & 0xffffu, gScatterQueue[idx].pixel >> 16);
     const float tHint = gReservoirPrev[pixel.y * gFrameDim.x + pixel.x]._pad0;
-    // tHint 0 = cleared/invalid history: bin with the thick class - unknown
+    // Bin edges are tuned to the QUEUED population, not the screen (run 137
+    // lesson: screen-scale edges 0.05/0.2/0.5 put essentially every queued
+    // pixel - they are scatter survivors, i.e. cloudy and low-T by
+    // construction - into class 0, and a sort where every key is equal is a
+    // stable no-op: [SHADEOCC] bounce occ stayed at exactly 0.229). The
+    // queue's T mass lives below ~0.1, so the edges split THAT range.
+    // tHint 0 = cleared/invalid history: bins with the thick class - unknown
     // pixels are the ones most likely to be freshly-revealed cloud interior.
-    if (tHint < 0.05f) c = 0;
-    else if (tHint < 0.2f) c = 1;
-    else if (tHint < 0.5f) c = 2;
+    if (tHint < 0.005f) c = 0;
+    else if (tHint < 0.02f) c = 1;
+    else if (tHint < 0.08f) c = 2;
     else c = 3;
 #endif
     // Temporal off: every entry lands in class 0 and the sort is a stable
@@ -1916,6 +1919,12 @@ void scatterClassMain(uint3 dispatchThreadId: SV_DispatchThreadID)
     // fallback behaviour for the same missing hint.
     gScatterClass[idx] = c;
     InterlockedAdd(gScatterClassCount[c], 1u);
+#if USE_WORK_STATS
+    // Class histogram to slots 73..76: a sort is only working if this is
+    // spread across classes - run 137's degenerate binning would have been
+    // visible in one log line instead of costing a run.
+    InterlockedAdd(gRisStats[73 + c], 1u);
+#endif
 }
 
 [numthreads(1, 1, 1)]
@@ -2057,7 +2066,6 @@ void emitShadeStats(inout VolumeInstanceSampler volumeSampler)
 void shadeInitMain(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
     gvsSetOccSkipEnable(gOccSkipEnable);
-    gvsSetBrickPrefetchEnable(gBrickPrefetchEnable);
     const uint queueIdx = dispatchThreadId.x;
     if (queueIdx >= gScatterCount[0])
         return;
@@ -2111,7 +2119,6 @@ void shadeInitMain(uint3 dispatchThreadId: SV_DispatchThreadID)
 void bounceMain(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
     gvsSetOccSkipEnable(gOccSkipEnable);
-    gvsSetBrickPrefetchEnable(gBrickPrefetchEnable);
     const uint i = dispatchThreadId.x;
     if (i >= gPathCountIn[0])
         return;
@@ -2195,7 +2202,6 @@ void bounceArgsMain()
 void bounceTailMain(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
     gvsSetOccSkipEnable(gOccSkipEnable);
-    gvsSetBrickPrefetchEnable(gBrickPrefetchEnable);
     const uint i = dispatchThreadId.x;
     if (i >= gPathCountIn[0])
         return;

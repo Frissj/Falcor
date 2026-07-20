@@ -379,7 +379,7 @@ private:
     // 42..45 = shadeMain divergence (bounce sum/max, marching-work sum/max),
     // 46..53 = [TRRPROBE] escape-walk E[T] with/without RR, 4 Tref bins x
     //          (RR sum, ref sum), x4096 fixed point.
-    static const uint32_t kRisStatSlots = 73; ///< 54..65 = [TRRPROBE2] coin telemetry (4 det-key bins x count/sumBefore/survives); 66..70 = [TRRPROBE2-CHK] self-checks + negative-Tr counts; 71 = brick-prefetch promotes; 72 = warp-RR kills.
+    static const uint32_t kRisStatSlots = 77; ///< 54..65 = [TRRPROBE2] coin telemetry (4 det-key bins x count/sumBefore/survives); 66..70 = [TRRPROBE2-CHK] self-checks + negative-Tr counts; 71 = brick-prefetch promotes; 72 = warp-RR kills; 73..76 = scatter-sort class histogram.
     ref<Buffer> mpRisStats;         ///< Device-local counters (atomics).
     ref<Buffer> mpRisStatsReadback; ///< CPU-visible copy.
     bool mLogRisStats = false;      ///< Log the histogram while RIS is on.
