@@ -1866,6 +1866,83 @@ void argsMain()
     gDispatchArgs.Store3(0, uint3((n + 63u) / 64u, 1u, 1u));
 }
 
+#if USE_COMPACTION
+// ---------------------------------------------------------------------------
+// Lever-1b: work-class counting sort of the scatter queue (MegaLights
+// classify -> dense-dispatch pattern, MegaLightsTileClassification.ush).
+//
+// WHY: shadeMain's queue is wave-append order == rough screen order, so a
+// warp mixes paths that die at bounce 1 with paths that diffuse 20+ bounces
+// ([SHADEOCC] bounce occupancy 0.229) and every warp waits on its longest
+// path. Sorting the queue by a work predictor puts similar path lengths in
+// the same warp. The predictor is LAST frame's transmittance at the pixel
+// (reservoir _pad0 - the same MegaLights-style hint adaptive M already
+// trusts): low T = thick = long diffusion.
+//
+// IMAGE-IDENTICAL BY CONSTRUCTION: shadeMain seeds its generator by PIXEL
+// precisely because queue order was already nondeterministic (see the seed
+// comment there), so each path computes bit-identical values from any slot.
+// Reordering changes only which threads share a warp. No gate needed - this
+// is a pure scheduling change, same class as compaction itself.
+//
+// Three tiny dispatches between argsMain and shadeMain: classify (count-sized,
+// per-entry class + histogram), offsets (1 thread, 4-wide exclusive prefix),
+// scatter (count-sized, stable within a class up to atomic order - which is
+// exactly as nondeterministic as the append order was).
+// ---------------------------------------------------------------------------
+RWStructuredBuffer<ScatterEntry> gScatterQueueSorted;
+RWStructuredBuffer<uint> gScatterClass;      ///< Class per queue entry.
+RWStructuredBuffer<uint> gScatterClassCount; ///< [0..3] histogram; [4..7] scatter cursors (start at class offsets).
+
+[numthreads(64, 1, 1)]
+void scatterClassMain(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    const uint idx = dispatchThreadId.x;
+    if (idx >= gScatterCount[0])
+        return;
+    uint c = 0;
+#if USE_TEMPORAL_REUSE
+    const uint2 pixel = uint2(gScatterQueue[idx].pixel & 0xffffu, gScatterQueue[idx].pixel >> 16);
+    const float tHint = gReservoirPrev[pixel.y * gFrameDim.x + pixel.x]._pad0;
+    // tHint 0 = cleared/invalid history: bin with the thick class - unknown
+    // pixels are the ones most likely to be freshly-revealed cloud interior.
+    if (tHint < 0.05f) c = 0;
+    else if (tHint < 0.2f) c = 1;
+    else if (tHint < 0.5f) c = 2;
+    else c = 3;
+#endif
+    // Temporal off: every entry lands in class 0 and the sort is a stable
+    // no-op pass-through - correct, just useless, matching the adaptive-M
+    // fallback behaviour for the same missing hint.
+    gScatterClass[idx] = c;
+    InterlockedAdd(gScatterClassCount[c], 1u);
+}
+
+[numthreads(1, 1, 1)]
+void scatterOffsetMain()
+{
+    uint off = 0;
+    [unroll]
+    for (uint c = 0; c < 4; ++c)
+    {
+        gScatterClassCount[4 + c] = off;
+        off += gScatterClassCount[c];
+    }
+}
+
+[numthreads(64, 1, 1)]
+void scatterSortMain(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    const uint idx = dispatchThreadId.x;
+    if (idx >= gScatterCount[0])
+        return;
+    const uint c = gScatterClass[idx];
+    uint dst;
+    InterlockedAdd(gScatterClassCount[4 + c], 1u, dst);
+    gScatterQueueSorted[dst] = gScatterQueue[idx];
+}
+#endif // USE_COMPACTION
+
 // ---------------------------------------------------------------------------
 // Wavefront backend for phase B: per-bounce requeueing.
 //

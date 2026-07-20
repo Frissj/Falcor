@@ -59,6 +59,15 @@ private:
     // one thread per queued path in dense waves. Null when compaction is off.
     ref<ComputePass> mpPassShade;
     ref<ComputePass> mpPassArgs;
+    // Lever-1b scatter-queue counting sort (classify/offsets/scatter). Pure
+    // scheduling, image-identical; mUseScatterSort is the runtime A/B.
+    ref<ComputePass> mpPassScatterClass;
+    ref<ComputePass> mpPassScatterOffset;
+    ref<ComputePass> mpPassScatterSort;
+    ref<Buffer> mpScatterQueueSorted;
+    ref<Buffer> mpScatterClass;
+    ref<Buffer> mpScatterClassCount;
+    bool mUseScatterSort = true;
     ref<Buffer> mpScatterQueue;  ///< RIS survivors (16 B each), sized to pixel count.
     ref<Buffer> mpScatterCount;  ///< Single uint: queued path count.
     ref<Buffer> mpDispatchArgs;  ///< uint3 indirect dispatch args for shadeMain.

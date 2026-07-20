@@ -63,6 +63,7 @@ const char kTemporalMCap[] = "temporalMCap";
 const char kUseBrickTlas[] = "useBrickTlas";
 const char kUseOccupancySkip[] = "useOccupancySkip";
 const char kUseBrickPrefetch[] = "useBrickPrefetch";
+const char kUseScatterSort[] = "useScatterSort";
 const char kMipPixelThreshold[] = "mipPixelThreshold";
 const char kUseMergedTail[] = "useMergedTail";
 const char kTailRes[] = "tailRes";
@@ -144,6 +145,8 @@ void VolumePathTracer::parseProperties(const Properties& props)
             mUseOccupancySkip = value;
         else if (key == kUseBrickPrefetch)
             mUseBrickPrefetch = value;
+        else if (key == kUseScatterSort)
+            mUseScatterSort = value;
         else if (key == kMipPixelThreshold)
             mMipPixelThreshold = value;
         else if (key == kUseMergedTail)
@@ -231,6 +234,7 @@ Properties VolumePathTracer::getProperties() const
     props[kUseBrickTlas] = mUseBrickTlas;
     props[kUseOccupancySkip] = mUseOccupancySkip;
     props[kUseBrickPrefetch] = mUseBrickPrefetch;
+    props[kUseScatterSort] = mUseScatterSort;
     props[kMipPixelThreshold] = mMipPixelThreshold;
     props[kUseMergedTail] = mUseMergedTail;
     props[kTailRes] = mTailRes;
@@ -1038,6 +1042,19 @@ void VolumePathTracer::prepareProgram(RenderContext* pRenderContext)
         mpPassArgs = ComputePass::create(mpDevice, makeDesc("argsMain"), defines, true);
     }
 
+    // Lever-1b scatter-queue counting sort (same module + DefineList). Pure
+    // scheduling - image-identical (shadeMain seeds by pixel) - so it rides
+    // the compaction pipeline unconditionally and a checkbox A/Bs it.
+    mpPassScatterClass = nullptr;
+    mpPassScatterOffset = nullptr;
+    mpPassScatterSort = nullptr;
+    if (compactionCompiled)
+    {
+        mpPassScatterClass = ComputePass::create(mpDevice, makeDesc("scatterClassMain"), defines, true);
+        mpPassScatterOffset = ComputePass::create(mpDevice, makeDesc("scatterOffsetMain"), defines, true);
+        mpPassScatterSort = ComputePass::create(mpDevice, makeDesc("scatterSortMain"), defines, true);
+    }
+
     // Wavefront phase B (per-bounce requeue). Same module + DefineList as
     // every other kernel; selection between fused shadeMain and this pipeline
     // is purely which passes execute() dispatches, so the A/B is a checkbox.
@@ -1309,6 +1326,34 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
         }
         pRenderContext->clearUAV(mpScatterCount->getUAV().get(), uint4(0, 0, 0, 0));
 
+        // Lever-1b sort buffers: sorted queue mirror + per-entry class + a
+        // 8-uint histogram/cursor block. Only when the sort will actually run.
+        if (mUseScatterSort && mpPassScatterSort)
+        {
+            if (!mpScatterQueueSorted || mpScatterQueueSorted->getElementCount() < pixelCount)
+            {
+                mpScatterQueueSorted = mpDevice->createStructuredBuffer(
+                    16, pixelCount, ResourceBindFlags::UnorderedAccess | ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal
+                );
+                mpScatterQueueSorted->setName("VolumePathTracer::mpScatterQueueSorted");
+            }
+            if (!mpScatterClass || mpScatterClass->getElementCount() < pixelCount)
+            {
+                mpScatterClass = mpDevice->createStructuredBuffer(
+                    sizeof(uint32_t), pixelCount, ResourceBindFlags::UnorderedAccess | ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal
+                );
+                mpScatterClass->setName("VolumePathTracer::mpScatterClass");
+            }
+            if (!mpScatterClassCount)
+            {
+                mpScatterClassCount = mpDevice->createStructuredBuffer(
+                    sizeof(uint32_t), 8, ResourceBindFlags::UnorderedAccess | ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal
+                );
+                mpScatterClassCount->setName("VolumePathTracer::mpScatterClassCount");
+            }
+            pRenderContext->clearUAV(mpScatterClassCount->getUAV().get(), uint4(0, 0, 0, 0));
+        }
+
         // Wavefront path-state pool. Sized to pixelCount like the scatter
         // queue (worst case every pixel scatters). Stride comes from
         // REFLECTION - PathState embeds SampleGenerator and the NEE reservoir,
@@ -1553,7 +1598,35 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
                                      mpPassBounceTail && mpPathState;
         if (!wavefrontActive)
         {
-            bindFrame(mpPassShade->getRootVar());
+            // Lever-1b: classify -> offsets -> scatter, then shade reads the
+            // SORTED queue. Image-identical (per-pixel seeding); the sort only
+            // changes which paths share a warp. Three count-sized-or-smaller
+            // dispatches; Falcor inserts the UAV barriers.
+            const bool sortActive = mUseScatterSort && mpPassScatterClass && mpScatterQueueSorted;
+            if (sortActive)
+            {
+                auto classVar = mpPassScatterClass->getRootVar();
+                bindFrame(classVar);
+                classVar["gScatterClass"] = mpScatterClass;
+                classVar["gScatterClassCount"] = mpScatterClassCount;
+                mpPassScatterClass->executeIndirect(pRenderContext, mpDispatchArgs.get());
+
+                auto offVar = mpPassScatterOffset->getRootVar();
+                offVar["gScatterClassCount"] = mpScatterClassCount;
+                mpPassScatterOffset->execute(pRenderContext, uint3(1, 1, 1));
+
+                auto sortVar = mpPassScatterSort->getRootVar();
+                bindFrame(sortVar);
+                sortVar["gScatterClass"] = mpScatterClass;
+                sortVar["gScatterClassCount"] = mpScatterClassCount;
+                sortVar["gScatterQueueSorted"] = mpScatterQueueSorted;
+                mpPassScatterSort->executeIndirect(pRenderContext, mpDispatchArgs.get());
+            }
+
+            auto shadeVar = mpPassShade->getRootVar();
+            bindFrame(shadeVar);
+            if (sortActive)
+                shadeVar["gScatterQueue"] = mpScatterQueueSorted;
             mpPassShade->executeIndirect(pRenderContext, mpDispatchArgs.get());
         }
         else
@@ -2185,6 +2258,17 @@ void VolumePathTracer::renderUI(Gui::Widgets& widget)
             "texels; a wasted prefetch is dead loads, never wrong data.\n\n"
             "Flip WITHIN one session; watch [COST] prefetch promote share and\n"
             "gpuMs. Regression suspect #1 is register pressure (~9 regs).",
+            true
+        );
+        group.checkbox("Scatter-queue sort", mUseScatterSort);
+        group.tooltip(
+            "Lever 1b (2026-07-20): counting sort of the shade queue by last\n"
+            "frame's transmittance hint, so warp-mates get similar expected\n"
+            "path lengths ([SHADEOCC] bounce occ 0.229 = warps idling behind\n"
+            "their longest path). IMAGE-IDENTICAL: shadeMain seeds by pixel,\n"
+            "so slot order never enters the estimator - this is scheduling,\n"
+            "same class as compaction. Flip within one session; watch\n"
+            "[SHADEOCC] bounces occ / warpMaxSum and gpuMs.",
             true
         );
 
