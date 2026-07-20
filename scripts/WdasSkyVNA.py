@@ -86,13 +86,25 @@ def render_graph_VNA():
         # Knee is sharp: q=0.15 FAILS the gate (+0.331%). Do not raise past 0.125.
         # Starting roulette earlier (rouletteStartBounce 1/2) FAILED at every
         # floor tested - that lever is dead, leave it at 3.
-        'rouletteMinQ': 0.10,
+        # 0.125 = the knee itself, adopted 2026-07-20: rq2 sweep scored it
+        # +0.064% cloudy-mean (PASS, 2.3x inside the gate) with 1-spp firefly
+        # counts (>100: 2) far below the q=0.05 baseline's 13. Buys ~10-15%
+        # off shadeMain's warp critical path on top of q=0.10.
+        'rouletteMinQ': 0.125,
         'rouletteStartBounce': 3,
         # Stream compaction (ReSTIR PT Enhanced 6.2.2 / UE dense-dispatch):
         # phase A queues the ~13% of pixels that scatter, an indirect phase B
         # shades one thread per real path. Attacks the measured 87%-idle
         # warp divergence in the shading/bounce buckets.
         'useCompaction': True,
+        # Wavefront phase B: MEASURED OFF (2026-07-20). fps degrades
+        # monotonically with requeue rounds - K=0 fastest - because the
+        # divergence is INTRA-bounce (single-bounce marching cost varies 10x+
+        # between lanes), which requeueing cannot equalize; the state
+        # round-trip and per-round barriers only add. Byte-identical backend
+        # kept compiled for A/B; do not re-enable without a new measurement
+        # that contradicts this one.
+        'useWavefront': False,
         # Section 4: HW-BVH brick TLAS (UE HeterogeneousVolumes port) with
         # per-instance projected-error mip selection.
         'useBrickTlas': True,

@@ -76,6 +76,8 @@ const char kRisTargetFloor[] = "risTargetFloor";
 const char kRouletteMinQ[] = "rouletteMinQ";
 const char kRouletteStartBounce[] = "rouletteStartBounce";
 const char kUseCompaction[] = "useCompaction";
+const char kUseWavefront[] = "useWavefront";
+const char kWavefrontRounds[] = "wavefrontRounds";
 const char kUseTauCache[] = "useTauCache";
 const char kTauCacheRes[] = "tauCacheRes";
 const char kTauCacheInterval[] = "tauCacheInterval";
@@ -157,6 +159,10 @@ void VolumePathTracer::parseProperties(const Properties& props)
             mRouletteStartBounce = (uint32_t)value;
         else if (key == kUseCompaction)
             mUseCompaction = value;
+        else if (key == kUseWavefront)
+            mUseWavefront = value;
+        else if (key == kWavefrontRounds)
+            mWavefrontRounds = value;
         else if (key == kUseTauCache)
             mUseTauCache = value;
         else if (key == kTauCacheRes)
@@ -203,6 +209,8 @@ Properties VolumePathTracer::getProperties() const
     props[kRouletteMinQ] = mRouletteMinQ;
     props[kRouletteStartBounce] = mRouletteStartBounce;
     props[kUseCompaction] = mUseCompaction;
+    props[kUseWavefront] = mUseWavefront;
+    props[kWavefrontRounds] = mWavefrontRounds;
     props[kUseTauCache] = mUseTauCache;
     props[kTauCacheRes] = mTauCacheRes;
     props[kTauCacheInterval] = mTauCacheInterval;
@@ -222,6 +230,10 @@ void VolumePathTracer::setScene(RenderContext* pRenderContext, const ref<Scene>&
     mpPass = nullptr;
     mpPassShade = nullptr;
     mpPassArgs = nullptr;
+    mpPassShadeInit = nullptr;
+    mpPassBounce = nullptr;
+    mpPassBounceArgs = nullptr;
+    mpPassBounceTail = nullptr;
     mpVolumeSampler = nullptr;
     mpEnvMapSampler = nullptr;
 
@@ -972,6 +984,21 @@ void VolumePathTracer::prepareProgram(RenderContext* pRenderContext)
         mpPassArgs = ComputePass::create(mpDevice, makeDesc("argsMain"), defines, true);
     }
 
+    // Wavefront phase B (per-bounce requeue). Same module + DefineList as
+    // every other kernel; selection between fused shadeMain and this pipeline
+    // is purely which passes execute() dispatches, so the A/B is a checkbox.
+    mpPassShadeInit = nullptr;
+    mpPassBounce = nullptr;
+    mpPassBounceArgs = nullptr;
+    mpPassBounceTail = nullptr;
+    if (compactionCompiled && mUseWavefront)
+    {
+        mpPassShadeInit = ComputePass::create(mpDevice, makeDesc("shadeInitMain"), defines, true);
+        mpPassBounce = ComputePass::create(mpDevice, makeDesc("bounceMain"), defines, true);
+        mpPassBounceArgs = ComputePass::create(mpDevice, makeDesc("bounceArgsMain"), defines, true);
+        mpPassBounceTail = ComputePass::create(mpDevice, makeDesc("bounceTailMain"), defines, true);
+    }
+
     // Sun-tau cache build passes (same module + DefineList, so the bake's
     // coarseOpticalDepth agrees with the live path on every feature define).
     // A fresh program means a fresh bake: defines can change the field.
@@ -1021,6 +1048,12 @@ void VolumePathTracer::prepareProgram(RenderContext* pRenderContext)
     bindStatics(mpPass->getRootVar());
     if (mpPassShade)
         bindStatics(mpPassShade->getRootVar());
+    if (mpPassShadeInit)
+        bindStatics(mpPassShadeInit->getRootVar());
+    if (mpPassBounce)
+        bindStatics(mpPassBounce->getRootVar());
+    if (mpPassBounceTail)
+        bindStatics(mpPassBounceTail->getRootVar());
     if (mpPassTauDir)
         bindStatics(mpPassTauDir->getRootVar());
     if (mpPassTauBuild)
@@ -1081,6 +1114,10 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
     mpPass->getProgram()->addDefines(getValidResourceDefines(kOutputChannels, renderData));
     if (mpPassShade)
         mpPassShade->getProgram()->addDefines(getValidResourceDefines(kOutputChannels, renderData));
+    if (mpPassShadeInit)
+        mpPassShadeInit->getProgram()->addDefines(getValidResourceDefines(kOutputChannels, renderData));
+    if (mpPassBounce)
+        mpPassBounce->getProgram()->addDefines(getValidResourceDefines(kOutputChannels, renderData));
 
     const uint2 targetDim = renderData.getDefaultTextureDims();
     FALCOR_ASSERT(targetDim.x > 0 && targetDim.y > 0);
@@ -1156,6 +1193,52 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
             mpDispatchArgs->setName("VolumePathTracer::mpDispatchArgs");
         }
         pRenderContext->clearUAV(mpScatterCount->getUAV().get(), uint4(0, 0, 0, 0));
+
+        // Wavefront path-state pool. Sized to pixelCount like the scatter
+        // queue (worst case every pixel scatters). Stride comes from
+        // REFLECTION - PathState embeds SampleGenerator and the NEE reservoir,
+        // and a hand-maintained byte count would drift the first time either
+        // struct changes.
+        if (mUseWavefront && mpPassBounce)
+        {
+            const auto stateVar = mpPassBounce->getRootVar()["gPathState"];
+            if (!mpPathState || mpPathState->getElementCount() < pixelCount)
+            {
+                mpPathState = mpDevice->createStructuredBuffer(
+                    stateVar, pixelCount, ResourceBindFlags::UnorderedAccess | ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal
+                );
+                mpPathState->setName("VolumePathTracer::mpPathState");
+                logInfo(
+                    "VolumePathTracer: wavefront path-state pool {} paths x {} B = {:.1f} MB.",
+                    pixelCount, mpPathState->getStructSize(), mpPathState->getSize() / (1024.0 * 1024.0)
+                );
+            }
+            for (int q = 0; q < 2; ++q)
+            {
+                if (!mpPathQueue[q] || mpPathQueue[q]->getElementCount() < pixelCount)
+                {
+                    mpPathQueue[q] = mpDevice->createStructuredBuffer(
+                        sizeof(uint32_t), pixelCount, ResourceBindFlags::UnorderedAccess | ResourceBindFlags::ShaderResource,
+                        MemoryType::DeviceLocal
+                    );
+                    mpPathQueue[q]->setName(fmt::format("VolumePathTracer::mpPathQueue[{}]", q));
+                }
+                if (!mpPathCount[q])
+                {
+                    mpPathCount[q] = mpDevice->createStructuredBuffer(
+                        sizeof(uint32_t), 1, ResourceBindFlags::UnorderedAccess | ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal
+                    );
+                    mpPathCount[q]->setName(fmt::format("VolumePathTracer::mpPathCount[{}]", q));
+                }
+            }
+            if (!mpBounceArgs)
+            {
+                mpBounceArgs = mpDevice->createBuffer(
+                    3 * sizeof(uint32_t), ResourceBindFlags::IndirectArg | ResourceBindFlags::UnorderedAccess, MemoryType::DeviceLocal
+                );
+                mpBounceArgs->setName("VolumePathTracer::mpBounceArgs");
+            }
+        }
     }
 
     // Per-frame bindings, shared by the fused/phase-A kernel and the shade
@@ -1295,8 +1378,9 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
 
     // Time the dispatches on the GPU. A CPU timer here would measure command
     // submission, not the work, and would report near-zero regardless of cost.
-    // Under compaction the timer brackets ALL THREE dispatches, so gpuMs stays
-    // the whole-pipeline number the log has always reported.
+    // The timer brackets the WHOLE phase-B pipeline - fused: three dispatches;
+    // wavefront: init + maxBounces rounds of (args, clear, bounce) - so gpuMs
+    // stays the whole-pipeline number the log has always reported.
     const bool timeThisFrame = mLogWorkStats && mpGpuTimer && logThisFrame;
     if (timeThisFrame)
         mpGpuTimer->begin();
@@ -1313,8 +1397,72 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
         argsVar["gDispatchArgs"] = mpDispatchArgs;
         mpPassArgs->execute(pRenderContext, uint3(1, 1, 1));
 
-        bindFrame(mpPassShade->getRootVar());
-        mpPassShade->executeIndirect(pRenderContext, mpDispatchArgs.get());
+        const bool wavefrontActive =
+            mUseWavefront && mpPassShadeInit && mpPassBounce && mpPassBounceArgs && mpPassBounceTail && mpPathState;
+        if (!wavefrontActive)
+        {
+            bindFrame(mpPassShade->getRootVar());
+            mpPassShade->executeIndirect(pRenderContext, mpDispatchArgs.get());
+        }
+        else
+        {
+            // Wavefront phase B. shadeInitMain shades the RIS vertex for every
+            // queued pixel and parks survivors; then up to maxBounces rounds of
+            // (count -> args, clear next count, advance one bounce). Dead
+            // rounds cost one empty ExecuteIndirect - no CPU readback, no
+            // sync. All GPU-GPU dependencies are UAV barriers Falcor already
+            // inserts between dispatches touching the same resources.
+            pRenderContext->clearUAV(mpPathCount[0]->getUAV().get(), uint4(0, 0, 0, 0));
+
+            auto initVar = mpPassShadeInit->getRootVar();
+            bindFrame(initVar);
+            initVar["gPathState"] = mpPathState;
+            initVar["gPathQueueOut"] = mpPathQueue[0];
+            initVar["gPathCountOut"] = mpPathCount[0];
+            mpPassShadeInit->executeIndirect(pRenderContext, mpDispatchArgs.get());
+
+            auto bounceVar = mpPassBounce->getRootVar();
+            bindFrame(bounceVar);
+            bounceVar["gPathState"] = mpPathState;
+            auto bounceArgsVar = mpPassBounceArgs->getRootVar();
+            bounceArgsVar["gBounceArgs"] = mpBounceArgs;
+
+            // K dense requeue rounds, then ONE tail dispatch that loops the
+            // survivors to death. v1 ran all 64 rounds: ~192 serializing sync
+            // points per frame, most of them advancing a near-empty queue -
+            // measured MUCH slower than the fused loop. Requeueing pays only
+            // while populations keep warps dense; the thin tail is cheaper
+            // divergent than re-dispatched.
+            uint32_t cur = 0;
+            const uint32_t rounds = std::min(mWavefrontRounds, mMaxBounces);
+            for (uint32_t b = 0; b < rounds; ++b)
+            {
+                const uint32_t next = 1u - cur;
+                bounceArgsVar["gPathCountIn"] = mpPathCount[cur];
+                mpPassBounceArgs->execute(pRenderContext, uint3(1, 1, 1));
+                pRenderContext->clearUAV(mpPathCount[next]->getUAV().get(), uint4(0, 0, 0, 0));
+
+                bounceVar["gPathQueueIn"] = mpPathQueue[cur];
+                bounceVar["gPathCountIn"] = mpPathCount[cur];
+                bounceVar["gPathQueueOut"] = mpPathQueue[next];
+                bounceVar["gPathCountOut"] = mpPathCount[next];
+                mpPassBounce->executeIndirect(pRenderContext, mpBounceArgs.get());
+                cur = next;
+            }
+
+            if (rounds < mMaxBounces)
+            {
+                bounceArgsVar["gPathCountIn"] = mpPathCount[cur];
+                mpPassBounceArgs->execute(pRenderContext, uint3(1, 1, 1));
+
+                auto tailVar = mpPassBounceTail->getRootVar();
+                bindFrame(tailVar);
+                tailVar["gPathState"] = mpPathState;
+                tailVar["gPathQueueIn"] = mpPathQueue[cur];
+                tailVar["gPathCountIn"] = mpPathCount[cur];
+                mpPassBounceTail->executeIndirect(pRenderContext, mpBounceArgs.get());
+            }
+        }
     }
 
     if (timeThisFrame)
@@ -1685,6 +1833,35 @@ void VolumePathTracer::renderUI(Gui::Widgets& widget)
                 "87%-idle warps. Estimator-identical (matrix config 15).",
                 true
             );
+            if (mUseCompaction)
+            {
+                rebuild |= group.checkbox("Wavefront bounces (per-bounce requeue)", mUseWavefront);
+                group.tooltip(
+                    "[SHADEOCC] measured the fused bounce loop at 0.271 lane occupancy:\n"
+                    "the average path dies at 8 bounces, the average warp's LONGEST runs\n"
+                    "29, and 27 of 32 lanes idle behind it. This advances every live path\n"
+                    "ONE bounce per dispatch and requeues survivors, keeping warps dense\n"
+                    "(ceiling ~2.6x on shadeMain's marching).\n\n"
+                    "BYTE-IDENTICAL estimator: the per-bounce body is the fused loop body\n"
+                    "verbatim and the RNG state rides in PathState, never re-seeded.\n"
+                    "A/B against the fused loop with this checkbox - converged images\n"
+                    "must be BIT-identical, stronger than the +-0.15% gate.",
+                    true
+                );
+                if (mUseWavefront)
+                {
+                    group.var("Wavefront rounds", mWavefrontRounds, 0u, 64u);
+                    group.tooltip(
+                        "Dense requeue rounds before the tail finisher loops survivors\n"
+                        "to death. Each round costs args + clear + dispatch with\n"
+                        "serializing barriers, so it only pays while the queue is fat\n"
+                        "(avg path dies at 8). LIVE knob, no recompile - sweep it and\n"
+                        "watch gpuMs same-session. 0 = tail-only (~fused schedule),\n"
+                        "64 = pure wavefront (measured much slower: barrier overhead).",
+                        true
+                    );
+                }
+            }
             rebuild |= group.var("Coarse mip", mRisMip, 0u, 3u);
             group.tooltip("Mean-pyramid mip for the target's shadow walks.\nCoarser = cheaper, cruder 'is this candidate lit' guess.", true);
             rebuild |= group.checkbox("Log branch histogram", mLogRisStats);

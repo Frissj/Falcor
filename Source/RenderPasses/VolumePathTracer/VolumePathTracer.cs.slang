@@ -1525,6 +1525,293 @@ void argsMain()
     const uint n = gScatterCount[0];
     gDispatchArgs.Store3(0, uint3((n + 63u) / 64u, 1u, 1u));
 }
+
+// ---------------------------------------------------------------------------
+// Wavefront backend for phase B: per-bounce requeueing.
+//
+// WHY: [SHADEOCC] measured the fused bounce loop at 0.271 lane occupancy -
+// the average path dies at 8 bounces but the average warp's LONGEST path runs
+// 29, and 27 lanes idle behind it. Roulette cannot fix this shape: the matrix
+// gate FAILS every floor past 0.125 (+0.33% at 0.15) and every startBounce
+// below 3, so the tail is load-bearing energy, not waste. The only unbiased
+// lever left is scheduling: advance every live path ONE bounce per dispatch,
+// requeue survivors, so warps stay dense (ceiling 1/0.383 ~ 2.6x on
+// shadeMain's marching).
+//
+// BYTE-IDENTICAL BY CONSTRUCTION, and this is the part to keep true when
+// editing: a path's per-bounce code is the fused loop body VERBATIM (same
+// call order: sampleDistance -> scatterAtVertex -> deferred NEE at death),
+// and the SampleGenerator STATE rides in PathState between dispatches - never
+// re-seeded - so every path consumes the exact sample stream the fused loop
+// would have. One path owns one pixel, so output writes stay single-writer.
+// The fused shadeMain stays compiled and selectable (useWavefront off) as the
+// same-session A/B reference; converged images from the two backends must be
+// bit-identical, which is a stronger check than the +-0.15% gate.
+// ---------------------------------------------------------------------------
+
+/** Everything one in-flight path needs between bounces (~124 B).
+    SampleGenerator and NeeVertexReservoir are embedded as POD - reflection
+    sizes the buffer, so there is no hand-maintained stride to drift.
+*/
+struct PathState
+{
+    uint pixel;             ///< Packed x | y<<16 (one path per pixel: single writer).
+    uint bounce;            ///< Bounce index of the NEXT scatter vertex.
+    float3 org;             ///< Continuation ray origin (scatterAtVertex always
+    float3 dir;             ///< writes Ray(pos, wo, 0, FLT_MAX), so tMin/tMax
+                            ///< reconstruct exactly).
+    float3 thp;             ///< Path throughput.
+    float3 rad;             ///< Radiance this path has accumulated.
+    NeeVertexReservoir nee; ///< Deferred single-NEE reservoir (resolved at death).
+    SampleGenerator sg;     ///< RNG state - carried, NEVER re-seeded.
+};
+RWStructuredBuffer<PathState> gPathState; ///< Indexed by scatter-queue slot; a path's slot never changes.
+RWStructuredBuffer<uint> gPathQueueIn;    ///< Slots of paths alive this bounce.
+RWStructuredBuffer<uint> gPathCountIn;    ///< [0] = size of gPathQueueIn.
+RWStructuredBuffer<uint> gPathQueueOut;   ///< Survivors, consumed next bounce.
+RWStructuredBuffer<uint> gPathCountOut;   ///< [0] = size of gPathQueueOut.
+RWByteAddressBuffer gBounceArgs;          ///< Indirect args for the next bounceMain.
+
+/** Path death: resolve the deferred single NEE and write the pixel. Byte-for-
+    byte the fused shadeMain tail, factored so init and bounce share it.
+*/
+void finishPath(
+    const uint2 pixel,
+    float3 radiance,
+    const NeeVertexReservoir neeReservoir,
+    inout VolumeInstanceSampler volumeSampler,
+    inout SampleGenerator sg
+)
+{
+    if (kSingleNeePerPath && kUseNEE && neeReservoir.count > 0)
+    {
+        const HenyeyGreensteinPhaseFunction phase = HenyeyGreensteinPhaseFunction(neeReservoir.g);
+        radiance += neeReservoir.thp * evalNEE(neeReservoir.pos, neeReservoir.wi, phase, volumeSampler, sg) * float(neeReservoir.count);
+    }
+    gOutputColor[pixel] += float4(radiance, 0.f);
+    if (is_valid(gOutputLin))
+        gOutputLin[pixel] += float4(radiance, 0.f);
+}
+
+/** Shade-phase work counters, shared by both wavefront kernels so [WORK] and
+    [COST] stay comparable with the fused backend (same slots, 20/21 = shading
+    cells/taps). Wave ops with all live lanes, then lane 0 commits.
+*/
+void emitShadeStats(inout VolumeInstanceSampler volumeSampler)
+{
+#if USE_WORK_STATS
+    const uint a = WaveActiveSum(volumeSampler.statAabbTests);
+    const uint a2 = WaveActiveSum(volumeSampler.statBrickCandidates);
+    const uint b = WaveActiveSum(volumeSampler.statSegments);
+    const uint g2 = WaveActiveSum(volumeSampler.statRays);
+    const uint h4 = WaveActiveSum(gvsCellsNow());
+    const uint h5 = WaveActiveSum(gvsTapsNow());
+    const uint h6 = WaveActiveSum(volumeSampler.statOverlapSteps);
+    const uint h7 = WaveActiveSum(volumeSampler.statOverlapLookups);
+    const uint h8 = WaveActiveSum(volumeSampler.statTailRays);
+    const uint h9 = WaveActiveSum(gvsBrickHitsNow());
+    const uint h11 = WaveActiveSum(gvsTapSkipsNow());
+    const uint h10 = WaveActiveSum(gvsBrickMissesNow());
+    if (WaveIsFirstLane())
+    {
+        if (a > 0) InterlockedAdd(gRisStats[9], a);
+        if (a2 > 0) InterlockedAdd(gRisStats[29], a2);
+        if (b > 0) InterlockedAdd(gRisStats[10], b);
+        if (g2 > 0) InterlockedAdd(gRisStats[15], g2);
+        if (h4 > 0) InterlockedAdd(gRisStats[20], h4);
+        if (h5 > 0) InterlockedAdd(gRisStats[21], h5);
+        if (h6 > 0) InterlockedAdd(gRisStats[22], h6);
+        if (h7 > 0) InterlockedAdd(gRisStats[23], h7);
+        if (h8 > 0) InterlockedAdd(gRisStats[24], h8);
+        if (h9 > 0) InterlockedAdd(gRisStats[27], h9);
+        if (h10 > 0) InterlockedAdd(gRisStats[28], h10);
+        if (h11 > 0) InterlockedAdd(gRisStats[30], h11);
+    }
+#endif
+}
+
+/** Wavefront phase B entry: shade the RIS vertex (bounce 0) exactly as the
+    fused shadeMain head does, then park the survivor in gPathState instead of
+    looping.
+*/
+[numthreads(64, 1, 1)]
+void shadeInitMain(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gvsSetOccSkipEnable(gOccSkipEnable);
+    const uint queueIdx = dispatchThreadId.x;
+    if (queueIdx >= gScatterCount[0])
+        return;
+
+    const ScatterEntry entry = gScatterQueue[queueIdx];
+    const uint2 pixel = uint2(entry.pixel & 0xffffu, entry.pixel >> 16);
+
+    // Seed by PIXEL with the same constant as the fused path: the wavefront
+    // stream must be the same stream.
+    SampleGenerator sg = SampleGenerator(pixel, gFrameCount + 0x9e3779b9u);
+    VolumeInstanceSampler volumeSampler = {};
+
+    Ray ray = gScene.camera.computeRayPinhole(pixel, gFrameDim);
+    ray.tMax = FLT_MAX;
+    const float3 wi = -ray.dir;
+
+    float3 radiance = float3(0.f);
+    const GridVolume gv = gScene.getGridVolume(entry.inst);
+    float3 throughput = gv.data.albedo * entry.W;
+    NeeVertexReservoir neeReservoir = {};
+
+    const float3 scatterPos = ray.origin + entry.t * ray.dir;
+    if (scatterAtVertex(scatterPos, wi, gv.data.anisotropy, 0, ray, throughput, radiance, neeReservoir, volumeSampler, sg))
+    {
+        PathState ps;
+        ps.pixel = entry.pixel;
+        ps.bounce = 1;
+        ps.org = ray.origin;
+        ps.dir = ray.dir;
+        ps.thp = throughput;
+        ps.rad = radiance;
+        ps.nee = neeReservoir;
+        ps.sg = sg;
+        gPathState[queueIdx] = ps;
+        uint slot;
+        InterlockedAdd(gPathCountOut[0], 1u, slot);
+        gPathQueueOut[slot] = queueIdx;
+    }
+    else
+    {
+        finishPath(pixel, radiance, neeReservoir, volumeSampler, sg);
+    }
+
+    emitShadeStats(volumeSampler);
+}
+
+/** One bounce for every live path: the fused while-loop body, verbatim, with
+    "break" replaced by path death and "loop again" by requeue.
+*/
+[numthreads(64, 1, 1)]
+void bounceMain(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gvsSetOccSkipEnable(gOccSkipEnable);
+    const uint i = dispatchThreadId.x;
+    if (i >= gPathCountIn[0])
+        return;
+    const uint slot = gPathQueueIn[i];
+    PathState ps = gPathState[slot];
+
+    const uint2 pixel = uint2(ps.pixel & 0xffffu, ps.pixel >> 16);
+    VolumeInstanceSampler volumeSampler = {};
+    SampleGenerator sg = ps.sg;
+    Ray ray = Ray(ps.org, ps.dir, 0.f, FLT_MAX);
+    float3 throughput = ps.thp;
+    float3 radiance = ps.rad;
+    NeeVertexReservoir neeReservoir = ps.nee;
+    uint bounce = ps.bounce;
+
+    // Fused loop body, one trip. Divergence here is bounded by ONE bounce's
+    // internal variance, not the whole path's - that is the entire point.
+    bool alive = false;
+    VolumeInstanceSampler::DistanceSample ds;
+    if (!volumeSampler.sampleDistance(ray, sg, ds))
+    {
+        radiance += throughput * evalEnvironment(ray.dir);
+    }
+    else
+    {
+        throughput *= ds.thp;
+        const float3 pos = ray.origin + ds.t * ray.dir;
+        const float3 wiB = -ray.dir;
+        if (bounce < kMaxBounces)
+        {
+            const float g = gScene.getGridVolume(ds.instance).data.anisotropy;
+            if (scatterAtVertex(pos, wiB, g, bounce, ray, throughput, radiance, neeReservoir, volumeSampler, sg))
+            {
+                bounce++;
+                alive = true;
+            }
+        }
+    }
+
+    if (alive)
+    {
+        ps.bounce = bounce;
+        ps.org = ray.origin;
+        ps.dir = ray.dir;
+        ps.thp = throughput;
+        ps.rad = radiance;
+        ps.nee = neeReservoir;
+        ps.sg = sg;
+        gPathState[slot] = ps;
+        uint o;
+        InterlockedAdd(gPathCountOut[0], 1u, o);
+        gPathQueueOut[o] = slot;
+    }
+    else
+    {
+        finishPath(pixel, radiance, neeReservoir, volumeSampler, sg);
+    }
+
+    emitShadeStats(volumeSampler);
+}
+
+/** Next bounce's indirect args from the live-path count. */
+[numthreads(1, 1, 1)]
+void bounceArgsMain()
+{
+    const uint n = gPathCountIn[0];
+    gBounceArgs.Store3(0, uint3((n + 63u) / 64u, 1u, 1u));
+}
+
+/** Tail finisher: loop the remaining live paths to completion, fused-style.
+    WHY: v1 ran all 64 requeue rounds and was MUCH slower - each round is
+    args + clear + dispatch with serializing barriers (~192 sync points per
+    frame), and past round ~10 only a few thousand paths remain, so ~50 rounds
+    paid full pipeline-drain overhead to advance almost nothing. Requeueing
+    only pays while populations keep warps dense; once they are thin, the
+    fused loop's divergence costs less than the per-round overhead. So: K
+    dense rounds (gWavefrontRounds, CPU-side), then this kernel drains the
+    rest. Same loop body, same RNG stream => still byte-identical.
+*/
+[numthreads(64, 1, 1)]
+void bounceTailMain(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gvsSetOccSkipEnable(gOccSkipEnable);
+    const uint i = dispatchThreadId.x;
+    if (i >= gPathCountIn[0])
+        return;
+    const uint slot = gPathQueueIn[i];
+    PathState ps = gPathState[slot];
+
+    const uint2 pixel = uint2(ps.pixel & 0xffffu, ps.pixel >> 16);
+    VolumeInstanceSampler volumeSampler = {};
+    SampleGenerator sg = ps.sg;
+    Ray ray = Ray(ps.org, ps.dir, 0.f, FLT_MAX);
+    float3 throughput = ps.thp;
+    float3 radiance = ps.rad;
+    NeeVertexReservoir neeReservoir = ps.nee;
+    uint bounce = ps.bounce;
+
+    // The fused shadeMain continuation loop, verbatim.
+    while (true)
+    {
+        VolumeInstanceSampler::DistanceSample ds;
+        if (!volumeSampler.sampleDistance(ray, sg, ds))
+        {
+            radiance += throughput * evalEnvironment(ray.dir);
+            break;
+        }
+        throughput *= ds.thp;
+        const float3 pos = ray.origin + ds.t * ray.dir;
+        const float3 wiB = -ray.dir;
+        if (bounce >= kMaxBounces)
+            break;
+        const float g = gScene.getGridVolume(ds.instance).data.anisotropy;
+        if (!scatterAtVertex(pos, wiB, g, bounce, ray, throughput, radiance, neeReservoir, volumeSampler, sg))
+            break;
+        bounce++;
+    }
+
+    finishPath(pixel, radiance, neeReservoir, volumeSampler, sg);
+    emitShadeStats(volumeSampler);
+}
 #endif // USE_COMPACTION
 
 // ---------------------------------------------------------------------------

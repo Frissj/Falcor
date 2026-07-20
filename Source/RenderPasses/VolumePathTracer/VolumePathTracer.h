@@ -211,6 +211,43 @@ private:
     /// thread per real path in dense waves. Estimator-identical: matrix
     /// config 15 gates converged-identity. Requires RIS.
     bool mUseCompaction = false;
+    /// Wavefront phase B: per-bounce requeueing on top of compaction. The
+    /// fused shadeMain loop measured 0.271 lane occupancy ([SHADEOCC]) - the
+    /// average warp idles 27 of 32 lanes behind its longest path - and the
+    /// matrix gate blocks roulette past 0.125, so scheduling is the only
+    /// unbiased lever left. shadeInitMain shades the RIS vertex and parks
+    /// survivors in a PathState buffer; up to maxBounces bounceMain dispatches
+    /// each advance every live path one bounce and requeue survivors, keeping
+    /// warps dense. Estimator is byte-identical (RNG state carried in PathState,
+    /// never re-seeded). Requires compaction; A/B against the fused loop is a
+    /// same-session checkbox - converged images must be BIT-identical.
+    ///
+    /// MEASURED AND DEFAULTED OFF (2026-07-20): fps degrades MONOTONICALLY in
+    /// the round count - K=0 fastest, on-screen, same session. The loss is
+    /// structural, not tuning: requeueing fixes path-LENGTH divergence, but a
+    /// round's warp still waits on its slowest lane's SINGLE bounce, and
+    /// single-bounce cost variance (3 vs 40 bricks marched) is most of the
+    /// 0.383 work-occupancy gap. Packing cannot equalize per-bounce cost, and
+    /// the 116 B/path state round-trip + per-round barriers eat the rest. A
+    /// dynamic/GPU-driven K cannot help: it would only select the best K, and
+    /// the best K is zero. Kept compiled for A/B and as the measured record.
+    /// The remaining shadeMain lever is algorithmic (volumetric final gather),
+    /// not scheduling.
+    bool mUseWavefront = false;
+    /// Dense requeue rounds before the tail finisher takes over. v1 ran all
+    /// 64 rounds and was MUCH slower: each round is args + clear + dispatch
+    /// with serializing barriers, and past ~round 10 populations are too thin
+    /// to pay that overhead. Runtime knob (CPU-side loop bound, no recompile):
+    /// 0 = tail-only (~fused), maxBounces = pure wavefront. Sweep it live.
+    uint32_t mWavefrontRounds = 8;
+    ref<ComputePass> mpPassShadeInit; ///< shadeInitMain.
+    ref<ComputePass> mpPassBounce;    ///< bounceMain.
+    ref<ComputePass> mpPassBounceArgs;///< bounceArgsMain.
+    ref<ComputePass> mpPassBounceTail;///< bounceTailMain (loops survivors to death).
+    ref<Buffer> mpPathState;          ///< PathState per scatter-queue slot.
+    ref<Buffer> mpPathQueue[2];       ///< Ping-pong live-path slot lists.
+    ref<Buffer> mpPathCount[2];       ///< Ping-pong queue counts.
+    ref<Buffer> mpBounceArgs;         ///< Indirect args for bounceMain.
     /// Defensive RIS target floor, relative to a fully-lit isotropic vertex
     /// (1/4pi). Bounds the L/Lhat firefly mechanism measured in the matrix
     /// (isolated 800-2200x pixels at 1 spp). Unbiased for any value, but it
