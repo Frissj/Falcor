@@ -1105,6 +1105,8 @@ void VolumePathTracer::prepareProgram(RenderContext* pRenderContext)
     }
     if (!mpGpuTimer)
         mpGpuTimer = GpuTimer::create(mpDevice);
+    if (!mpGpuTimerA)
+        mpGpuTimerA = GpuTimer::create(mpDevice);
 
     // Bind resources that never change for the lifetime of the program.
     // Plain bindShaderData is still correct for the SCENE block: this pass
@@ -1583,8 +1585,15 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
     if (timeThisFrame)
         mpGpuTimer->begin();
 
+    // Nested phase-A timer: [WORK] prints gpuMs split main/shade so the
+    // main-vs-shadeMain attribution comes from the log, not from a stale
+    // Nsight ratio. Independent timestamp pairs, so nesting is safe.
+    if (timeThisFrame && mpGpuTimerA)
+        mpGpuTimerA->begin();
     bindFrame(mpPass->getRootVar());
     mpPass->execute(pRenderContext, uint3(targetDim, 1));
+    if (timeThisFrame && mpGpuTimerA)
+        mpGpuTimerA->end();
 
     if (compactionActive)
     {
@@ -1723,6 +1732,8 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
     {
         mpGpuTimer->end();
         mpGpuTimer->resolve();
+        if (mpGpuTimerA)
+            mpGpuTimerA->resolve();
     }
 
     if (logThisFrame)
@@ -1753,6 +1764,8 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
             {
                 if (mpGpuTimer)
                     mLastGpuMs = mpGpuTimer->getElapsedTime();
+                if (mpGpuTimerA)
+                    mLastGpuMsA = mpGpuTimerA->getElapsedTime();
 
                 // [DIVERGE] Why only ~23% of lane-slots retire useful work.
                 // laneUtil is computed the same way Nsight computes Active
@@ -1896,10 +1909,10 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
                 // operation volume, and compare against gpuMs to find the
                 // dominant term. No thresholds, no interpretation baked in.
                 logInfo(
-                    "[WORK] frame {} res {}x{} gpuMs {:.3f} | per-pixel: samplerCalls {:.1f} instSlabs {:.1f} "
+                    "[WORK] frame {} res {}x{} gpuMs {:.3f} (main {:.3f} + shade {:.3f}) | per-pixel: samplerCalls {:.1f} instSlabs {:.1f} "
                     "brickCands {:.1f} segments {:.1f} coarseWalks {:.2f} coarseCells {:.1f} sweepCells {:.1f} "
                     "sweepTaps {:.2f} | totals: instSlabs {} brickCands {} coarseCells {}",
-                    mFrameCount, targetDim.x, targetDim.y, mLastGpuMs,
+                    mFrameCount, targetDim.x, targetDim.y, mLastGpuMs, mLastGpuMsA, std::max(0.0, (double)mLastGpuMs - mLastGpuMsA),
                     s[15] / px, s[9] / px, s[29] / px, s[10] / px, s[11] / px, s[12] / px, s[13] / px, s[14] / px,
                     s[9], s[29], s[12]
                 );

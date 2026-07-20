@@ -407,6 +407,8 @@ private:
     bool mLogWorkStats = false;
     ref<GpuTimer> mpGpuTimer;
     double mLastGpuMs = 0.0;
+    ref<GpuTimer> mpGpuTimerA; ///< Nested phase-A (main dispatch) timer; [WORK] prints the main/shade split.
+    double mLastGpuMsA = 0.0;
 
     uint32_t mFrameCount = 0;
     bool mOptionsChanged = false;
