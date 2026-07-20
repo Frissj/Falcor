@@ -105,6 +105,20 @@ def render_graph_VNA():
         # kept compiled for A/B; do not re-enable without a new measurement
         # that contradicts this one.
         'useWavefront': False,
+        # Radiance-cache control variate (2026-07-20): the deep-bounce tail's
+        # mean lives in a trained world-grid cache; paths past radCutBounce
+        # only estimate the residual (L - C), so the aggressive kill rate that
+        # FAILED the gate on raw paths (it deleted real energy) is safe here -
+        # the deleted term has mean ~0. Unbiased for any cache content. All
+        # knobs are CB values: radCutBounce 0 is the live OFF switch for
+        # same-session A/B. MUST pass the matrix gate before being called
+        # adopted; this flag turns it on for measurement.
+        'useRadCache': True,
+        'radCacheRes': 64,
+        'radCutBounce': 3,
+        'radResidualSurvival': 0.25,
+        'radTrainEvery': 8,
+        'radEma': 0.10,
         # Section 4: HW-BVH brick TLAS (UE HeterogeneousVolumes port) with
         # per-instance projected-error mip selection.
         'useBrickTlas': True,

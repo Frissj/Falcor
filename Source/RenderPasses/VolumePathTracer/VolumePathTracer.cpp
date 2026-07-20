@@ -79,6 +79,12 @@ const char kUseCompaction[] = "useCompaction";
 const char kUseWavefront[] = "useWavefront";
 const char kWavefrontRounds[] = "wavefrontRounds";
 const char kUseTauCache[] = "useTauCache";
+const char kUseRadCache[] = "useRadCache";
+const char kRadCacheRes[] = "radCacheRes";
+const char kRadCutBounce[] = "radCutBounce";
+const char kRadResidualSurvival[] = "radResidualSurvival";
+const char kRadTrainEvery[] = "radTrainEvery";
+const char kRadEma[] = "radEma";
 const char kTauCacheRes[] = "tauCacheRes";
 const char kTauCacheInterval[] = "tauCacheInterval";
 } // namespace
@@ -165,6 +171,18 @@ void VolumePathTracer::parseProperties(const Properties& props)
             mWavefrontRounds = value;
         else if (key == kUseTauCache)
             mUseTauCache = value;
+        else if (key == kUseRadCache)
+            mUseRadCache = value;
+        else if (key == kRadCacheRes)
+            mRadCacheRes = std::clamp((uint32_t)value, 8u, 512u);
+        else if (key == kRadCutBounce)
+            mRadCutBounce = value;
+        else if (key == kRadResidualSurvival)
+            mRadResidualSurvival = std::clamp((float)value, 0.01f, 1.f);
+        else if (key == kRadTrainEvery)
+            mRadTrainEvery = std::max(1u, (uint32_t)value);
+        else if (key == kRadEma)
+            mRadEma = std::clamp((float)value, 0.001f, 1.f);
         else if (key == kTauCacheRes)
             mTauCacheRes = std::clamp((uint32_t)value, 8u, 512u);
         else if (key == kTauCacheInterval)
@@ -212,6 +230,12 @@ Properties VolumePathTracer::getProperties() const
     props[kUseWavefront] = mUseWavefront;
     props[kWavefrontRounds] = mWavefrontRounds;
     props[kUseTauCache] = mUseTauCache;
+    props[kUseRadCache] = mUseRadCache;
+    props[kRadCacheRes] = mRadCacheRes;
+    props[kRadCutBounce] = mRadCutBounce;
+    props[kRadResidualSurvival] = mRadResidualSurvival;
+    props[kRadTrainEvery] = mRadTrainEvery;
+    props[kRadEma] = mRadEma;
     props[kTauCacheRes] = mTauCacheRes;
     props[kTauCacheInterval] = mTauCacheInterval;
     return props;
@@ -300,6 +324,9 @@ void VolumePathTracer::setScene(RenderContext* pRenderContext, const ref<Scene>&
     mpPassTauDir = nullptr;
     mpPassTauBuild = nullptr;
     mTauLastBuildFrame = kTauNeverBuilt;
+    mpPassRadResolve = nullptr;
+    mpRadAccum = nullptr;
+    mpRadTex = nullptr;
 
     const auto& volumes = mpScene->getGridVolumes();
     for (const auto& pVolume : volumes)
@@ -958,6 +985,11 @@ void VolumePathTracer::prepareProgram(RenderContext* pRenderContext)
     // present), so a no-envmap scene never references an unbindable texture.
     // The RUNTIME switch is gTauEnable in TauCB, not this define.
     defines.add("USE_TAU_CACHE", (mUseRIS && mUseTauCache && mpEnvMapSampler) ? "1" : "0");
+    // Radiance-cache control variate: fused shadeMain backend only (the
+    // reference path in main stays untouched, and the wavefront backend is
+    // measured-off anyway).
+    const bool radCacheCompiled = compactionCompiled && mUseRadCache;
+    defines.add("USE_RAD_CACHE", radCacheCompiled ? "1" : "0");
     // Size the sampler's per-thread arrays to the scene, not to a fixed 16.
     // These arrays dominate register/scratch usage, and this pass measured as
     // spill-bound rather than work-bound, so oversizing them costs real time.
@@ -1010,6 +1042,10 @@ void VolumePathTracer::prepareProgram(RenderContext* pRenderContext)
         mpPassTauDir = ComputePass::create(mpDevice, makeDesc("tauDirMain"), defines, true);
         mpPassTauBuild = ComputePass::create(mpDevice, makeDesc("tauBuildMain"), defines, true);
     }
+
+    mpPassRadResolve = nullptr;
+    if (radCacheCompiled)
+        mpPassRadResolve = ComputePass::create(mpDevice, makeDesc("radResolveMain"), defines, true);
 
     // RIS stat buffers. Always created (and always bound) so the shader's UAV
     // is never null, regardless of whether logging is currently enabled.
@@ -1108,6 +1144,63 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
                                (mTauCacheInterval > 0 && mFrameCount - mTauLastBuildFrame >= mTauCacheInterval);
         if (needBuild)
             buildTauCache(pRenderContext);
+    }
+
+    // Radiance-cache resources (see RadCB in the shader). Same grid-geometry
+    // convention as the tau cache: cell from the longest axis, per-axis counts
+    // from the extents. Created empty (confidence 0), so consumption stays
+    // inert until training paths have populated cells.
+    if (mpPassRadResolve && !mpRadAccum && mpScene)
+    {
+        AABB wb;
+        for (const auto& pVolume : mpScene->getGridVolumes())
+        {
+            if (!pVolume->getDensityGrid()) continue;
+            wb.include(pVolume->getBounds());
+        }
+        const float3 ext = wb.valid() ? wb.extent() : float3(0.f);
+        const float maxExt = std::max(ext.x, std::max(ext.y, ext.z));
+        if (maxExt > 0.f)
+        {
+            const float cell = maxExt / float(std::max(mRadCacheRes, 8u));
+            const uint3 dim = uint3(
+                std::max(1u, (uint32_t)std::ceil(ext.x / cell)),
+                std::max(1u, (uint32_t)std::ceil(ext.y / cell)),
+                std::max(1u, (uint32_t)std::ceil(ext.z / cell))
+            );
+            mRadOrigin = wb.minPoint;
+            mRadCellSize = float3(cell);
+            mRadInvExtent = float3(1.f) / (float3(dim) * cell);
+            mRadDim = dim;
+
+            const uint32_t cells = dim.x * dim.y * dim.z;
+            mpRadAccum = mpDevice->createStructuredBuffer(
+                sizeof(uint32_t), cells * 4u, ResourceBindFlags::UnorderedAccess | ResourceBindFlags::ShaderResource,
+                MemoryType::DeviceLocal
+            );
+            mpRadAccum->setName("VolumePathTracer::mpRadAccum");
+            pRenderContext->clearUAV(mpRadAccum->getUAV().get(), uint4(0, 0, 0, 0));
+
+            mpRadTex = mpDevice->createTexture3D(
+                dim.x, dim.y, dim.z, ResourceFormat::RGBA16Float, 1, nullptr,
+                ResourceBindFlags::UnorderedAccess | ResourceBindFlags::ShaderResource
+            );
+            mpRadTex->setName("VolumePathTracer::mpRadTex");
+            pRenderContext->clearUAV(mpRadTex->getUAV().get(), float4(0.f));
+
+            if (!mpTauSampler)
+            {
+                Sampler::Desc sd;
+                sd.setFilterMode(TextureFilteringMode::Linear, TextureFilteringMode::Linear, TextureFilteringMode::Linear);
+                sd.setAddressingMode(TextureAddressingMode::Clamp, TextureAddressingMode::Clamp, TextureAddressingMode::Clamp);
+                mpTauSampler = mpDevice->createSampler(sd);
+            }
+
+            logInfo(
+                "VolumePathTracer: radiance cache {}x{}x{} cells of {:.1f} world units (train 1-in-{}, cut bounce {}, residual p {:.2f}).",
+                dim.x, dim.y, dim.z, cell, mRadTrainEvery, mRadCutBounce, mRadResidualSurvival
+            );
+        }
     }
 
     // Tell the shaders which optional outputs are actually connected.
@@ -1297,6 +1390,30 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
             }
         }
 
+        // Radiance-cache CV: resolved cache + deposit accumulators + knobs.
+        // Every knob is a CB value, so the estimator config sweeps live -
+        // gRadCutBounce = 0 is the runtime OFF switch.
+        if (mpRadAccum && mpRadTex)
+        {
+            if (auto v = var.findMember("gRadTex"); v.isValid())
+                v = mpRadTex;
+            if (auto v = var.findMember("gRadSmp"); v.isValid())
+                v = mpTauSampler;
+            if (auto v = var.findMember("gRadAccum"); v.isValid())
+                v = mpRadAccum;
+            if (auto rcb = var.findMember("RadCB"); rcb.isValid())
+            {
+                rcb["gRadOrigin"] = mRadOrigin;
+                rcb["gRadCutBounce"] = mRadCutBounce;
+                rcb["gRadCellSize"] = mRadCellSize;
+                rcb["gRadResidualSurvival"] = mRadResidualSurvival;
+                rcb["gRadInvExtent"] = mRadInvExtent;
+                rcb["gRadTrainEvery"] = mRadTrainEvery;
+                rcb["gRadDim"] = mRadDim;
+                rcb["gRadEma"] = mRadEma;
+            }
+        }
+
         // Merged coarse tail: baked summed-field grid + its constants.
         if (mUseMergedTail && mpTailTex)
         {
@@ -1397,8 +1514,10 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
         argsVar["gDispatchArgs"] = mpDispatchArgs;
         mpPassArgs->execute(pRenderContext, uint3(1, 1, 1));
 
-        const bool wavefrontActive =
-            mUseWavefront && mpPassShadeInit && mpPassBounce && mpPassBounceArgs && mpPassBounceTail && mpPathState;
+        // The rad-cache CV lives in the fused shadeMain only; the wavefront
+        // backend (measured-off anyway) does not implement the cut.
+        const bool wavefrontActive = mUseWavefront && !mUseRadCache && mpPassShadeInit && mpPassBounce && mpPassBounceArgs &&
+                                     mpPassBounceTail && mpPathState;
         if (!wavefrontActive)
         {
             bindFrame(mpPassShade->getRootVar());
@@ -1462,6 +1581,31 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
                 tailVar["gPathCountIn"] = mpPathCount[cur];
                 mpPassBounceTail->executeIndirect(pRenderContext, mpBounceArgs.get());
             }
+        }
+
+        // Fold this frame's training deposits into the resolved cache and
+        // clear the accumulators. Runs after phase B so deposits are complete;
+        // consumption reads the resolved texture next frame.
+        if (mpPassRadResolve && mpRadAccum && mpRadTex)
+        {
+            // Manual bind: this kernel touches only RadCB + the two rad
+            // resources. bindFrame would poke CB members the program does not
+            // reflect and throw.
+            auto rv = mpPassRadResolve->getRootVar();
+            rv["gRadAccum"] = mpRadAccum;
+            rv["gRadResolveUav"] = mpRadTex;
+            if (auto rcb = rv.findMember("RadCB"); rcb.isValid())
+            {
+                rcb["gRadOrigin"] = mRadOrigin;
+                rcb["gRadCutBounce"] = mRadCutBounce;
+                rcb["gRadCellSize"] = mRadCellSize;
+                rcb["gRadResidualSurvival"] = mRadResidualSurvival;
+                rcb["gRadInvExtent"] = mRadInvExtent;
+                rcb["gRadTrainEvery"] = mRadTrainEvery;
+                rcb["gRadDim"] = mRadDim;
+                rcb["gRadEma"] = mRadEma;
+            }
+            mpPassRadResolve->execute(pRenderContext, uint3(mRadDim));
         }
     }
 
@@ -1860,6 +2004,33 @@ void VolumePathTracer::renderUI(Gui::Widgets& widget)
                         "64 = pure wavefront (measured much slower: barrier overhead).",
                         true
                     );
+                }
+            }
+            rebuild |= group.checkbox("Radiance cache CV (final gather)", mUseRadCache);
+            group.tooltip(
+                "Volumetric final gather, unbiased: the deep-bounce tail's MEAN\n"
+                "moves into a world-grid cache trained by 1-in-N paths; consuming\n"
+                "paths take the cache at the cut vertex and continue only to\n"
+                "estimate the residual (L - C). Roulette past q=0.125 FAILED the\n"
+                "matrix gate because it deleted real energy; the same kill rates\n"
+                "on residuals delete a term with mean ~0. Unbiased for ANY cache\n"
+                "content - staleness/coarseness cost residual variance only.\n"
+                "Give the cache ~2-5 s to train after enabling (confidence gate).",
+                true
+            );
+            if (mUseRadCache)
+            {
+                group.var("Cut bounce (0=off, live)", mRadCutBounce, 0u, 16u);
+                group.tooltip("Bounce index where the CV applies. 0 = runtime off switch\nfor same-session A/B - no recompile.", true);
+                group.var("Residual survival p", mRadResidualSurvival, 0.01f, 1.f);
+                group.tooltip("Survival probability past the cut. 1.0 = CV bookkeeping only\n(pure variance reduction, no cost win). Lower = shorter paths,\nmore residual variance. The matrix prices it.", true);
+                group.var("Train 1-in-N", mRadTrainEvery, 1u, 64u);
+                group.tooltip("Training pixels run FULL paths (deposit, never consume), so the\ncache never learns from itself.", true);
+                group.var("Cache EMA", mRadEma, 0.001f, 1.f);
+                if (group.var("Cache res", mRadCacheRes, 8u, 512u))
+                {
+                    mpRadAccum = nullptr; // Recreate next frame.
+                    mpRadTex = nullptr;
                 }
             }
             rebuild |= group.var("Coarse mip", mRisMip, 0u, 3u);

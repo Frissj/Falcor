@@ -244,6 +244,27 @@ private:
     ref<ComputePass> mpPassBounce;    ///< bounceMain.
     ref<ComputePass> mpPassBounceArgs;///< bounceArgsMain.
     ref<ComputePass> mpPassBounceTail;///< bounceTailMain (loops survivors to death).
+
+    /// Radiance-cache control variate (volumetric final gather; see RadCB in
+    /// the shader). The deep-bounce tail's MEAN moves into a world-grid cache
+    /// trained by 1-in-N paths; consuming paths take the cache at the cut
+    /// vertex and continue only to estimate the residual (L - C), which
+    /// tolerates the aggressive kill rates the matrix gate rejected on raw
+    /// paths. UNBIASED for any cache content - staleness and coarseness cost
+    /// residual variance only. shadeMain (fused) backend only.
+    bool mUseRadCache = false;
+    uint32_t mRadCacheRes = 64;         ///< Cells along the longest axis.
+    uint32_t mRadCutBounce = 3;         ///< Bounce index of the cut (0 disables at runtime).
+    float mRadResidualSurvival = 0.25f; ///< p: residual survival at the cut.
+    uint32_t mRadTrainEvery = 8;        ///< 1-in-N pixels train (deposit, never consume).
+    float mRadEma = 0.10f;              ///< Per-frame resolve blend.
+    ref<ComputePass> mpPassRadResolve;  ///< radResolveMain.
+    ref<Buffer> mpRadAccum;             ///< 4 uints/cell fixed-point deposit sums.
+    ref<Texture> mpRadTex;              ///< Resolved cache (RGBA16F, .a = confidence).
+    float3 mRadOrigin = float3(0.f);
+    float3 mRadCellSize = float3(0.f);
+    float3 mRadInvExtent = float3(0.f);
+    uint3 mRadDim = uint3(0);
     ref<Buffer> mpPathState;          ///< PathState per scatter-queue slot.
     ref<Buffer> mpPathQueue[2];       ///< Ping-pong live-path slot lists.
     ref<Buffer> mpPathCount[2];       ///< Ping-pong queue counts.

@@ -272,6 +272,85 @@ SamplerState gTauSmp;                   ///< Linear clamp.
 RWTexture3D<float> gTauCacheUav;        ///< tauBuildMain output (same texture, UAV view).
 RWStructuredBuffer<float4> gTauDirBuf;  ///< [0].xyz = dominant light direction, written by tauDirMain.
 
+/** In-scattered radiance cache + control-variate residual (volumetric final
+    gather, the ReSTIR-FG / Nubis lesson in house style).
+
+    WHY: the deep-bounce tail is the last big cost (avg path 8 bounces, tail to
+    64) and every scheduling attack on it is measured dead. Roulette past
+    q=0.125 FAILS the matrix gate because the tail carries real energy - so
+    the tail's MEAN moves into a cache C, and the path only estimates the
+    RESIDUAL (L - C):
+
+        L = C + E[S - C]  for any C     (S = the path's suffix from the cut)
+
+    At the cut vertex: radiance += thp*C; survive w.p. p; on survival
+    thp /= p and radiance -= thp*C, then the vertex proceeds normally so its
+    continued suffix S accrues with the boosted throughput. Expectation is
+    thp*C + (thp/p)*E[S - C]*p = thp*E[S]: UNBIASED FOR ANY CACHE CONTENT,
+    stale, coarse, or empty. Quality of C moves only the residual's variance -
+    which is exactly the knob the gate prices. The aggressive kill rates that
+    failed on raw paths are safe on residuals because the residual's mean is
+    ~0 when C is good.
+
+    POPULATION (NRC-style split): 1-in-gRadTrainEvery pixels are TRAINING
+    paths - they skip consumption (so the cache never learns from itself) and
+    at death deposit their measured suffix S/thp_cut at the cut vertex.
+    Deposits accumulate in fixed-point atomics; radResolveMain folds them into
+    the resolved texture with an EMA so the cache converges over frames and
+    tracks slow lighting change. Confidence rides in .a; consumption only
+    fires where confidence > 0.5, so an empty cache degrades to the plain
+    estimator, not to garbage.
+*/
+#ifndef USE_RAD_CACHE
+#define USE_RAD_CACHE 0
+#endif
+
+cbuffer RadCB
+{
+    float3 gRadOrigin;          ///< World min corner of the cache grid.
+    uint   gRadCutBounce;       ///< Bounce index where the CV applies (0 = off).
+    float3 gRadCellSize;        ///< World size of one cell.
+    float  gRadResidualSurvival;///< p: residual survival probability at the cut.
+    float3 gRadInvExtent;       ///< world -> uvw.
+    uint   gRadTrainEvery;      ///< 1-in-N pixels are training paths.
+    uint3  gRadDim;             ///< Grid resolution.
+    float  gRadEma;             ///< Resolve blend factor per frame.
+}
+RWStructuredBuffer<uint> gRadAccum;   ///< 4 uints/cell: fixed-point RGB sums + sample count.
+Texture3D<float4> gRadTex;            ///< Resolved cache (rgb = L_in estimate, a = confidence).
+RWTexture3D<float4> gRadResolveUav;   ///< radResolveMain's view of the same texture.
+SamplerState gRadSmp;                 ///< Linear clamp.
+
+static const float kRadFxScale = 1024.f; ///< Fixed-point scale for the atomic sums.
+
+/** Deposit one suffix sample at a world position (training paths, at death). */
+void radSplat(const float3 pos, const float3 L)
+{
+    const float3 q = (pos - gRadOrigin) / gRadCellSize;
+    if (any(q < 0.f) || any(q >= float3(gRadDim)))
+        return;
+    const uint3 c = uint3(q);
+    const uint idx = ((c.z * gRadDim.y + c.y) * gRadDim.x + c.x) * 4u;
+    // Clamp keeps one firefly from saturating a cell's 32-bit sum; the cache
+    // is a smooth control, outliers belong to the residual anyway.
+    const float3 Lc = clamp(L, 0.f, 4096.f);
+    InterlockedAdd(gRadAccum[idx + 0], uint(Lc.r * kRadFxScale));
+    InterlockedAdd(gRadAccum[idx + 1], uint(Lc.g * kRadFxScale));
+    InterlockedAdd(gRadAccum[idx + 2], uint(Lc.b * kRadFxScale));
+    InterlockedAdd(gRadAccum[idx + 3], 1u);
+}
+
+/** Training-path selector. Hash, not stripes: neighbours in a wave must not
+    all be training (deposit atomics would hotspot) nor all consuming.
+*/
+bool radIsTraining(const uint2 pixel)
+{
+    if (gRadTrainEvery <= 1u)
+        return true;
+    const uint h = (pixel.x * 9781u) ^ (pixel.y * 6271u) ^ (gFrameCount * 26699u);
+    return (h % gRadTrainEvery) == 0u;
+}
+
 static const uint kMaxBounces = MAX_BOUNCES;
 static const bool kUseNEE = USE_NEE;
 static const bool kUseRussianRoulette = USE_RUSSIAN_ROULETTE;
@@ -1413,6 +1492,18 @@ void shadeMain(uint3 dispatchThreadId: SV_DispatchThreadID)
         traceLoop = true;
     }
 
+#if USE_RAD_CACHE
+    // Control-variate state (see the RadCB note). Training paths snapshot at
+    // the cut and deposit their measured suffix at death; consuming paths take
+    // the cache's mean there and continue only to estimate the residual.
+    const bool radTraining = gRadCutBounce != 0u && radIsTraining(pixel);
+    bool radHasCut = false;
+    float3 radCutPos = float3(0.f);
+    float3 radCutThp = float3(0.f);
+    float3 radCutRad = float3(0.f);
+    uint radCutNee = 0u;
+#endif
+
     // Continuation bounces: byte-identical logic to the fused loop, minus the
     // bounce==0 primary-transmittance case, which cannot occur here (phase A
     // owns the primary escape term).
@@ -1435,6 +1526,40 @@ void shadeMain(uint3 dispatchThreadId: SV_DispatchThreadID)
         if (bounce >= kMaxBounces)
             break;
 
+#if USE_RAD_CACHE
+        // The cut vertex. Both roles trigger BEFORE the vertex is processed,
+        // so the suffix S is defined identically for deposit and consumption:
+        // everything from this vertex onward, including the vertex itself.
+        if (gRadCutBounce != 0u && bounce == gRadCutBounce)
+        {
+            if (radTraining)
+            {
+                radHasCut = true;
+                radCutPos = pos;
+                radCutThp = throughput;
+                radCutRad = radiance;
+                radCutNee = neeReservoir.count;
+            }
+            else
+            {
+                const float4 C = gRadTex.SampleLevel(gRadSmp, (pos - gRadOrigin) * gRadInvExtent, 0.f);
+                if (C.a > 0.5f) // Confidence gate: an empty cache = plain estimator.
+                {
+                    // L = C + (S - C): bank the cache's mean...
+                    radiance += throughput * C.rgb;
+                    // ...then keep the path alive only to estimate the residual.
+                    // This kill rate on RAW paths failed the matrix gate (it
+                    // deleted real energy); on residuals the deleted term has
+                    // mean ~0, which is the entire trick.
+                    if (sampleNext1D(sg) >= gRadResidualSurvival)
+                        break;
+                    throughput /= gRadResidualSurvival;
+                    radiance -= throughput * C.rgb;
+                }
+            }
+        }
+#endif
+
         const float g = gScene.getGridVolume(ds.instance).data.anisotropy;
         if (!scatterAtVertex(pos, wiB, g, bounce, ray, throughput, radiance, neeReservoir, volumeSampler, sg))
             break;
@@ -1443,11 +1568,35 @@ void shadeMain(uint3 dispatchThreadId: SV_DispatchThreadID)
     }
 
     // Deferred single NEE for the whole path, exactly as the fused kernel.
+    // Kept separable so the training deposit can attribute the correct SHARE
+    // of it to the suffix.
+    float3 neeContrib = float3(0.f);
     if (kSingleNeePerPath && kUseNEE && neeReservoir.count > 0)
     {
         const HenyeyGreensteinPhaseFunction phase = HenyeyGreensteinPhaseFunction(neeReservoir.g);
-        radiance += neeReservoir.thp * evalNEE(neeReservoir.pos, neeReservoir.wi, phase, volumeSampler, sg) * float(neeReservoir.count);
+        neeContrib = neeReservoir.thp * evalNEE(neeReservoir.pos, neeReservoir.wi, phase, volumeSampler, sg) * float(neeReservoir.count);
+        radiance += neeContrib;
     }
+
+#if USE_RAD_CACHE
+    if (radHasCut)
+    {
+        // Suffix = everything added after the snapshot, plus the share of the
+        // deferred NEE belonging to post-cut vertices. The reservoir picks its
+        // vertex uniformly, so the post-cut share IS the count ratio - correct
+        // in expectation, which is all a training target needs.
+        const float fPost = neeReservoir.count > 0u
+            ? float(neeReservoir.count - min(radCutNee, neeReservoir.count)) / float(neeReservoir.count)
+            : 0.f;
+        const float3 suffix = (radiance - radCutRad) - neeContrib * (1.f - fPost);
+        const float3 Ls = float3(
+            radCutThp.x > 1e-6f ? suffix.x / radCutThp.x : 0.f,
+            radCutThp.y > 1e-6f ? suffix.y / radCutThp.y : 0.f,
+            radCutThp.z > 1e-6f ? suffix.z / radCutThp.z : 0.f
+        );
+        radSplat(radCutPos, max(Ls, float3(0.f)));
+    }
+#endif
 
     // Phase A wrote the background/escape terms; this adds the scatter terms.
     // One queue entry per pixel => single writer, plain read-modify-write.
@@ -1863,4 +2012,30 @@ void tauBuildMain(uint3 tid: SV_DispatchThreadID)
     // Clamp for R16F range; exp(-64) is 40 orders below the 1e-3 visibility
     // floor the target applies, so nothing is lost.
     gTauCacheUav[tid] = min(tau, 64.f);
+}
+
+/** Fold this frame's training deposits into the resolved radiance cache with
+    an EMA, then clear the accumulators. Confidence (.a) rises toward 1 as a
+    cell keeps receiving samples; consumption gates on it, so unpopulated
+    regions never contribute a fake zero - they just run the plain estimator.
+*/
+[numthreads(4, 4, 4)]
+void radResolveMain(uint3 tid: SV_DispatchThreadID)
+{
+    if (any(tid >= gRadDim))
+        return;
+    const uint idx = ((tid.z * gRadDim.y + tid.y) * gRadDim.x + tid.x) * 4u;
+    const uint4 a = uint4(gRadAccum[idx + 0], gRadAccum[idx + 1], gRadAccum[idx + 2], gRadAccum[idx + 3]);
+    if (a.w > 0u)
+    {
+        const float3 mean = float3(a.xyz) / (kRadFxScale * float(a.w));
+        float4 v = gRadResolveUav[tid];
+        v.rgb = lerp(v.rgb, mean, gRadEma);
+        v.a = lerp(v.a, 1.f, gRadEma);
+        gRadResolveUav[tid] = v;
+    }
+    gRadAccum[idx + 0] = 0u;
+    gRadAccum[idx + 1] = 0u;
+    gRadAccum[idx + 2] = 0u;
+    gRadAccum[idx + 3] = 0u;
 }
