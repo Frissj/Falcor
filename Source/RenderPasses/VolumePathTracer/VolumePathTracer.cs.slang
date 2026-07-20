@@ -1790,6 +1790,20 @@ void shadeMain(uint3 dispatchThreadId: SV_DispatchThreadID)
     if (is_valid(gOutputLin))
         gOutputLin[pixel] += float4(radiance, 0.f);
 
+#if USE_TEMPORAL_REUSE
+    // Feed the scatter-sort predictor: this path's MEASURED bounce count,
+    // read next frame by scatterClassMain. bounce >= 1 for every shaded path,
+    // so 0 stays the "no path here last frame" sentinel. Field-only store
+    // into the reservoir phase A wrote earlier this frame (one entry per
+    // pixel => single writer; Falcor's UAV barrier orders the dispatches).
+    // Run 138 lesson: the T hint (_pad0) is RR-quantized since trRR went
+    // live - killed walks store exactly 0, survivors >= ~theta - so it
+    // cannot rank work inside the thick mass. Last frame's actual path
+    // length is the label itself, one frame stale.
+    if (gTemporalEnable != 0)
+        gReservoirCurr[pixel.y * gFrameDim.x + pixel.x]._pad1 = float(bounce);
+#endif
+
 #if USE_WORK_STATS
     // Shade-phase work lands in the same [WORK]/[COST] slots as the fused
     // kernel's shading bucket, so the log stays comparable across modes.
@@ -1900,18 +1914,23 @@ void scatterClassMain(uint3 dispatchThreadId: SV_DispatchThreadID)
     uint c = 0;
 #if USE_TEMPORAL_REUSE
     const uint2 pixel = uint2(gScatterQueue[idx].pixel & 0xffffu, gScatterQueue[idx].pixel >> 16);
-    const float tHint = gReservoirPrev[pixel.y * gFrameDim.x + pixel.x]._pad0;
-    // Bin edges are tuned to the QUEUED population, not the screen (run 137
-    // lesson: screen-scale edges 0.05/0.2/0.5 put essentially every queued
-    // pixel - they are scatter survivors, i.e. cloudy and low-T by
-    // construction - into class 0, and a sort where every key is equal is a
-    // stable no-op: [SHADEOCC] bounce occ stayed at exactly 0.229). The
-    // queue's T mass lives below ~0.1, so the edges split THAT range.
-    // tHint 0 = cleared/invalid history: bins with the thick class - unknown
-    // pixels are the ones most likely to be freshly-revealed cloud interior.
-    if (tHint < 0.005f) c = 0;
-    else if (tHint < 0.02f) c = 1;
-    else if (tHint < 0.08f) c = 2;
+    // Predictor v3 = LAST frame's MEASURED bounce count for this pixel's
+    // path (written by shadeMain into _pad1). The label itself, one frame
+    // stale - no proxy modelling. History of dead proxies, kept so nobody
+    // resurrects them: v1 screen-scale T bins (run 137: all queued pixels
+    // are low-T, everything class 0); v2 queue-scale T bins (run 138: the
+    // T hint is RR-QUANTIZED since trRR went live - killed walks store
+    // exactly 0, survivors >= ~theta = 0.05, so class 1 read EXACTLY 0 and
+    // 89% piled into class 0; a T hint cannot rank work inside the thick
+    // mass at all).
+    // Edges bracket the measured distribution (avg path 8, warp-max 29):
+    // 0 = no path here last frame (fresh pixel - bin with the short class,
+    // most such pixels are silhouette flicker), 1..3 short, 4..9 the mass,
+    // 10..19 long, 20+ the warp-killers.
+    const float bHint = gReservoirPrev[pixel.y * gFrameDim.x + pixel.x]._pad1;
+    if (bHint < 4.f) c = 0;
+    else if (bHint < 10.f) c = 1;
+    else if (bHint < 20.f) c = 2;
     else c = 3;
 #endif
     // Temporal off: every entry lands in class 0 and the sort is a stable
