@@ -87,6 +87,7 @@ const char kUseRadCache[] = "useRadCache";
 const char kRadCacheRes[] = "radCacheRes";
 const char kRadCutBounce[] = "radCutBounce";
 const char kRadResidualSurvival[] = "radResidualSurvival";
+const char kRadWarpRRLanes[] = "radWarpRRLanes";
 const char kRadTrainEvery[] = "radTrainEvery";
 const char kRadEma[] = "radEma";
 const char kTauCacheRes[] = "tauCacheRes";
@@ -193,6 +194,8 @@ void VolumePathTracer::parseProperties(const Properties& props)
             mRadCutBounce = value;
         else if (key == kRadResidualSurvival)
             mRadResidualSurvival = std::clamp((float)value, 0.01f, 1.f);
+        else if (key == kRadWarpRRLanes)
+            mRadWarpRRLanes = std::clamp((uint32_t)value, 0u, 32u);
         else if (key == kRadTrainEvery)
             mRadTrainEvery = std::max(1u, (uint32_t)value);
         else if (key == kRadEma)
@@ -252,6 +255,7 @@ Properties VolumePathTracer::getProperties() const
     props[kRadCacheRes] = mRadCacheRes;
     props[kRadCutBounce] = mRadCutBounce;
     props[kRadResidualSurvival] = mRadResidualSurvival;
+    props[kRadWarpRRLanes] = mRadWarpRRLanes;
     props[kRadTrainEvery] = mRadTrainEvery;
     props[kRadEma] = mRadEma;
     props[kTauCacheRes] = mTauCacheRes;
@@ -1435,6 +1439,7 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
                 rcb["gRadCutBounce"] = mRadCutBounce;
                 rcb["gRadCellSize"] = mRadCellSize;
                 rcb["gRadResidualSurvival"] = mRadResidualSurvival;
+                rcb["gRadWarpRRLanes"] = mRadWarpRRLanes;
                 rcb["gRadInvExtent"] = mRadInvExtent;
                 rcb["gRadTrainEvery"] = mRadTrainEvery;
                 rcb["gRadDim"] = mRadDim;
@@ -1628,6 +1633,7 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
                 rcb["gRadCutBounce"] = mRadCutBounce;
                 rcb["gRadCellSize"] = mRadCellSize;
                 rcb["gRadResidualSurvival"] = mRadResidualSurvival;
+                rcb["gRadWarpRRLanes"] = mRadWarpRRLanes;
                 rcb["gRadInvExtent"] = mRadInvExtent;
                 rcb["gRadTrainEvery"] = mRadTrainEvery;
                 rcb["gRadDim"] = mRadDim;
@@ -1739,8 +1745,8 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
                 const double swOcc = s[45] > 0 ? double(s[44]) / (double(s[45]) * 32.0) : 0.0;
                 logInfo(
                     "[SHADEOCC] frame {} | bounces occ {:.3f} laneSum {} warpMaxSum {} "
-                    "| march work occ {:.3f} laneSum {} warpMaxSum {}",
-                    mFrameCount, sbOcc, s[42], s[43], swOcc, s[44], s[45]
+                    "| march work occ {:.3f} laneSum {} warpMaxSum {} | warpRRkills {}",
+                    mFrameCount, sbOcc, s[42], s[43], swOcc, s[44], s[45], s[72]
                 );
 
                 // Escape-walk E-bias probe (v4), binned by the DETERMINISTIC
@@ -2116,6 +2122,16 @@ void VolumePathTracer::renderUI(Gui::Widgets& widget)
                 group.var("Cut bounce (0=off, live)", mRadCutBounce, 0u, 16u);
                 group.tooltip("Bounce index where the CV applies. 0 = runtime off switch\nfor same-session A/B - no recompile.", true);
                 group.var("Residual survival p", mRadResidualSurvival, 0.01f, 1.f);
+                group.var("Warp-RR lanes (0=off)", mRadWarpRRLanes, 0u, 32u);
+                group.tooltip(
+                    "Lever 1 (2026-07-20): when fewer than this many lanes of a\n"
+                    "shadeMain wave are alive, residual paths roulette per bounce\n"
+                    "with p = alive/lanes (1/p compensated - unbiased). Attacks\n"
+                    "the 0.229 bounce occupancy: warps idling behind their longest\n"
+                    "paths, which after the cut carry only mean-zero residual.\n"
+                    "ESTIMATOR CHANGE - gate via the matrix sweep before adopting.",
+                    true
+                );
                 group.tooltip("Survival probability past the cut. 1.0 = CV bookkeeping only\n(pure variance reduction, no cost win). Lower = shorter paths,\nmore residual variance. The matrix prices it.", true);
                 group.var("Train 1-in-N", mRadTrainEvery, 1u, 64u);
                 group.tooltip("Training pixels run FULL paths (deposit, never consume), so the\ncache never learns from itself.", true);

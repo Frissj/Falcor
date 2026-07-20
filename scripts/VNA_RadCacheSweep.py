@@ -106,6 +106,11 @@ CONFIGS = [
     ("t_rr7",  dict(SHIP, useRadCache=False, trRRThreshold=0.05, trRRMode=7, radResidualSurvival=1.0), (256, 1024)),
     ("t_p100", dict(SHIP, useRadCache=True,  trRRThreshold=0.05, trRRMode=7, radResidualSurvival=1.0), (256, 1024)),
     ("t_p25",  dict(SHIP, useRadCache=True,  trRRThreshold=0.05, trRRMode=7, radResidualSurvival=0.25), (256, 1024)),
+    # Lever-1 gate row (2026-07-20 night): warp-aware residual roulette at 8
+    # lanes on top of the adopted t_p25 config. Estimator change - must PASS
+    # (gate AND noise floor, shared-mask scorer) before radWarpRRLanes goes
+    # nonzero in WdasSkyVNA.py. Judge vs t_p25 at the same windows.
+    ("t_wrr8", dict(SHIP, useRadCache=True,  trRRThreshold=0.05, trRRMode=7, radResidualSurvival=0.25, radWarpRRLanes=8), (256, 1024)),
     ("ntb",    dict(SHIP, useTemporalReuse=False, useRadCache=False, trRRThreshold=0.0,  trRRMode=0, radResidualSurvival=1.0), (256,)),
     # Site split (sweep 3): ntr (bit0+... old combined) FAILed -0.45% while a
     # 20M-sample simulation of the identical scheme reads -0.08% - the algebra

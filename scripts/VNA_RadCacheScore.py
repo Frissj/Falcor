@@ -127,9 +127,12 @@ print(f"gate +-{GATE}% (relative to same-window internal baseline, shared mask)"
 print()
 print(f"{'config':<9}{'rel% @256':>11}{'rel% @1024':>12}   verdict heuristic")
 print("-" * 70)
-for n in ["t_rr7", "t_p100", "t_p25"]:
-    r256 = cloudy_rel(n, "t_base", 256)
-    r1024 = cloudy_rel(n, "t_base", 1024)
+for n, base in [("t_rr7", "t_base"), ("t_p100", "t_base"), ("t_p25", "t_base"),
+                # Lever-1 warp-RR: judged against its own baseline (t_p25),
+                # so the delta is the roulette alone, not the whole CV stack.
+                ("t_wrr8", "t_p25")]:
+    r256 = cloudy_rel(n, base, 256)
+    r1024 = cloudy_rel(n, base, 1024)
     row = f"{n:<9}"
     row += f"{r256:>+11.4f}" if r256 is not None else f"{'-':>11}"
     row += f"{r1024:>+12.4f}" if r1024 is not None else f"{'-':>12}"

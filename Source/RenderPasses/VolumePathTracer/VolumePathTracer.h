@@ -281,6 +281,7 @@ private:
     uint32_t mRadCacheRes = 64;         ///< Cells along the longest axis.
     uint32_t mRadCutBounce = 3;         ///< Bounce index of the cut (0 disables at runtime).
     float mRadResidualSurvival = 0.25f; ///< p: residual survival at the cut.
+    uint32_t mRadWarpRRLanes = 0; ///< Lever-1 warp-aware residual roulette threshold (0 = off; gate before adopting).
     uint32_t mRadTrainEvery = 8;        ///< 1-in-N pixels train (deposit, never consume).
     float mRadEma = 0.10f;              ///< Per-frame resolve blend.
     ref<ComputePass> mpPassRadResolve;  ///< radResolveMain.
@@ -369,7 +370,7 @@ private:
     // 42..45 = shadeMain divergence (bounce sum/max, marching-work sum/max),
     // 46..53 = [TRRPROBE] escape-walk E[T] with/without RR, 4 Tref bins x
     //          (RR sum, ref sum), x4096 fixed point.
-    static const uint32_t kRisStatSlots = 72; ///< 54..65 = [TRRPROBE2] coin telemetry (4 det-key bins x count/sumBefore/survives); 66..70 = [TRRPROBE2-CHK] self-checks + negative-Tr counts; 71 = brick-prefetch promotes.
+    static const uint32_t kRisStatSlots = 73; ///< 54..65 = [TRRPROBE2] coin telemetry (4 det-key bins x count/sumBefore/survives); 66..70 = [TRRPROBE2-CHK] self-checks + negative-Tr counts; 71 = brick-prefetch promotes; 72 = warp-RR kills.
     ref<Buffer> mpRisStats;         ///< Device-local counters (atomics).
     ref<Buffer> mpRisStatsReadback; ///< CPU-visible copy.
     bool mLogRisStats = false;      ///< Log the histogram while RIS is on.

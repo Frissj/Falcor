@@ -132,6 +132,10 @@ def render_graph_VNA():
         'radCacheRes': 64,
         'radCutBounce': 3,
         'radResidualSurvival': 0.25,
+        # Lever-1 warp-aware residual roulette: BUILT, GATE PENDING (t_wrr8
+        # row in VNA_RadCacheSweep.py, judged vs t_p25 under the shared-mask
+        # scorer). Raise to 8 only on a PASS - estimator change discipline.
+        'radWarpRRLanes': 0,
         'radTrainEvery': 8,
         'radEma': 0.10,
         # Section 4: HW-BVH brick TLAS (UE HeterogeneousVolumes port) with

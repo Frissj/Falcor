@@ -326,6 +326,17 @@ cbuffer RadCB
     uint   gRadTrainEvery;      ///< 1-in-N pixels are training paths.
     uint3  gRadDim;             ///< Grid resolution.
     float  gRadEma;             ///< Resolve blend factor per frame.
+    /// Lever-1 warp-aware residual roulette: when fewer than this many lanes
+    /// of a shadeMain wave are still alive, RESIDUAL paths (post-cut, cache
+    /// consumed) roulette per bounce with survival p = alive/lanes and 1/p
+    /// compensation. The warp critical path (0.229 bounce occupancy = warps
+    /// idling behind their longest path) shortens exactly where the surviving
+    /// work matters least: a residual path's expected remaining contribution
+    /// is mean-zero-priced by the CV. Unbiased for any p measurable at coin
+    /// time (same argument as adaptive M); p depending on OTHER lanes is
+    /// fine - it is independent of this path's future randomness.
+    /// 0 = off. ESTIMATOR CHANGE: gate via the matrix sweep before adopting.
+    uint   gRadWarpRRLanes;
 }
 RWStructuredBuffer<uint> gRadAccum;   ///< 4 uints/cell: fixed-point RGB sums + sample count.
 Texture3D<float4> gRadTex;            ///< Resolved cache (rgb = L_in estimate, a = confidence).
@@ -1647,6 +1658,7 @@ void shadeMain(uint3 dispatchThreadId: SV_DispatchThreadID)
     // the cache's mean there and continue only to estimate the residual.
     const bool radTraining = gRadCutBounce != 0u && radIsTraining(pixel);
     bool radHasCut = false;
+    bool radIsResidual = false; ///< Path consumed the cache at the cut; its remaining bounces estimate the mean-zero residual.
     float3 radCutPos = float3(0.f);
     float3 radCutThp = float3(0.f);
     float3 radCutRad = float3(0.f);
@@ -1658,6 +1670,33 @@ void shadeMain(uint3 dispatchThreadId: SV_DispatchThreadID)
     // owns the primary escape term).
     while (traceLoop)
     {
+#if USE_RAD_CACHE
+        // Lever-1 warp-aware residual roulette (see gRadWarpRRLanes). Placed
+        // at the loop HEAD so a killed path skips this bounce's distance walk
+        // entirely - the walk is the cost being saved. Only RESIDUAL paths are
+        // eligible: their remaining contribution is (S - C), mean zero, so the
+        // variance price of killing them is the smallest in the kernel, and
+        // the CV already priced the survival algebra. alive counts every live
+        // lane (residual or not) - it IS the warp occupancy the [SHADEOCC]
+        // 0.229 measured; when it drops below the knob, this warp is mostly
+        // waiting on stragglers and each surviving straggler delays 32 slots.
+        if (radIsResidual && gRadWarpRRLanes != 0u)
+        {
+            const uint alive = WaveActiveCountBits(true);
+            if (alive < gRadWarpRRLanes)
+            {
+                const float p = float(alive) / float(gRadWarpRRLanes);
+                if (sampleNext1D(sg) >= p)
+                {
+#if USE_WORK_STATS
+                    InterlockedAdd(gRisStats[72], 1u); // Per-lane, wave-free (runs 127/128 lesson).
+#endif
+                    break;
+                }
+                throughput /= p;
+            }
+        }
+#endif
         VolumeInstanceSampler::DistanceSample ds;
         const bool scattered = volumeSampler.sampleDistance(ray, sg, ds);
 
@@ -1704,6 +1743,7 @@ void shadeMain(uint3 dispatchThreadId: SV_DispatchThreadID)
                         break;
                     throughput /= gRadResidualSurvival;
                     radiance -= throughput * C.rgb;
+                    radIsResidual = true; // Eligible for the warp-aware roulette above from the next bounce on.
                 }
             }
         }
