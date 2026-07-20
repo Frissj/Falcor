@@ -111,8 +111,23 @@ def render_graph_VNA():
         # FAILED the gate on raw paths (it deleted real energy) is safe here -
         # the deleted term has mean ~0. Unbiased for any cache content. All
         # knobs are CB values: radCutBounce 0 is the live OFF switch for
-        # same-session A/B. MUST pass the matrix gate before being called
-        # adopted; this flag turns it on for measurement.
+        # same-session A/B. GATE PASSED (2026-07-20 night, rescored matrix
+        # under the fixed shared-mask scorer): t_p100 +0.04%, t_p25 +0.11%
+        # @1024 - both inside the 0.15% gate. ADOPTED at p 0.25; walking p
+        # lower is the next free frame time (every PASS step is a win).
+        # Tracker RR: RE-ENABLED (2026-07-20 night). The "conviction" was two
+        # measurement bugs, not estimator bias: (1) the probe's wave-op flush
+        # miscompiled (per-lane atomics now; walk E-bias reads ~0 in every
+        # det-key bin with 193k coins/frame firing), (2) the scorer masked by
+        # the base realization's own luma percentile - selection bias that
+        # manufactured every FAIL (ntrE_s1: -0.42% "FAIL" -> +0.01% under an
+        # independent shared mask). Rescored matrix: ALL rows PASS (ntrE
+        # -0.03%, seed pairs +-0.05%, noise floor 0.15%). Mode 31 = all sites
+        # + bit4 (coin from a counter-based hash, sg untouched - unbiased for
+        # ANY generator quality, and the survivor's continuation replays the
+        # exact draws a no-RR walk would consume).
+        'trRRThreshold': 0.05,
+        'trRRMode': 31,
         'useRadCache': True,
         'radCacheRes': 64,
         'radCutBounce': 3,

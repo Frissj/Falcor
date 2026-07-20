@@ -18,6 +18,8 @@ import Scene.Scene;
 import Utils.Math.Ray;
 import Utils.Math.MathHelpers;
 import Utils.Sampling.SampleGenerator;
+import Utils.Sampling.TinyUniformSampleGenerator;
+import Utils.Math.HashUtils;
 import Rendering.Lights.EnvMapSampler;
 import Rendering.Volumes.PhaseFunction;
 // Imported directly (imports are not transitive) for the gGvsStat* per-thread
@@ -740,7 +742,141 @@ void main(uint3 dispatchThreadId: SV_DispatchThreadID)
         // distance from the vertex, not the camera, and would misuse it.
 #if !USE_FUSED_SWEEP
         volumeSampler.footprintSpread = gFootprintSpread;
+        // Escape call site: RR here is governed by mode bit3, not bit0 - the
+        // escape value couples into adaptive M and the RIS stream, so the
+        // bias investigation gates it separately from the NEE walk.
+        visSetTrRRSite(8u);
+#if USE_WORK_STATS
+        // [TRRPROBE2] Fresh coin telemetry for exactly this walk; later walks
+        // in the frame may also fire coins but are never flushed.
+        visResetTrRRCoinStats();
+#endif
         const float Tfull = volumeSampler.evalTransmittance(ray, sg);
+        visSetTrRRSite(1u);
+#if USE_WORK_STATS
+        // [TRRPROBE2] Snapshot the armed walk's telemetry IMMEDIATELY, before
+        // any other code can touch the statics. Run 127 logged surv > coins -
+        // impossible per the increment logic - so the flush now uses these
+        // locals, and the check slots below test the invariants directly
+        // instead of trusting the pipeline.
+        const uint probeCoins = visTrRRCoinCount();
+        const uint probeSurv = visTrRRCoinSurvives();
+        const float probeBefore = visTrRRCoinSumBefore();
+        const uint probeNegFull = visTrRRNegTr();
+#endif
+
+#if USE_WORK_STATS
+        // [TRRPROBE] Direct walk-level bias measurement (slots 46..53). The
+        // sweep bisection pinned the -0.73% on this call site but could not
+        // separate "the walk's E[T] moves under RR" from "a downstream
+        // consumer couples nonlinearly" - and simulation cannot resolve it
+        // (the product estimator is too heavy-tailed for sample means).
+        // So: run the SAME walk again with RR hard-disabled (site mask 0) on
+        // a decorrelated RNG, and accumulate both estimates. The ratio of the
+        // two frame sums is E-bias of the walk itself, paired per pixel,
+        // with no RIS, adaptive M, or image pipeline in the loop.
+        if (gTrRRThreshold > 0.f && (gTrRRMode & 8u) != 0u)
+        {
+            // PROBE V3 (kept): the reference walk must use the SAME generator
+            // family as the real walk. V2 used TinyUniform (LCG) and bin3 -
+            // where T > 0.5 and RR cannot fire, so any difference is NOT RR -
+            // read a consistent -0.44%. Same family, decorrelated seed
+            // constant.
+            SampleGenerator psg = SampleGenerator(pixel, gFrameCount + 0x51ed270bu);
+            // Canary: the statics were snapshotted above, so reset them and
+            // let the reference walk run - it uses site mask 0, so its coin
+            // count after the walk must be IDENTICALLY zero. A nonzero slot 67
+            // means the mask gating is broken and every probe reading with it.
+            visResetTrRRCoinStats();
+            visSetTrRRSite(0u); // mask 0: RR cannot fire regardless of mode.
+            const float Tref = volumeSampler.evalTransmittance(ray, psg);
+            visSetTrRRSite(1u);
+            const uint refCoins = visTrRRCoinCount();
+            const uint refNeg = visTrRRNegTr();
+            // PROBE V4: bin by a DETERMINISTIC key, never by either walk's own
+            // outcome. V2/V3 binned by Tref, which is a random variable: a
+            // straddler pixel enters the thick bin exactly on the realizations
+            // where its ref walk read HIGH, so E[Tref | bin] is inflated by
+            // selection while the RR side is unconditioned - every v2/v3 bin
+            // reading (including bin3's "impossible" -0.38%) is invalid by
+            // construction. The key here is exp(-coarseOpticalDepth(view ray)):
+            // analytic mean-field DDA, zero RNG, identical for both walks and
+            // across frames, so bin membership is a fixed pixel property and
+            // both estimators are unconditioned within every bin.
+            // NOTE Tdet is only a proxy for E[T] (Jensen: true E[T] >=
+            // exp(-mean tau) in heterogeneous media) - fine, the key only
+            // needs to be deterministic and thickness-monotone, not exact.
+            // COST: one extra coarse DDA walk in probe-armed rows only; it
+            // also bumps gvs cell counters, so [LOOPOCC]/cost buckets in
+            // probe-armed rows are not representative (gpuMs already wasn't).
+            const float Tdet = exp(-volumeSampler.coarseOpticalDepth(ray));
+            // Bins by Tdet: [0,0.01) [0.01,0.1) [0.1,0.5) [0.5,inf).
+            // Fixed-point scales are 16x more conservative than v3's: the
+            // walked T inside a bin is no longer range-bounded by the bin
+            // edges (straddlers + Jensen), so each scale is sized so overflow
+            // would need an absurd average T for that bin's key range
+            // (e.g. bin0 wraps only if 3.5M px keyed Tdet<0.01 average
+            // T>0.3). Ratios are computed within a bin, so scale cancels.
+            // fx are MULTIPLES OF 20 (not powers of two) so threshold-valued
+            // outputs land on exact integers: the RR walk's survivors carry
+            // atoms at exactly theta = 0.05, and uint(0.05*2048 + 0.5) = 102
+            // vs true 102.4 would inject a systematic -0.4% on the RR side
+            // under the per-lane flush below. theta*fx = 200/100/25/13 exact.
+            uint bin;
+            float fx;
+            if (Tdet < 0.01f) { bin = 0; fx = 4000.f; }
+            else if (Tdet < 0.1f) { bin = 1; fx = 2000.f; }
+            else if (Tdet < 0.5f) { bin = 2; fx = 500.f; }
+            else { bin = 3; fx = 260.f; }
+            // [TRRPROBE2] slots 54..65: coin telemetry from the armed walk,
+            // same det-key bins. sumBefore is Tr/threshold per coin (each term
+            // in (0,1)) at x64 fixed point: worst case ~13 coins/walk (one per
+            // brick candidate) x 3.5M px x 64 stays far under 2^32. The
+            // E-preservation check "threshold*survives == sum(TrBefore)" is
+            // scale-free on the CPU side (survives vs sumBefore/64).
+            // Per-lane atomics for the walk sums too - the probe now contains
+            // ZERO wave ops. Run 131's mass accounting (coins touch <=125
+            // T-units of bin1 while 4076 are missing) proves the deficit is
+            // not the RR block, so before chasing deeper the last instance of
+            // the wave pattern that provably miscompiled in runs 127/128 is
+            // removed from the evidence chain. Per-lane rounding at these fx
+            // is ~0.001% on multi-million-unit bin sums (error ~ sqrt(N)*0.3
+            // units) and treats both sides identically; theta-atoms are exact
+            // by the fx choice above.
+            InterlockedAdd(gRisStats[46 + 2 * bin], uint(Tfull * fx + 0.5f));
+            InterlockedAdd(gRisStats[47 + 2 * bin], uint(Tref * fx + 0.5f));
+
+            // [TRRPROBE2] slots 54..65 + [TRRPROBE2-CHK] 66..70, flushed with
+            // PER-LANE atomics, deliberately NO wave ops. Run 128 printed
+            // per-bin surv > coins while the per-lane invariant check read 0
+            // violations - set-theoretically impossible if the wave-summed
+            // flush were faithful, so the WaveActiveSum/WaveIsFirstLane
+            // combination inside the unrolled loop is itself under suspicion
+            // (reconvergence miscompile shape). Coins are sparse (~140k lanes
+            // at 1080p), so per-lane atomics cost nothing measurable here and
+            // have no wave semantics to miscompile. If per-lane readings
+            // restore surv <= coins, the wave path was guilty; sRR/sRef above
+            // stay wave-summed (dense, every lane) and get cross-checked by
+            // the image-level gate instead.
+            //   66 = lanes violating surv <= coins (must be 0),
+            //   67 = reference-walk coins (must be 0; site-mask canary),
+            //   68 = lanes that fired at least one coin (RR exposure),
+            //   69/70 = armed/reference walks whose Tr went negative (a
+            //        residual factor outside [0,2]; such walks die WITHOUT RR
+            //        compensation).
+            if (probeCoins > 0u)
+            {
+                InterlockedAdd(gRisStats[54 + 3 * bin], probeCoins);
+                InterlockedAdd(gRisStats[55 + 3 * bin], uint(probeBefore * 64.f + 0.5f));
+                InterlockedAdd(gRisStats[56 + 3 * bin], probeSurv);
+                InterlockedAdd(gRisStats[68], 1u);
+            }
+            if (probeSurv > probeCoins) InterlockedAdd(gRisStats[66], 1u);
+            if (refCoins > 0u) InterlockedAdd(gRisStats[67], refCoins);
+            if (probeNegFull > 0u) InterlockedAdd(gRisStats[69], probeNegFull);
+            if (refNeg > 0u) InterlockedAdd(gRisStats[70], refNeg);
+        }
+#endif
         volumeSampler.footprintSpread = 0.f;
         primaryT = Tfull;
         radiance += Tfull * primaryBg;

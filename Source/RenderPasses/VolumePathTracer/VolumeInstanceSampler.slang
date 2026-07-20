@@ -21,6 +21,7 @@
 
 import Scene.Scene;
 import Utils.Math.Ray;
+import Utils.Math.HashUtils;
 import Utils.Geometry.IntersectionHelpers;
 import Utils.Sampling.SampleGeneratorInterface;
 import Rendering.Volumes.GridVolumeSampler;
@@ -115,6 +116,77 @@ struct BrickAABB
     float3 maxPos;
 };
 StructuredBuffer<BrickAABB> gBrickAABBs;
+
+/** Weight Russian roulette for the RQ transmittance trackers.
+    [COST] 2026-07-20 (post rad-cache): candGen = 20.9 cells + 8.9 taps/px is
+    the frame's dominant bucket, and in thick pixels much of it estimates a Tr
+    that has already decayed to ~1e-6 - worthless to the image, still paying
+    per-brick tracker taps and (in the fused walk) full traversal. Standard
+    weight RR: below the threshold, survive with p = Tr/threshold and reweight
+    to exactly the threshold (E[new Tr] = Tr, textbook-unbiased). A dead
+    tracker then unlocks structural savings: the NEE walk aborts its traversal
+    outright, and the fused walk adopts the candidates-only path's
+    commit-shrink. 0 disables (live A/B; changes the sample stream, converged
+    image must not move).
+*/
+cbuffer TrRRCB
+{
+    float gTrRRThreshold;
+    /// Isolation bitmask for the gate investigation (2026-07-20): the first
+    /// sweep FAILed all trRR configs, but every config shared the temporal-
+    /// reuse chain AND the fused-walk RR perturbs the chain's own RNG stream,
+    /// so "slow-mixing chain realization shifted" and "RR is biased" are
+    /// indistinguishable there. This mask splits the three mechanisms so a
+    /// temporal-OFF sweep can convict exactly one.
+    /// bit0 = RR in the NEE walk, bit1 = RR in the fused walk,
+    /// bit2 = commit-shrink in the fused walk, bit3 = RR in the NON-FUSED
+    /// escape walk (same function as bit0, different call site - split
+    /// because the escape value couples into adaptive M and the RIS stream
+    /// while NEE is a pure linear factor). 15 = all.
+    /// bit4 = draw the RR coin from a counter-based hash stream INDEPENDENT
+    /// of the walk's sample generator (see the coin site for why: the
+    /// same-stream coin conditions every post-survival draw on u < p, and
+    /// with an LCG-family generator those draws are deterministic functions
+    /// of the conditioned state - probe-measured -42% escape-walk E-bias
+    /// with a per-event-fair coin).
+    uint gTrRRMode;
+    /// Per-frame salt for the bit4 coin stream (CPU sets the frame counter;
+    /// hashed on GPU with ray bits + coin ordinal).
+    uint gTrRRCoinSeed;
+}
+
+/** Which mode bit governs evalTransmittanceRQ's RR at the CURRENT call site.
+    Default 1 (the NEE walk); the escape call site sets 8 around its call.
+    A static, not a parameter: the walk is reached through the generic
+    evalTransmittance dispatch and threading a flag through it would touch
+    every backend for what is a diagnostic split.
+*/
+static uint gTrRRSiteMask = 1u;
+void visSetTrRRSite(uint mask) { gTrRRSiteMask = mask; }
+
+/** [TRRPROBE2] Per-walk coin telemetry for the weight-RR bias hunt (probe v5).
+    Probe v4 (deterministic det-key bins) CONVICTED the escape walk itself:
+    -35%/-23% E-bias in the thick bins under RR, while both the isolated coin
+    algebra and a 20M-sample simulation are clean. So the defect is either
+    (a) the coin as executed in vivo (real Tr distribution, real generator
+    state) or (b) the walk's continuation after a survival (inner per-node RR
+    interaction, FP32). These counters split (a) from (b): per-event
+    unbiasedness requires E[Tr_after] = Tr_before, i.e. over all coins
+    threshold * survives == sum(Tr_before). If that identity holds in the data
+    while the walk stays biased, the coin is acquitted and the continuation is
+    convicted. Reset by the probe before the armed escape walk; flushed to
+    gRisStats 54..65 by the probe's bin loop (the reference walk runs with
+    site mask 0 and can never touch them).
+*/
+static uint gTrRRCoinCount = 0u;
+static uint gTrRRCoinSurvives = 0u;
+static float gTrRRCoinSumBefore = 0.f; ///< Sum of Tr/threshold at coin time, one term per coin.
+static uint gTrRRNegTr = 0u; ///< Walks whose running Tr went NEGATIVE (a residual factor outside [0,2] - jittered density outside the node's stored min/max bound).
+void visResetTrRRCoinStats() { gTrRRCoinCount = 0u; gTrRRCoinSurvives = 0u; gTrRRCoinSumBefore = 0.f; gTrRRNegTr = 0u; }
+uint visTrRRCoinCount() { return gTrRRCoinCount; }
+uint visTrRRCoinSurvives() { return gTrRRCoinSurvives; }
+float visTrRRCoinSumBefore() { return gTrRRCoinSumBefore; }
+uint visTrRRNegTr() { return gTrRRNegTr; }
 #endif // USE_BRICK_TLAS
 
 #if USE_MERGED_TAIL
@@ -1114,6 +1186,67 @@ struct VolumeInstanceSampler
             else
                 Tr *= gvs.evalTransmittanceRatioTrackingLocalDDA(gridVolume, ray.origin, ray.dir, tt, sg);
 
+            // [TRRPROBE2] A residual factor outside [0,2] flips Tr negative
+            // (jittered density lookup escaped the node's stored min/max).
+            // The walk then dies at the <=0 check below WITHOUT RR
+            // compensation - count it, it is a bias suspect in its own right.
+            // Gated on threshold so the shipped config (trRRThreshold 0) pays
+            // nothing; the site mask is NOT checked, so the reference walk
+            // (mask 0) counts its negatives too - the pair is the datum.
+            if (gTrRRThreshold > 0.f && Tr < 0.f) gTrRRNegTr++;
+
+            // Weight RR (see TrRRCB). Nothing but Tr rides this traversal, so
+            // a dead tracker ends the whole walk - the classic shadow-ray
+            // early-out that ratio tracking alone never reaches (it decays to
+            // 1e-6 but never to exactly 0).
+            if ((gTrRRMode & gTrRRSiteMask) != 0u && gTrRRThreshold > 0.f && Tr > 0.f && Tr < gTrRRThreshold)
+            {
+                // [TRRPROBE2] Coin telemetry (see the statics' comment). Three
+                // adds inside a block that only executes with RR armed, so the
+                // shipped config (trRRThreshold 0) pays nothing.
+                gTrRRCoinCount++;
+                gTrRRCoinSumBefore += Tr / gTrRRThreshold;
+
+                // THE COIN. Probe chain (runs 126..129, 2026-07-20): walk-level
+                // E-bias -42% in the Tdet 0.01-0.1 bin under RR, while the coin
+                // itself is per-event FAIR (theta*survives == sum(TrBefore) to
+                // +-1%) and no walk ever goes negative. So the expectation is
+                // lost strictly AFTER a survived coin - and the only thing a
+                // survival changes about the continuation is the RNG stream:
+                // drawing the coin from sg conditions the generator STATE on
+                // u < p, and for an LCG-family generator every subsequent
+                // "uniform" draw is a deterministic function of that state.
+                // Mode bit4 severs the dependency: the coin comes from a
+                // counter-based hash (frame salt + ray bits + coin ordinal),
+                // sg is NOT advanced, so conditional on survival the
+                // continuation consumes exactly the draws it would have
+                // consumed without RR - unbiased by construction for ANY
+                // generator quality.
+                float u;
+                if ((gTrRRMode & 16u) != 0u)
+                {
+                    uint h = gTrRRCoinSeed ^ (gTrRRCoinCount * 0x9e3779b9u);
+                    h = jenkinsHash(h ^ asuint(ray.origin.x));
+                    h = jenkinsHash(h ^ asuint(ray.origin.y));
+                    h = jenkinsHash(h ^ asuint(ray.origin.z));
+                    h = jenkinsHash(h ^ asuint(ray.dir.x));
+                    h = jenkinsHash(h ^ asuint(ray.dir.y));
+                    h = jenkinsHash(h ^ asuint(ray.dir.z));
+                    u = (h >> 8) * 0x1p-24f;
+                }
+                else
+                {
+                    u = sampleNext1D(sg);
+                }
+                if (u * gTrRRThreshold < Tr)
+                {
+                    Tr = gTrRRThreshold;
+                    gTrRRCoinSurvives++;
+                }
+                else
+                    Tr = 0.f;
+            }
+
             if (Tr <= 0.f) return 0.f;
         }
         return Tr;
@@ -1331,6 +1464,18 @@ struct VolumeInstanceSampler
                     Tr *= gvs.evalTransmittanceRatioTrackingLocalDDA(gridVolume, ray.origin, ray.dir, tt, sg);
             }
 
+            // Weight RR on the escape tracker (see TrRRCB): below the
+            // threshold, survive with p = Tr/threshold reweighted to exactly
+            // the threshold. Kills the tracker in thick pixels while its
+            // expectation is preserved.
+            if ((gTrRRMode & 2u) != 0u && gTrRRThreshold > 0.f && Tr > 0.f && Tr < gTrRRThreshold)
+            {
+                if (sampleNext1D(sg) * gTrRRThreshold < Tr)
+                    Tr = gTrRRThreshold;
+                else
+                    Tr = 0.f;
+            }
+
             // Candidates: identical per-brick min construction to
             // sampleCandidatesRQ, clamped per process instead of committed.
             for (uint j = 0; j < nProc; ++j)
@@ -1343,6 +1488,21 @@ struct VolumeInstanceSampler
                     bestT[j] = gds.t;
                     bestInst[j] = info.gridVolumeIdx;
                 }
+            }
+
+            // Dead tracker => the traversal now serves ONLY the candidate
+            // processes, so the fused walk can adopt the shrink the
+            // candidates-only path always had: commit the farthest process
+            // bound and let the BVH prune every brick beyond it. The old
+            // comment was right that this was impossible - but only while the
+            // escape term needed the full ray.
+            if ((gTrRRMode & 4u) != 0u && Tr <= 0.f)
+            {
+                float allBest = 0.f;
+                for (uint j = 0; j < nProc; ++j)
+                    allBest = max(allBest, bestT[j]);
+                if (allBest < FLT_MAX)
+                    q.CommitProceduralPrimitiveHit(allBest);
             }
         }
 

@@ -79,6 +79,9 @@ const char kUseCompaction[] = "useCompaction";
 const char kUseWavefront[] = "useWavefront";
 const char kWavefrontRounds[] = "wavefrontRounds";
 const char kUseTauCache[] = "useTauCache";
+const char kTrRRThreshold[] = "trRRThreshold";
+const char kTrRRMode[] = "trRRMode";
+const char kSeedOffset[] = "seedOffset";
 const char kUseRadCache[] = "useRadCache";
 const char kRadCacheRes[] = "radCacheRes";
 const char kRadCutBounce[] = "radCutBounce";
@@ -171,6 +174,14 @@ void VolumePathTracer::parseProperties(const Properties& props)
             mWavefrontRounds = value;
         else if (key == kUseTauCache)
             mUseTauCache = value;
+        else if (key == kTrRRThreshold)
+            mTrRRThreshold = std::clamp((float)value, 0.f, 0.5f);
+        else if (key == kTrRRMode)
+            // 31 not 15: bit4 = decorrelated RR coin (run 130 lesson - this
+            // clamp silently ate mode 24 and made the bit4 A/B a no-op).
+            mTrRRMode = std::clamp((uint32_t)value, 0u, 31u);
+        else if (key == kSeedOffset)
+            mSeedOffset = value;
         else if (key == kUseRadCache)
             mUseRadCache = value;
         else if (key == kRadCacheRes)
@@ -230,6 +241,9 @@ Properties VolumePathTracer::getProperties() const
     props[kUseWavefront] = mUseWavefront;
     props[kWavefrontRounds] = mWavefrontRounds;
     props[kUseTauCache] = mUseTauCache;
+    props[kTrRRThreshold] = mTrRRThreshold;
+    props[kTrRRMode] = mTrRRMode;
+    props[kSeedOffset] = mSeedOffset;
     props[kUseRadCache] = mUseRadCache;
     props[kRadCacheRes] = mRadCacheRes;
     props[kRadCutBounce] = mRadCutBounce;
@@ -1339,7 +1353,7 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
     // reference different subsets and reflection strips the rest.
     auto bindFrame = [&](const ShaderVar& var)
     {
-        var["CB"]["gFrameCount"] = mFrameCount;
+        var["CB"]["gFrameCount"] = mFrameCount + mSeedOffset;
         var["CB"]["gFrameDim"] = targetDim;
         var["CB"]["gFootprintSpread"] = footprintSpread;
         var["CB"]["gOccSkipEnable"] = mUseOccupancySkip ? 1u : 0u;
@@ -1351,6 +1365,15 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
         var["CB"]["gRisTargetFloor"] = mRisTargetFloor;
         var["CB"]["gRouletteMinQ"] = mRouletteMinQ;
         var["CB"]["gRouletteStartBounce"] = mRouletteStartBounce;
+
+        if (auto trcb = var.findMember("TrRRCB"); trcb.isValid())
+        {
+            trcb["gTrRRThreshold"] = mTrRRThreshold;
+            trcb["gTrRRMode"] = mTrRRMode;
+            // Per-frame salt for the bit4 decorrelated coin stream (hashed on
+            // GPU with ray bits + coin ordinal, so the raw counter is enough).
+            trcb["gTrRRCoinSeed"] = mFrameCount;
+        }
 
         if (mUseBrickTlas && mBrickBlasesValid && mpBrickTlas)
         {
@@ -1715,6 +1738,56 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
                     mFrameCount, sbOcc, s[42], s[43], swOcc, s[44], s[45]
                 );
 
+                // Escape-walk E-bias probe (v4), binned by the DETERMINISTIC
+                // key exp(-coarseOpticalDepth) - never by either walk's own
+                // realization, which selection-biases the bins (v2/v3 defect).
+                // The thick bins are where RR fires; v1's global sum hid them
+                // under the sky's T~1 mass. Active only while trRRThreshold > 0
+                // and mode bit3 is set.
+                if (s[47] + s[49] + s[51] + s[53] > 0)
+                {
+                    auto bias = [&](int b) {
+                        return s[47 + 2 * b] > 0 ? (double(s[46 + 2 * b]) / double(s[47 + 2 * b]) - 1.0) * 100.0 : 0.0;
+                    };
+                    logInfo(
+                        "[TRRPROBE] frame {} | E-bias by det-key bin (Tdet=exp(-coarseTau)): Tdet<0.01 {:+.3f}% (ref {}) | 0.01-0.1 {:+.3f}% (ref {}) "
+                        "| 0.1-0.5 {:+.3f}% (ref {}) | Tdet>0.5 {:+.3f}% (ref {})",
+                        mFrameCount, bias(0), s[47], bias(1), s[49], bias(2), s[51], bias(3), s[53]
+                    );
+                }
+
+                // [TRRPROBE2] Coin-level E-preservation, same det-key bins.
+                // Per-event unbiasedness demands threshold*survives ==
+                // sum(TrBefore), i.e. survives == sumBefore/64 in slot units.
+                // coinBias ~ 0 while the walk bin reads -35% acquits the coin
+                // and convicts the post-survival continuation (inner per-node
+                // RR at GridVolumeSampler.slang:658 interaction, FP32);
+                // coinBias matching the walk bias convicts the coin itself.
+                if (s[54] + s[57] + s[60] + s[63] > 0)
+                {
+                    auto coinBias = [&](int b) {
+                        const double before = double(s[55 + 3 * b]) / 64.0;
+                        return before > 0 ? (double(s[56 + 3 * b]) / before - 1.0) * 100.0 : 0.0;
+                    };
+                    logInfo(
+                        "[TRRPROBE2] frame {} | coin E-bias by det-key bin: Tdet<0.01 {:+.3f}% (coins {} surv {}) | 0.01-0.1 {:+.3f}% (coins {} surv {}) "
+                        "| 0.1-0.5 {:+.3f}% (coins {} surv {}) | Tdet>0.5 {:+.3f}% (coins {} surv {})",
+                        mFrameCount,
+                        coinBias(0), s[54], s[56], coinBias(1), s[57], s[59],
+                        coinBias(2), s[60], s[62], coinBias(3), s[63], s[65]
+                    );
+                    // Self-checks: survGtCoins and refCoins MUST be 0 - any
+                    // nonzero invalidates every [TRRPROBE2] reading above.
+                    // coinLanes is the RR exposure (tail-gated walks never
+                    // reach the RR site: run 127 showed the 1080p-vs-maximized
+                    // resolution change moved most thick pixels onto the tail
+                    // path and the walk bias "vanished" for lack of exposure).
+                    logInfo(
+                        "[TRRPROBE2-CHK] frame {} | survGtCoins {} (must 0) | refCoins {} (must 0) | coinLanes {} | negTr armed {} ref {}",
+                        mFrameCount, s[66], s[67], s[68], s[69], s[70]
+                    );
+                }
+
                 // One line per sweep step, greppable as a table. warpMaxSum is
                 // the number the sweep exists to move (the warp critical path);
                 // occ is the derived utilisation; gpuMs is same-session here so
@@ -1904,6 +1977,14 @@ void VolumePathTracer::renderUI(Gui::Widgets& widget)
                     group.tooltip("Gaussian sigma of the neighbor offsets. ~16 px matches the\nclassic 30 px uniform disk (ReSTIR PT Enhanced, Fig. 7).", true);
                 }
             }
+            group.var("Tracker RR threshold (0=off)", mTrRRThreshold, 0.f, 0.5f);
+            group.tooltip(
+                "Weight RR on the RQ transmittance trackers: below this, survive\n"
+                "w.p. Tr/threshold reweighted to the threshold (unbiased). Dead\n"
+                "tracker => NEE walk ends, fused walk commit-shrinks to the\n"
+                "farthest candidate. Live CB value - A/B in one session.",
+                true
+            );
             group.var("Target floor (x isotropic)", mRisTargetFloor, 0.f, 1.f);
             group.var("Roulette min q", mRouletteMinQ, 0.f, 1.f);
             group.tooltip(

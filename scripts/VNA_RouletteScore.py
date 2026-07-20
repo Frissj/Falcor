@@ -52,7 +52,11 @@ ref_mean = ref_lum[mask].mean()
 ref1_path = newest("01_ref_vp1_1spp.*.exr")
 ref1 = load(ref1_path) if ref1_path else None
 
-names = sorted({os.path.basename(p).split("_vp1_")[0] for p in glob.glob(os.path.join(DIR, "rq*_vp1_*.exr"))})
+# rq* = roulette sweeps, rc* = rad-cache/tracker-RR sweeps (VNA_RadCacheSweep.py).
+names = sorted(
+    {os.path.basename(p).split("_vp1_")[0] for p in glob.glob(os.path.join(DIR, "rq*_vp1_*.exr"))} |
+    {os.path.basename(p).split("_vp1_")[0] for p in glob.glob(os.path.join(DIR, "rc*_vp1_*.exr"))}
+)
 
 print(f"reference: {os.path.basename(ref_path)}   cloudyMean {ref_mean:.4f}   gate +-{GATE}%")
 print()

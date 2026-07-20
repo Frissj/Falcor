@@ -252,6 +252,25 @@ private:
     /// tolerates the aggressive kill rates the matrix gate rejected on raw
     /// paths. UNBIASED for any cache content - staleness and coarseness cost
     /// residual variance only. shadeMain (fused) backend only.
+    /// Weight RR threshold for the RQ transmittance trackers (TrRRCB in the
+    /// sampler). Below it, survive w.p. Tr/threshold reweighted to the
+    /// threshold - textbook-unbiased. Kills thick-pixel tracker work and
+    /// unlocks the fused walk's commit-shrink + the NEE walk's early-out.
+    /// 0 = off (live A/B; CB value, no recompile).
+    float mTrRRThreshold = 0.05f;
+    /// RNG epoch offset, added to gFrameCount at bind time. Exists for the
+    /// gate methodology: comparing configs whose RNG streams fully decorrelate
+    /// (like RR coins mid-walk) measures realization variance unless the same
+    /// comparison is repeated across seeds. 0 = canonical.
+    uint32_t mSeedOffset = 0;
+    /// Isolation bitmask (bit0 NEE-walk RR, bit1 fused-walk RR, bit2 shrink,
+    /// bit3 non-fused escape-walk RR); 15 = all. The de-confounding matrix
+    /// (2026-07-20) convicted the combined temporal-off config at -0.45%
+    /// while a 20M-sample simulation of the identical scheme reads -0.08%,
+    /// so a call-site coupling, not the RR algebra, is at fault; bits 0 vs 3
+    /// exist to name it. trRRThreshold is 0 in the shipping script until
+    /// this is resolved.
+    uint32_t mTrRRMode = 15;
     bool mUseRadCache = false;
     uint32_t mRadCacheRes = 64;         ///< Cells along the longest axis.
     uint32_t mRadCutBounce = 3;         ///< Bounce index of the cut (0 disables at runtime).
@@ -341,8 +360,10 @@ private:
     // 31..35 = divergence probe (laneWork sum, waveMax sum, warps, idle lanes, active lanes),
     // 36..37 = fully idle warps, busy lanes within marching warps,
     // 38..41 = per-loop SIMD occupancy (RQ traversal sum/max, coarse-DDA sum/max),
-    // 42..45 = shadeMain divergence (bounce sum/max, marching-work sum/max).
-    static const uint32_t kRisStatSlots = 46;
+    // 42..45 = shadeMain divergence (bounce sum/max, marching-work sum/max),
+    // 46..53 = [TRRPROBE] escape-walk E[T] with/without RR, 4 Tref bins x
+    //          (RR sum, ref sum), x4096 fixed point.
+    static const uint32_t kRisStatSlots = 71; ///< 54..65 = [TRRPROBE2] coin telemetry (4 det-key bins x count/sumBefore/survives); 66..70 = [TRRPROBE2-CHK] self-checks + negative-Tr counts.
     ref<Buffer> mpRisStats;         ///< Device-local counters (atomics).
     ref<Buffer> mpRisStatsReadback; ///< CPU-visible copy.
     bool mLogRisStats = false;      ///< Log the histogram while RIS is on.

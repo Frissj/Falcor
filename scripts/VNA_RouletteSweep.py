@@ -139,3 +139,5 @@ for name, props in CONFIGS:
 with open(os.path.join(OUT_DIR, "progress.txt"), "a") as f:
     f.write("ROULETTE2 SWEEP COMPLETE\n")
 print("VNA-ROULETTE2: complete.")
+# Unattended batch job: close Mogwai so the run is hands-off end to end.
+exit()
