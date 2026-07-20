@@ -116,6 +116,12 @@ private:
     // [COST] occSkip / gpuMs within ONE session - cross-session gpuMs on this
     // machine drifts ~25% with identical work counters.
     bool mUseOccupancySkip = true;
+    /// Lever-2 (2026-07-20) speculative next-brick prefetch in the DDA walks.
+    /// Runtime A/B like mUseOccupancySkip: flip in-session, compare [COST]
+    /// promote share + gpuMs. Costs ~9 registers of prefetch entry - if the
+    /// disassembly shows the kernel pushed past the 128 target, that is the
+    /// first suspect for any regression.
+    bool mUseBrickPrefetch = true;
     /// Pixels one acceleration-structure cell may span before the next coarser
     /// mip is selected (1 = cell ~ pixel, the Nanite balance point).
     float mMipPixelThreshold = 1.f;
@@ -363,7 +369,7 @@ private:
     // 42..45 = shadeMain divergence (bounce sum/max, marching-work sum/max),
     // 46..53 = [TRRPROBE] escape-walk E[T] with/without RR, 4 Tref bins x
     //          (RR sum, ref sum), x4096 fixed point.
-    static const uint32_t kRisStatSlots = 71; ///< 54..65 = [TRRPROBE2] coin telemetry (4 det-key bins x count/sumBefore/survives); 66..70 = [TRRPROBE2-CHK] self-checks + negative-Tr counts.
+    static const uint32_t kRisStatSlots = 72; ///< 54..65 = [TRRPROBE2] coin telemetry (4 det-key bins x count/sumBefore/survives); 66..70 = [TRRPROBE2-CHK] self-checks + negative-Tr counts; 71 = brick-prefetch promotes.
     ref<Buffer> mpRisStats;         ///< Device-local counters (atomics).
     ref<Buffer> mpRisStatsReadback; ///< CPU-visible copy.
     bool mLogRisStats = false;      ///< Log the histogram while RIS is on.

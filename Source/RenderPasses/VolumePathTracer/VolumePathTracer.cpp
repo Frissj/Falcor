@@ -62,6 +62,7 @@ const char kUseTemporalReuse[] = "useTemporalReuse";
 const char kTemporalMCap[] = "temporalMCap";
 const char kUseBrickTlas[] = "useBrickTlas";
 const char kUseOccupancySkip[] = "useOccupancySkip";
+const char kUseBrickPrefetch[] = "useBrickPrefetch";
 const char kMipPixelThreshold[] = "mipPixelThreshold";
 const char kUseMergedTail[] = "useMergedTail";
 const char kTailRes[] = "tailRes";
@@ -140,6 +141,8 @@ void VolumePathTracer::parseProperties(const Properties& props)
             mUseBrickTlas = value;
         else if (key == kUseOccupancySkip)
             mUseOccupancySkip = value;
+        else if (key == kUseBrickPrefetch)
+            mUseBrickPrefetch = value;
         else if (key == kMipPixelThreshold)
             mMipPixelThreshold = value;
         else if (key == kUseMergedTail)
@@ -224,6 +227,7 @@ Properties VolumePathTracer::getProperties() const
     props[kTemporalMCap] = mTemporalMCap;
     props[kUseBrickTlas] = mUseBrickTlas;
     props[kUseOccupancySkip] = mUseOccupancySkip;
+    props[kUseBrickPrefetch] = mUseBrickPrefetch;
     props[kMipPixelThreshold] = mMipPixelThreshold;
     props[kUseMergedTail] = mUseMergedTail;
     props[kTailRes] = mTailRes;
@@ -1357,6 +1361,7 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
         var["CB"]["gFrameDim"] = targetDim;
         var["CB"]["gFootprintSpread"] = footprintSpread;
         var["CB"]["gOccSkipEnable"] = mUseOccupancySkip ? 1u : 0u;
+        var["CB"]["gBrickPrefetchEnable"] = mUseBrickPrefetch ? 1u : 0u;
         var["CB"]["gPrevViewProj"] = mPrevViewProj;
         var["CB"]["gPrevCamPos"] = mPrevCamPos;
         var["CB"]["gTemporalEnable"] = (temporalActive && mPrevCamValid) ? 1u : 0u;
@@ -1828,7 +1833,7 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
                     "[COST] frame {} | per-pixel cells/taps: escapeT {:.1f}/{:.1f} candGen {:.1f}/{:.1f} "
                     "shadeNEE {:.1f}/{:.1f} sweep {:.1f}/{:.1f} | overlap steps {:.2f} lookups {:.2f} "
                     "| tailRays {:.2f}/entry | totals: cells {} taps {} "
-                    "| brickCache hit {:.1f}% ({}/{}) | occSkip {:.1f}% ({})",
+                    "| brickCache hit {:.1f}% ({}/{}) promote {:.1f}% ({}) | occSkip {:.1f}% ({})",
                     mFrameCount,
                     s[16] / px, s[17] / px, s[18] / px, s[19] / px,
                     s[20] / px, s[21] / px, s[13] / px, s[14] / px,
@@ -1841,6 +1846,13 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
                     // hop into atlasTex. A low rate means revert, not tune.
                     (s[27] + s[28]) > 0 ? 100.0 * double(s[27]) / double(s[27] + s[28]) : 0.0,
                     s[27], s[27] + s[28],
+                    // Lever-2 payoff: the share of ex-misses now answered by the
+                    // prefetch entry (register moves; loads were issued a cell
+                    // early, off the critical path). s[28] still counts a
+                    // promote as a miss for hit-rate continuity, so the promote
+                    // share is reported against the same denominator.
+                    (s[27] + s[28]) > 0 ? 100.0 * double(s[71]) / double(s[27] + s[28]) : 0.0,
+                    s[71],
                     // Occupancy-mask payoff (HANDOFF_6 6.3): the share of taps
                     // answered from the register-resident bitmask with no
                     // atlasTex read. totalTaps still counts these - they are
@@ -2144,6 +2156,19 @@ void VolumePathTracer::renderUI(Gui::Widgets& widget)
             "Flip it WITHIN one session and compare [COST]. Cross-session gpuMs\n"
             "here has twice drifted ~25% with identical work counters, which is\n"
             "bigger than the effect being measured.",
+            true
+        );
+        group.checkbox("Brick prefetch", mUseBrickPrefetch);
+        group.tooltip(
+            "Lever 2 (2026-07-20): speculative next-brick prefetch in the DDA\n"
+            "walks. The marching loop is a serial chain of dependent loads\n"
+            "(LONG SCOREBOARD 30% in the Nsight capture, SM 50% / VRAM 12% =\n"
+            "latency-bound); the next cell's address is pure ALU, so its\n"
+            "range/indirection/occupancy loads go in flight while the current\n"
+            "cell's value is still outstanding. EXACT: promotes reuse the same\n"
+            "texels; a wasted prefetch is dead loads, never wrong data.\n\n"
+            "Flip WITHIN one session; watch [COST] prefetch promote share and\n"
+            "gpuMs. Regression suspect #1 is register pressure (~9 regs).",
             true
         );
 

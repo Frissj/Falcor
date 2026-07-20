@@ -35,6 +35,7 @@ cbuffer CB
     /// (2*tan(fovY/2)/resY * user scale). 0 = footprint-driven residual mip off.
     float gFootprintSpread;
     uint gOccSkipEnable;    ///< 6.3 occupancy tap skip on/off. Pushed into the sampler per thread.
+    uint gBrickPrefetchEnable; ///< Lever-2 next-brick prefetch on/off. Pushed into the sampler per thread.
     /// Stage B temporal reuse: previous frame's camera.
     float4x4 gPrevViewProj;
     float3 gPrevCamPos;
@@ -145,6 +146,14 @@ uint gvsBrickMissesNow()
     fraction of the frame's most-stalled load that is no longer issued. If it is
     near zero the bricks are internally dense and the mask is dead weight.
 */
+uint gvsBrickPromotesNow()
+{
+#if GRID_VOLUME_SAMPLER_STATS
+    return gGvsStatBrickPromotes;
+#else
+    return 0;
+#endif
+}
 uint gvsTapSkipsNow()
 {
 #if GRID_VOLUME_SAMPLER_STATS
@@ -684,6 +693,7 @@ bool scatterAtVertex<S : ISampleGenerator>(
 void main(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
     gvsSetOccSkipEnable(gOccSkipEnable);
+    gvsSetBrickPrefetchEnable(gBrickPrefetchEnable);
     const uint2 pixel = dispatchThreadId.xy;
     if (any(pixel >= gFrameDim))
         return;
@@ -1466,6 +1476,7 @@ void main(uint3 dispatchThreadId: SV_DispatchThreadID)
         const uint h9 = WaveActiveSum(gvsBrickHitsNow());
         const uint h11 = WaveActiveSum(gvsTapSkipsNow());
         const uint h10 = WaveActiveSum(gvsBrickMissesNow());
+        const uint h12 = WaveActiveSum(gvsBrickPromotesNow());
 
         // ---- DIVERGENCE PROBE (slots 31-35) ----
         // Nsight's largest rule on this pass is Active Threads Per Warp: only
@@ -1565,6 +1576,7 @@ void main(uint3 dispatchThreadId: SV_DispatchThreadID)
             if (h9 > 0) InterlockedAdd(gRisStats[27], h9);
             if (h10 > 0) InterlockedAdd(gRisStats[28], h10);
             if (h11 > 0) InterlockedAdd(gRisStats[30], h11);
+            if (h12 > 0) InterlockedAdd(gRisStats[71], h12);
         }
     }
 #endif
@@ -1595,6 +1607,7 @@ void main(uint3 dispatchThreadId: SV_DispatchThreadID)
 void shadeMain(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
     gvsSetOccSkipEnable(gOccSkipEnable);
+    gvsSetBrickPrefetchEnable(gBrickPrefetchEnable);
     const uint queueIdx = dispatchThreadId.x;
     if (queueIdx >= gScatterCount[0])
         return;
@@ -1761,6 +1774,7 @@ void shadeMain(uint3 dispatchThreadId: SV_DispatchThreadID)
         const uint h9 = WaveActiveSum(gvsBrickHitsNow());
         const uint h11 = WaveActiveSum(gvsTapSkipsNow());
         const uint h10 = WaveActiveSum(gvsBrickMissesNow());
+        const uint h12 = WaveActiveSum(gvsBrickPromotesNow());
 
         // ---- shadeMain DIVERGENCE PROBE (slots 42-45) ----
         // Every lane here holds a REAL path (dense queue dispatch), so the
@@ -1796,6 +1810,7 @@ void shadeMain(uint3 dispatchThreadId: SV_DispatchThreadID)
             if (h9 > 0) InterlockedAdd(gRisStats[27], h9);
             if (h10 > 0) InterlockedAdd(gRisStats[28], h10);
             if (h11 > 0) InterlockedAdd(gRisStats[30], h11);
+            if (h12 > 0) InterlockedAdd(gRisStats[71], h12);
         }
     }
 #endif
@@ -1897,6 +1912,7 @@ void emitShadeStats(inout VolumeInstanceSampler volumeSampler)
     const uint h9 = WaveActiveSum(gvsBrickHitsNow());
     const uint h11 = WaveActiveSum(gvsTapSkipsNow());
     const uint h10 = WaveActiveSum(gvsBrickMissesNow());
+    const uint h12 = WaveActiveSum(gvsBrickPromotesNow());
     if (WaveIsFirstLane())
     {
         if (a > 0) InterlockedAdd(gRisStats[9], a);
@@ -1911,6 +1927,7 @@ void emitShadeStats(inout VolumeInstanceSampler volumeSampler)
         if (h9 > 0) InterlockedAdd(gRisStats[27], h9);
         if (h10 > 0) InterlockedAdd(gRisStats[28], h10);
         if (h11 > 0) InterlockedAdd(gRisStats[30], h11);
+        if (h12 > 0) InterlockedAdd(gRisStats[71], h12);
     }
 #endif
 }
@@ -1923,6 +1940,7 @@ void emitShadeStats(inout VolumeInstanceSampler volumeSampler)
 void shadeInitMain(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
     gvsSetOccSkipEnable(gOccSkipEnable);
+    gvsSetBrickPrefetchEnable(gBrickPrefetchEnable);
     const uint queueIdx = dispatchThreadId.x;
     if (queueIdx >= gScatterCount[0])
         return;
@@ -1976,6 +1994,7 @@ void shadeInitMain(uint3 dispatchThreadId: SV_DispatchThreadID)
 void bounceMain(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
     gvsSetOccSkipEnable(gOccSkipEnable);
+    gvsSetBrickPrefetchEnable(gBrickPrefetchEnable);
     const uint i = dispatchThreadId.x;
     if (i >= gPathCountIn[0])
         return;
@@ -2059,6 +2078,7 @@ void bounceArgsMain()
 void bounceTailMain(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
     gvsSetOccSkipEnable(gOccSkipEnable);
+    gvsSetBrickPrefetchEnable(gBrickPrefetchEnable);
     const uint i = dispatchThreadId.x;
     if (i >= gPathCountIn[0])
         return;

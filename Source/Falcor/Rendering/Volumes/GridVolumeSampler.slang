@@ -111,7 +111,39 @@ void gvsStatTap()
 static int3 gGvsBrickKey = int3(-1, -1, -1); ///< Cached brick coord; sentinel no valid index produces.
 static uint3 gGvsBrickPtr = uint3(0, 0, 0);  ///< Cached indirection result for gGvsBrickKey.
 static float2 gGvsBrickRange = float2(0.f, 0.f); ///< Cached (majorant, minorant) for gGvsBrickKey.
+static float gGvsBrickMean = 0.f;            ///< Cached mean (rangeMeanTex .z) - the residual walk's control.
 static uint gGvsBrickOcc = 0u;               ///< Cached occupancy mask for gGvsBrickKey (see Grid.slang).
+
+// ---------------------------------------------------------------------------
+// PREFETCH ENTRY (lever 2, 2026-07-20). The DDA loops are serial chains of
+// single-entry misses: at mip 0 every DDA cell IS a brick, so each iteration's
+// range/indirection/occupancy loads cannot issue until the previous
+// iteration's majorant decided the loop - Nsight run 20_50 profiles the walk
+// at LONG SCOREBOARD 30% with the SM at 50% and VRAM at 12% (latency-bound,
+// not bandwidth). But the NEXT cell's address needs only ALU (stepDDA is pure
+// arithmetic), so the walk can issue the next brick's loads WHILE the current
+// brick's value is still in flight - software pipelining. This second entry
+// holds those speculative loads; gvsBrickEnsure promotes it with register
+// moves when the walk arrives, and a wasted prefetch (collision ended the
+// walk) costs only the dead loads, never correctness.
+// Same single-grid validity rule as the primary entry: reset clears BOTH.
+// ---------------------------------------------------------------------------
+static int3 gGvsBrickKeyN = int3(-1, -1, -1);
+static uint3 gGvsBrickPtrN = uint3(0, 0, 0);
+static float2 gGvsBrickRangeN = float2(0.f, 0.f);
+static float gGvsBrickMeanN = 0.f;
+static uint gGvsBrickOccN = 0u;
+
+/** Runtime A/B switch for the prefetch, same discipline (and reasons) as
+    gGvsOccSkipEnable below: cross-session gpuMs drifts more than the effect,
+    so the only trustworthy comparison is flipping this inside one process.
+    0 = behaviourally identical to the single-entry cache.
+*/
+static uint gGvsBrickPrefetchEnable = 1u;
+void gvsSetBrickPrefetchEnable(const uint enable)
+{
+    gGvsBrickPrefetchEnable = enable;
+}
 
 /** Runtime A/B switch for the occupancy skip (HANDOFF_6 6.3).
 
@@ -145,14 +177,79 @@ void gvsSetOccSkipEnable(const uint enable)
 static uint gGvsStatBrickHits = 0;   ///< Taps served from the cached brick.
 static uint gGvsStatBrickMisses = 0; ///< Taps that had to re-chase the indirection.
 static uint gGvsStatTapSkips = 0;    ///< Taps answered from the occupancy mask, atlasTex never read.
+static uint gGvsStatBrickPromotes = 0; ///< Misses answered by the prefetch entry - register moves, loads already in flight.
 #endif
 
 /** Invalidate the brick cache. MUST be called at the start of every walk, before
     any tap, because the cache is only valid for a single Grid (see above).
+    Clears BOTH entries - a prefetched brick from another grid's walk promoted
+    later would be the exact silent-wrong-density bug the primary reset exists
+    to prevent.
 */
 void gvsBrickCacheReset()
 {
     gGvsBrickKey = int3(-1, -1, -1);
+    gGvsBrickKeyN = int3(-1, -1, -1);
+}
+
+/** Make the primary entry hold `brick`: hit, promote-from-prefetch, or full
+    miss load. All callers below go through this, so hit/promote/miss
+    accounting and the promote register-move path live in exactly one place.
+*/
+void gvsBrickEnsure(const Grid densityGrid, const int3 brick)
+{
+    if (!any(brick != gGvsBrickKey))
+    {
+#if GRID_VOLUME_SAMPLER_STATS
+        gGvsStatBrickHits++;
+#endif
+        return;
+    }
+    if (gGvsBrickPrefetchEnable != 0u && !any(brick != gGvsBrickKeyN))
+    {
+        // The loads were issued cells ago (gvsBrickPrefetch); by now they have
+        // landed or are about to. Promotion is register moves only.
+        gGvsBrickKey = gGvsBrickKeyN;
+        gGvsBrickRange = gGvsBrickRangeN;
+        gGvsBrickMean = gGvsBrickMeanN;
+        gGvsBrickPtr = gGvsBrickPtrN;
+        gGvsBrickOcc = gGvsBrickOccN;
+        gGvsBrickKeyN = int3(-1, -1, -1);
+#if GRID_VOLUME_SAMPLER_STATS
+        // A promote still counts as a miss: without the prefetch it WOULD have
+        // been one, so the [COST] hit-rate stays comparable across sessions
+        // and the promote share reads against the same denominator.
+        gGvsStatBrickMisses++;
+        gGvsStatBrickPromotes++;
+#endif
+        return;
+    }
+    gGvsBrickKey = brick;
+    const float3 rm = densityGrid.rangeMeanTex[brick].xyz;
+    gGvsBrickRange = rm.xy;
+    gGvsBrickMean = rm.z;
+    gGvsBrickPtr = densityGrid.indirectionTex[brick].xyz;
+    gGvsBrickOcc = densityGrid.occupancyTex[brick];
+#if GRID_VOLUME_SAMPLER_STATS
+    gGvsStatBrickMisses++;
+#endif
+}
+
+/** Issue the next brick's loads into the prefetch entry WITHOUT waiting for
+    them. Call with the brick the walk will enter next (pure ALU to compute)
+    while the current brick's work is still outstanding - that overlap is the
+    entire point. Skips bricks already resident in either entry.
+*/
+void gvsBrickPrefetch(const Grid densityGrid, const int3 brick)
+{
+    if (gGvsBrickPrefetchEnable == 0u) return;
+    if (!any(brick != gGvsBrickKey) || !any(brick != gGvsBrickKeyN)) return;
+    gGvsBrickKeyN = brick;
+    const float3 rm = densityGrid.rangeMeanTex[brick].xyz;
+    gGvsBrickRangeN = rm.xy;
+    gGvsBrickMeanN = rm.z;
+    gGvsBrickPtrN = densityGrid.indirectionTex[brick].xyz;
+    gGvsBrickOccN = densityGrid.occupancyTex[brick];
 }
 
 /** Brick-coherent replacement for Grid::lookupStochasticIndexTex.
@@ -182,46 +279,27 @@ float gvsLookupMajorantCached(const Grid densityGrid, const int3 index, const in
     // mip config.
     if (mip != 0) return densityGrid.lookupIndexLocalMajorantTex(index, mip);
 
-    const int3 brick = index >> 3;
-    if (any(brick != gGvsBrickKey))
-    {
-        gGvsBrickKey = brick;
-        gGvsBrickRange = densityGrid.rangeMeanTex[brick].xy;
-        gGvsBrickPtr = densityGrid.indirectionTex[brick].xyz;
-        gGvsBrickOcc = densityGrid.occupancyTex[brick];
-#if GRID_VOLUME_SAMPLER_STATS
-        gGvsStatBrickMisses++;
-#endif
-    }
-#if GRID_VOLUME_SAMPLER_STATS
-    else
-    {
-        gGvsStatBrickHits++;
-    }
-#endif
+    gvsBrickEnsure(densityGrid, index >> 3);
     return gGvsBrickRange.x;
+}
+
+/** Cache-served (majorant, minorant, mean) at mip 0 - the residual walk's
+    per-node fetch. Same texel the cache already loads (rangeMeanTex[brick]
+    == lookupIndexLocalRangeMeanTex at mip 0, see Grid.slang:327), so serving
+    it from the entry is bitwise identical - and it fills ptr/occ EARLY, so
+    the residual taps that follow inside the node hit instead of paying the
+    dependent indirection chase on their first tap.
+*/
+float3 gvsLookupRangeMeanCached(const Grid densityGrid, const int3 index)
+{
+    gvsBrickEnsure(densityGrid, index >> 3);
+    return float3(gGvsBrickRange, gGvsBrickMean);
 }
 
 float gvsLookupStochasticCached(const Grid densityGrid, const float3 index, const float3 u)
 {
     const int3 vox = int3(index + (u - 0.5f));
-    const int3 brick = vox >> 3;
-    if (any(brick != gGvsBrickKey))
-    {
-        gGvsBrickKey = brick;
-        gGvsBrickRange = densityGrid.rangeMeanTex[brick].xy;
-        gGvsBrickPtr = densityGrid.indirectionTex[brick].xyz;
-        gGvsBrickOcc = densityGrid.occupancyTex[brick];
-#if GRID_VOLUME_SAMPLER_STATS
-        gGvsStatBrickMisses++;
-#endif
-    }
-#if GRID_VOLUME_SAMPLER_STATS
-    else
-    {
-        gGvsStatBrickHits++;
-    }
-#endif
+    gvsBrickEnsure(densityGrid, vox >> 3);
     // Occupancy early-out (UE Nanite Foliage ProcessBrickPixel lesson): the mask
     // is already in a register, so a tap into an all-zero BC4 tile is answered
     // by one shift and one AND instead of a dependent atlasTex load. That load
@@ -504,6 +582,15 @@ struct GridVolumeSampler
             // the taps that follow in this cell. Same float3 -> int3 implicit
             // truncation as the direct call it replaces.
             majorant = gridVolume.data.densityScale * gvsLookupMajorantCached(densityGrid, pos, mip);
+            // Speculative next-brick prefetch (see gvsBrickPrefetch). The next
+            // cell's coordinate is pure ALU from tExit - the SAME expression
+            // the next iteration truncates - so its loads can be in flight
+            // while THIS cell's majorant is still being waited on. Wasted only
+            // when this cell collides or exits, and a wasted prefetch is dead
+            // loads, not wrong data. Mip-0 only: that is where the cache (and
+            // the thick-pixel cost) lives; higher mips fall through unchanged.
+            if (mip == 0 && tExit < tFar)
+                gvsBrickPrefetch(densityGrid, int3(ipos + idir * tExit) >> 3);
             const float dt = tExit - t;
             t = tExit;
             // Test for (tentative) collisions.
@@ -623,7 +710,22 @@ struct GridVolumeSampler
             // RGBA16Float texel. Reading range and mean separately cost two
             // fetches per cell at the identical address, and cells are the
             // dominant term in this pass's memory traffic.
-            const float3 majMinMean = densityGrid.lookupIndexLocalRangeMeanTex(int3(pos), residualMip);
+            // At mip 0 (the shipping residualMip, and what the footprint rule
+            // picks in this scene - [LOD] shows every instance at 0) the fetch
+            // is served through the brick cache: bitwise-identical texel, plus
+            // ptr/occ land early for the residual taps below, plus the NEXT
+            // node's texels go in flight while this node's tracking runs -
+            // this loop has real ALU work to hide the latency under, which the
+            // pure marching chain does not.
+            float3 majMinMean;
+            if (residualMip == 0)
+            {
+                majMinMean = gvsLookupRangeMeanCached(densityGrid, int3(pos));
+                if (tExit < nearFar.y)
+                    gvsBrickPrefetch(densityGrid, int3(ipos + idir * tExit) >> 3);
+            }
+            else
+                majMinMean = densityGrid.lookupIndexLocalRangeMeanTex(int3(pos), residualMip);
             const float2 majMin = majMinMean.xy;
             const float mean = majMinMean.z;
             const float sigmaC = scale * mean;
