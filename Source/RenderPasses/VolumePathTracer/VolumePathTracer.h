@@ -61,13 +61,22 @@ private:
     ref<ComputePass> mpPassArgs;
     // Lever-1b scatter-queue counting sort (classify/offsets/scatter). Pure
     // scheduling, image-identical; mUseScatterSort is the runtime A/B.
+    // MEASURED AND DEFAULTED OFF (run 139 in-session A/B, v3 bounce-count
+    // predictor with healthy 320k/75k/29k/7k class spread): gpuMs wash,
+    // bounces occ 0.223 sorted vs 0.228 unsorted, march occ 0.301 vs 0.309 -
+    // the sort LOSES. Append order is screen order, and neighbors already
+    // share both path length (same cloud depth) AND the same bricks; a
+    // global class sort trades that spatial coherence away for a coarse
+    // 4-class length grouping. Do not reopen without a class-major +
+    // spatial-minor STABLE sort (atomic-cursor scatter is unstable within a
+    // class, which is what destroyed locality).
     ref<ComputePass> mpPassScatterClass;
     ref<ComputePass> mpPassScatterOffset;
     ref<ComputePass> mpPassScatterSort;
     ref<Buffer> mpScatterQueueSorted;
     ref<Buffer> mpScatterClass;
     ref<Buffer> mpScatterClassCount;
-    bool mUseScatterSort = true;
+    bool mUseScatterSort = false;
     ref<Buffer> mpScatterQueue;  ///< RIS survivors (16 B each), sized to pixel count.
     ref<Buffer> mpScatterCount;  ///< Single uint: queued path count.
     ref<Buffer> mpDispatchArgs;  ///< uint3 indirect dispatch args for shadeMain.
