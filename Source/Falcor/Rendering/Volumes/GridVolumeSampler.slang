@@ -131,6 +131,45 @@ void gvsBrickCacheReset()
     int3 conversion reproduces the implicit TRUNCATION in lookupStochasticIndexTex
     (which does NOT floor, unlike lookupStochasticIndex).
 */
+float gvsLookupMajorantCached(const Grid densityGrid, const int3 index, const int mip)
+{
+    // At mip 0 - the shipping config (residualMip 0) - lookupIndexLocalMajorantTex
+    // loads rangeMeanTex[index >> 3].x, the SAME TEXEL the brick cache already
+    // holds as gGvsBrickRange.x. On a hit the majorant costs nothing.
+    //
+    // The bigger win is ordering. stepToNextCollision fetches the majorant ONCE
+    // per DDA cell, BEFORE any density tap in that cell. On a miss this populates
+    // the FULL entry - range AND the indirection pointer - so taps that follow in
+    // the same brick already have ptr resident and skip the dependent hop into
+    // atlasTex. The indirection load is not added, it is MOVED EARLIER: off the
+    // tap's critical path into a slot where its latency overlaps the DDA
+    // arithmetic. Both fetches profile at LONG SCOREBOARD (majorant 76%, tap
+    // 83-86%), so taking one off the dependent chain is the whole point.
+    //
+    // Above mip 0 the majorant lives in a different mip than the cache's mip-0
+    // entry, so it falls through untouched - correctness does not depend on the
+    // mip config.
+    if (mip != 0) return densityGrid.lookupIndexLocalMajorantTex(index, mip);
+
+    const int3 brick = index >> 3;
+    if (any(brick != gGvsBrickKey))
+    {
+        gGvsBrickKey = brick;
+        gGvsBrickRange = densityGrid.rangeMeanTex[brick].xy;
+        gGvsBrickPtr = densityGrid.indirectionTex[brick].xyz;
+#if GRID_VOLUME_SAMPLER_STATS
+        gGvsStatBrickMisses++;
+#endif
+    }
+#if GRID_VOLUME_SAMPLER_STATS
+    else
+    {
+        gGvsStatBrickHits++;
+    }
+#endif
+    return gGvsBrickRange.x;
+}
+
 float gvsLookupStochasticCached(const Grid densityGrid, const float3 index, const float3 u)
 {
     const int3 vox = int3(index + (u - 0.5f));
@@ -409,7 +448,10 @@ struct GridVolumeSampler
             const float3 pos = ipos + idir * t;
             const float tExit = stepDDA(ipos, ri, pos, mip);
             logVolumeLookup();
-            majorant = gridVolume.data.densityScale * densityGrid.lookupIndexLocalMajorantTex(pos, mip);
+            // Shares the brick cache and prefetches the indirection pointer for
+            // the taps that follow in this cell. Same float3 -> int3 implicit
+            // truncation as the direct call it replaces.
+            majorant = gridVolume.data.densityScale * gvsLookupMajorantCached(densityGrid, pos, mip);
             const float dt = tExit - t;
             t = tExit;
             // Test for (tentative) collisions.

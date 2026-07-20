@@ -76,6 +76,38 @@ struct BrickTlasInstanceInfo
 };
 StructuredBuffer<BrickTlasInstanceInfo> gBrickTlasInstances;
 
+/** Per-thread cache of the last TLAS instance info.
+
+    WHY: every RayQuery candidate does
+        info = gBrickTlasInstances[CandidateInstanceIndex()];   // load 1
+        bb   = gBrickAABBs[info.aabbOffset + CandidatePrimitiveIndex()];  // load 2
+    and load 2's ADDRESS depends on load 1's result, so it cannot issue until
+    load 1 returns. That is a two-hop dependent chase run ~30M times a frame
+    (aabbTests 14.6/px), and it is why sampleDistanceRQ and
+    evalEscapeAndCandidatesRQ profile at LONG SCOREBOARD ~43%.
+
+    A ray crossing one cloud hits many bricks of the SAME TLAS instance, so
+    consecutive candidates almost always share this info. Caching it removes
+    load 1 and, more importantly, the dependency - the AABB address becomes
+    computable immediately from a register.
+
+    EXACT, not approximate: keyed on the instance index itself, so a hit returns
+    precisely what the buffer read would have. Unlike the brick cache this needs
+    no reset discipline - there is no grid whose identity could go stale.
+*/
+static uint gVisTlasInstKey = 0xFFFFFFFFu; ///< Sentinel: no valid instance index.
+static BrickTlasInstanceInfo gVisTlasInstInfo;
+
+BrickTlasInstanceInfo visInstanceInfo(const uint instIdx)
+{
+    if (instIdx != gVisTlasInstKey)
+    {
+        gVisTlasInstKey = instIdx;
+        gVisTlasInstInfo = gBrickTlasInstances[instIdx];
+    }
+    return gVisTlasInstInfo;
+}
+
 /** Brick AABBs in SHIFTED index space; same memory the BLAS was built from. */
 struct BrickAABB
 {
@@ -1042,7 +1074,7 @@ struct VolumeInstanceSampler
         {
             if (q.CandidateType() != CANDIDATE_PROCEDURAL_PRIMITIVE) continue;
 
-            const BrickTlasInstanceInfo info = gBrickTlasInstances[q.CandidateInstanceIndex()];
+            const BrickTlasInstanceInfo info = visInstanceInfo(q.CandidateInstanceIndex());
             const BrickAABB bb = gBrickAABBs[info.aabbOffset + q.CandidatePrimitiveIndex()];
             const float2 tt = intersectBrickAABB(q.CandidateObjectRayOrigin(), q.CandidateObjectRayDirection(), bb, ray.tMin, ray.tMax);
             if (tt.x >= tt.y) continue;
@@ -1088,7 +1120,7 @@ struct VolumeInstanceSampler
         {
             if (q.CandidateType() != CANDIDATE_PROCEDURAL_PRIMITIVE) continue;
 
-            const BrickTlasInstanceInfo info = gBrickTlasInstances[q.CandidateInstanceIndex()];
+            const BrickTlasInstanceInfo info = visInstanceInfo(q.CandidateInstanceIndex());
             const BrickAABB bb = gBrickAABBs[info.aabbOffset + q.CandidatePrimitiveIndex()];
             const float2 tt = intersectBrickAABB(q.CandidateObjectRayOrigin(), q.CandidateObjectRayDirection(), bb, ray.tMin, min(ray.tMax, bestT));
             if (tt.x >= tt.y) continue;
@@ -1150,7 +1182,7 @@ struct VolumeInstanceSampler
             float allBest = 0.f;
             for (uint j = 0; j < nProc; ++j) allBest = max(allBest, bestT[j]);
 
-            const BrickTlasInstanceInfo info = gBrickTlasInstances[q.CandidateInstanceIndex()];
+            const BrickTlasInstanceInfo info = visInstanceInfo(q.CandidateInstanceIndex());
             const BrickAABB bb = gBrickAABBs[info.aabbOffset + q.CandidatePrimitiveIndex()];
             const float2 tt = intersectBrickAABB(q.CandidateObjectRayOrigin(), q.CandidateObjectRayDirection(), bb, ray.tMin, min(ray.tMax, allBest));
             if (tt.x >= tt.y) continue;
@@ -1248,7 +1280,7 @@ struct VolumeInstanceSampler
         {
             if (q.CandidateType() != CANDIDATE_PROCEDURAL_PRIMITIVE) continue;
 
-            const BrickTlasInstanceInfo info = gBrickTlasInstances[q.CandidateInstanceIndex()];
+            const BrickTlasInstanceInfo info = visInstanceInfo(q.CandidateInstanceIndex());
             const BrickAABB bb = gBrickAABBs[info.aabbOffset + q.CandidatePrimitiveIndex()];
             const float2 tt = intersectBrickAABB(q.CandidateObjectRayOrigin(), q.CandidateObjectRayDirection(), bb, ray.tMin, ray.tMax);
             if (tt.x >= tt.y) continue;
