@@ -49,6 +49,9 @@ private:
     // Merged coarse tail (VNA section 3).
     void bakeMergedTail();
 
+    // Sun-tau cache build (Nubis3/UE port; see TauCB in the shader).
+    void buildTauCache(RenderContext* pRenderContext);
+
     ref<Scene> mpScene;
     ref<ComputePass> mpPass;
     // Stream compaction pipeline (phase A = mpPass with USE_COMPACTION=1):
@@ -221,6 +224,19 @@ private:
     /// variance. Defaults reproduce the previous hardcoded 0.05f / bounce > 3.
     float mRouletteMinQ = 0.05f;
     uint32_t mRouletteStartBounce = 3;
+    /// Roulette sweep driver (the ReSTIR PT Enhanced 6.2.4 experiment): one
+    /// button steps (minQ, startBounce) through a fixed schedule, holds each
+    /// for mSweepFramesPerStep frames, force-logs a [SWEEP] line with the
+    /// shadeMain divergence counters on each step's last frame, then restores
+    /// the original values. CB values only - no recompile between steps, so
+    /// the whole comparison is one session, per measurement discipline.
+    /// Accumulation is reset at every step boundary so each step's image is
+    /// judgeable on its own.
+    bool mSweepActive = false;
+    uint32_t mSweepStartFrame = 0;
+    uint32_t mSweepFramesPerStep = 64;
+    float mSweepSavedMinQ = 0.05f;
+    uint32_t mSweepSavedStartBounce = 3;
     /// Mip of the coarse mean field used for the TARGET's shadow estimate (0..3).
     /// Candidates no longer come from this field (they are real delta-tracking
     /// collisions), so this only decides how cheap/crude the "is this candidate
@@ -228,6 +244,33 @@ private:
     /// cost in the pass - so it defaults coarse. Being crude here costs variance
     /// only, never correctness.
     uint32_t mRisMip = 2u;
+    /// Sun-tau cache (Nubis3 / UE transmittance-volume port, see TauCB in the
+    /// shader): replace the target's per-candidate coarseOpticalDepth walk -
+    /// [LOOPOCC] measured it at 39.5M cells/frame at 0.342 SIMD occupancy,
+    /// 3.6x the warp-slots of the entire RayQuery traversal - with one
+    /// trilinear fetch of tau baked toward the dominant env direction.
+    /// Unbiased: target-only, so any staleness/coarseness is variance.
+    /// mUseTauCache compiles the feature (resources + build passes);
+    /// mTauCacheApply is the RUNTIME A/B switch (CB uniform, no recompile),
+    /// same discipline as mUseOccupancySkip.
+    bool mUseTauCache = true;
+    bool mTauCacheApply = true;
+    /// Cache cells along the longest world axis (tail-bake convention).
+    /// Nubis shipped 256x256x32 for a whole sky; this shapes a target only.
+    uint32_t mTauCacheRes = 64;
+    /// Rebuild every N frames; 0 = bake once (scene and env are static).
+    uint32_t mTauCacheInterval = 0;
+    ref<Texture> mpTauCache;             ///< R16F 3D tau grid (UAV+SRV).
+    ref<Sampler> mpTauSampler;           ///< Linear clamp.
+    ref<Buffer> mpTauDir;                ///< float4[1], dominant light direction.
+    ref<ComputePass> mpPassTauDir;       ///< tauDirMain.
+    ref<ComputePass> mpPassTauBuild;     ///< tauBuildMain.
+    float3 mTauOrigin = float3(0.f);
+    float3 mTauCellSize = float3(0.f);
+    float3 mTauInvExtent = float3(0.f);
+    uint3 mTauDim = uint3(0);
+    uint32_t mTauLastBuildFrame = kTauNeverBuilt;
+    static const uint32_t kTauNeverBuilt = 0xffffffffu;
 
     // RIS diagnostics. The shader tallies which branch ended the RIS block for
     // every pixel; this is read back and written to the log as a histogram, so
@@ -239,8 +282,9 @@ private:
     // 27..28 = brick-cache hits/misses, 29 = brick candidates, 30 = occupancy tap skips,
     // 31..35 = divergence probe (laneWork sum, waveMax sum, warps, idle lanes, active lanes),
     // 36..37 = fully idle warps, busy lanes within marching warps,
-    // 38..41 = per-loop SIMD occupancy (RQ traversal sum/max, coarse-DDA sum/max).
-    static const uint32_t kRisStatSlots = 42;
+    // 38..41 = per-loop SIMD occupancy (RQ traversal sum/max, coarse-DDA sum/max),
+    // 42..45 = shadeMain divergence (bounce sum/max, marching-work sum/max).
+    static const uint32_t kRisStatSlots = 46;
     ref<Buffer> mpRisStats;         ///< Device-local counters (atomics).
     ref<Buffer> mpRisStatsReadback; ///< CPU-visible copy.
     bool mLogRisStats = false;      ///< Log the histogram while RIS is on.

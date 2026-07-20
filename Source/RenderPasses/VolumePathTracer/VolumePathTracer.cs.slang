@@ -232,6 +232,46 @@ static const uint kRisExitContributed = 6; ///< Full contribution made.
 */
 RWTexture2D<float4> gWorkDebug;
 
+/** Sun-tau cache: the Nubis3 lighting trick (SIGGRAPH 2023, slides 127-130),
+    also UE's DIM_USE_TRANSMITTANCE_VOLUME path (HeterogeneousVolumes
+    RayMarchingUtils.ush ComputeTransmittance: cache lookup FIRST, ray march
+    LAST). Replaces the per-candidate coarseOpticalDepth shadow walk - measured
+    at 39.5M DDA cells/frame at 0.342 SIMD occupancy, 115.5M warp-slots, 3.6x
+    the cost of the entire RayQuery traversal ([LOOPOCC] 2026-07-20) - with ONE
+    trilinear fetch of precomputed optical depth toward the dominant light.
+
+    UNBIASED BY CONSTRUCTION: tau only feeds the RIS TARGET Lhat, and the
+    estimator divides Lhat back out (w = phat/p = Lhat, see the algebra note in
+    VolumeInstanceSampler.slang). Any approximation here - coarse grid, single
+    direction, stale by a few frames - moves candidate-selection VARIANCE,
+    never the converged image. Nubis and UE both defend image quality with
+    their caches; ours only has to pick good candidates.
+
+    The cache is built along ONE direction (the luminance-weighted mean of 64
+    env-map importance samples) while the actual per-pixel target light varies.
+    Same argument: direction mismatch = variance only. Nubis got a 40% frame
+    reduction AND better shadows from the equivalent trade.
+*/
+#ifndef USE_TAU_CACHE
+#define USE_TAU_CACHE 0
+#endif
+
+cbuffer TauCB
+{
+    float3 gTauOrigin;    ///< World-space min corner of the cache grid.
+    uint   gTauEnable;    ///< Runtime A/B toggle (CB, not define: same-session A/B per measurement discipline).
+    float3 gTauCellSize;  ///< World size of one cache voxel.
+    float  _tauPad0;
+    float3 gTauInvExtent; ///< 1 / (gTauDim * gTauCellSize): world -> uvw.
+    float  _tauPad1;
+    uint3  gTauDim;       ///< Cache resolution.
+    uint   _tauPad2;
+}
+Texture3D<float> gTauTex;               ///< Baked tau (optical depth to volume exit toward gTauDirBuf[0]).
+SamplerState gTauSmp;                   ///< Linear clamp.
+RWTexture3D<float> gTauCacheUav;        ///< tauBuildMain output (same texture, UAV view).
+RWStructuredBuffer<float4> gTauDirBuf;  ///< [0].xyz = dominant light direction, written by tauDirMain.
+
 static const uint kMaxBounces = MAX_BOUNCES;
 static const bool kUseNEE = USE_NEE;
 static const bool kUseRussianRoulette = USE_RUSSIAN_ROULETTE;
@@ -416,7 +456,19 @@ float evalTargetLhat(
     const float gj = gScene.getGridVolume(inst).data.anisotropy;
     const float3 fp = HenyeyGreensteinPhaseFunction(gj).eval(wi, targetLight.dir);
     const float3 posJ = ray.origin + t * ray.dir;
-    const float tauShadow = volumeSampler.coarseOpticalDepth(Ray(posJ, targetLight.dir, 0.f, FLT_MAX));
+    // Cached tau (one trilinear fetch) vs live DDA walk: see the TauCB note.
+    // Inside USE_TAU_CACHE both paths stay compiled and gTauEnable picks at
+    // runtime, so the A/B is same-session; the define only exists so a
+    // no-envmap scene never references an unbindable texture.
+    float tauShadow;
+#if USE_TAU_CACHE
+    if (gTauEnable != 0)
+        tauShadow = gTauTex.SampleLevel(gTauSmp, (posJ - gTauOrigin) * gTauInvExtent, 0.f);
+    else
+        tauShadow = volumeSampler.coarseOpticalDepth(Ray(posJ, targetLight.dir, 0.f, FLT_MAX));
+#else
+    tauShadow = volumeSampler.coarseOpticalDepth(Ray(posJ, targetLight.dir, 0.f, FLT_MAX));
+#endif
     // Floored: deep points are lit by multiple scattering, which this
     // single-scatter target cannot see. Without the floor exp(-tau)
     // underflows to 0 and the target collapses.
@@ -1424,8 +1476,29 @@ void shadeMain(uint3 dispatchThreadId: SV_DispatchThreadID)
         const uint h9 = WaveActiveSum(gvsBrickHitsNow());
         const uint h11 = WaveActiveSum(gvsTapSkipsNow());
         const uint h10 = WaveActiveSum(gvsBrickMissesNow());
+
+        // ---- shadeMain DIVERGENCE PROBE (slots 42-45) ----
+        // Every lane here holds a REAL path (dense queue dispatch), so the
+        // idle-warp clustering that made main's divergence benign cannot help:
+        // any waste is path-LENGTH variance inside the warp, the thing
+        // per-bounce requeueing would fix (the queue infra already exists).
+        // Same identity as [LOOPOCC]: for a monotone-exit loop,
+        // sum(iters) / (max(iters) * 32) IS instantaneous lane occupancy.
+        // bounces = loop trips; work = total marching (cells + taps) so the
+        // two disagreeing would show bounce COUNT vs bounce COST divergence.
+        const uint sbSum = WaveActiveSum(bounce);
+        const uint sbMax = WaveActiveMax(bounce);
+        const uint swWork = gvsCellsNow() + gvsTapsNow();
+        const uint swSum = WaveActiveSum(swWork);
+        const uint swMax = WaveActiveMax(swWork);
+
         if (WaveIsFirstLane())
         {
+            if (sbSum > 0) InterlockedAdd(gRisStats[42], sbSum);
+            if (sbMax > 0) InterlockedAdd(gRisStats[43], sbMax);
+            if (swSum > 0) InterlockedAdd(gRisStats[44], swSum);
+            if (swMax > 0) InterlockedAdd(gRisStats[45], swMax);
+
             if (a > 0) InterlockedAdd(gRisStats[9], a);
             if (a2 > 0) InterlockedAdd(gRisStats[29], a2);
             if (b > 0) InterlockedAdd(gRisStats[10], b);
@@ -1453,3 +1526,54 @@ void argsMain()
     gDispatchArgs.Store3(0, uint3((n + 63u) / 64u, 1u, 1u));
 }
 #endif // USE_COMPACTION
+
+// ---------------------------------------------------------------------------
+// Sun-tau cache build (see the TauCB note for what this is and why it is
+// unbiased). Two dispatches, both trivial next to one frame of marching:
+// tauDirMain picks the direction, tauBuildMain walks one coarseOpticalDepth
+// per cache voxel - the SAME function the per-pixel path calls when the cache
+// is off, so a cache texel is byte-identical in semantics to the walk it
+// replaces. 64^3 voxels x ~19 cells is ~5M DDA cells per rebuild, vs the
+// 39.5M PER FRAME the live walks cost ([WORK] 2026-07-20).
+// ---------------------------------------------------------------------------
+
+/** Dominant light direction: luminance-weighted mean of 64 env importance
+    samples. One thread on purpose - no reduction plumbing for a 64-iteration
+    loop that runs once per rebuild. Fixed seed: the direction must not jitter
+    between rebuilds or the cache would shimmer for no variance benefit.
+*/
+[numthreads(1, 1, 1)]
+void tauDirMain()
+{
+    float3 acc = float3(0.f);
+    if (kUseEnvLight)
+    {
+        SampleGenerator sg = SampleGenerator(uint2(0, 0), 4211);
+        for (uint i = 0; i < 64; ++i)
+        {
+            EnvMapSample s = {};
+            if (gParams.envMapSampler.sample(sampleNext2D(sg), s) && s.pdf > 0.f)
+                acc += s.dir * (dot(s.Le, float3(0.2126f, 0.7152f, 0.0722f)) / s.pdf);
+        }
+    }
+    // Degenerate env (or none): straight up. The cache is target-only, so a
+    // wrong direction costs candidate-selection variance, never correctness.
+    const float3 dir = dot(acc, acc) > 1e-12f ? normalize(acc) : float3(0.f, 1.f, 0.f);
+    gTauDirBuf[0] = float4(dir, 1.f);
+}
+
+/** One coarseOpticalDepth walk per cache voxel, from voxel center to volume
+    exit toward the dominant light. Occupancy skip is left at its static
+    default here (no CB dependency); it only changes bake speed, not tau.
+*/
+[numthreads(4, 4, 4)]
+void tauBuildMain(uint3 tid: SV_DispatchThreadID)
+{
+    if (any(tid >= gTauDim)) return;
+    const float3 pos = gTauOrigin + (float3(tid) + 0.5f) * gTauCellSize;
+    VolumeInstanceSampler vs = {};
+    const float tau = vs.coarseOpticalDepth(Ray(pos, gTauDirBuf[0].xyz, 0.f, FLT_MAX));
+    // Clamp for R16F range; exp(-64) is 40 orders below the 1e-3 visibility
+    // floor the target applies, so nothing is lost.
+    gTauCacheUav[tid] = min(tau, 64.f);
+}

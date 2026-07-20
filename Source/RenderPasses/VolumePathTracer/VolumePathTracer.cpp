@@ -76,6 +76,9 @@ const char kRisTargetFloor[] = "risTargetFloor";
 const char kRouletteMinQ[] = "rouletteMinQ";
 const char kRouletteStartBounce[] = "rouletteStartBounce";
 const char kUseCompaction[] = "useCompaction";
+const char kUseTauCache[] = "useTauCache";
+const char kTauCacheRes[] = "tauCacheRes";
+const char kTauCacheInterval[] = "tauCacheInterval";
 } // namespace
 
 VolumePathTracer::VolumePathTracer(ref<Device> pDevice, const Properties& props) : RenderPass(pDevice)
@@ -154,6 +157,12 @@ void VolumePathTracer::parseProperties(const Properties& props)
             mRouletteStartBounce = (uint32_t)value;
         else if (key == kUseCompaction)
             mUseCompaction = value;
+        else if (key == kUseTauCache)
+            mUseTauCache = value;
+        else if (key == kTauCacheRes)
+            mTauCacheRes = std::clamp((uint32_t)value, 8u, 512u);
+        else if (key == kTauCacheInterval)
+            mTauCacheInterval = value;
         else
             logWarning("Unknown property '{}' in VolumePathTracer properties.", key);
     }
@@ -194,6 +203,9 @@ Properties VolumePathTracer::getProperties() const
     props[kRouletteMinQ] = mRouletteMinQ;
     props[kRouletteStartBounce] = mRouletteStartBounce;
     props[kUseCompaction] = mUseCompaction;
+    props[kUseTauCache] = mUseTauCache;
+    props[kTauCacheRes] = mTauCacheRes;
+    props[kTauCacheInterval] = mTauCacheInterval;
     return props;
 }
 
@@ -271,6 +283,11 @@ void VolumePathTracer::setScene(RenderContext* pRenderContext, const ref<Scene>&
     mBrickBlasesValid = false;
     mpTailTex = nullptr;
     mTailMinVoxWorld = 0.f;
+    mpTauCache = nullptr;
+    mpTauDir = nullptr;
+    mpPassTauDir = nullptr;
+    mpPassTauBuild = nullptr;
+    mTauLastBuildFrame = kTauNeverBuilt;
 
     const auto& volumes = mpScene->getGridVolumes();
     for (const auto& pVolume : volumes)
@@ -790,6 +807,95 @@ void VolumePathTracer::bakeMergedTail()
     );
 }
 
+void VolumePathTracer::buildTauCache(RenderContext* pRenderContext)
+{
+    // GPU bake, unlike the tail's CPU bake: tauBuildMain calls the exact
+    // coarseOpticalDepth the live path calls, so a cache texel is semantically
+    // identical to the walk it replaces - no second implementation to drift.
+    FALCOR_ASSERT(mpPassTauDir && mpPassTauBuild);
+
+    // World bounds of the union of grid volumes (tail-bake convention: cell
+    // size from the longest axis, per-axis counts from the extents).
+    constexpr float kFloatMax = std::numeric_limits<float>::max();
+    AABB worldBounds;
+    for (const auto& pVolume : mpScene->getGridVolumes())
+    {
+        if (!pVolume->getDensityGrid()) continue;
+        worldBounds.include(pVolume->getBounds());
+    }
+    if (!worldBounds.valid()) return;
+    const float3 extent = worldBounds.extent();
+    const float maxExtent = std::max(extent.x, std::max(extent.y, extent.z));
+    if (maxExtent <= 0.f) return;
+
+    const float cell = maxExtent / float(std::max(mTauCacheRes, 8u));
+    const uint3 dim = uint3(
+        std::max(1u, (uint32_t)std::ceil(extent.x / cell)),
+        std::max(1u, (uint32_t)std::ceil(extent.y / cell)),
+        std::max(1u, (uint32_t)std::ceil(extent.z / cell))
+    );
+
+    mTauOrigin = worldBounds.minPoint;
+    mTauCellSize = float3(cell);
+    mTauInvExtent = float3(1.f) / (float3(dim) * cell);
+    mTauDim = dim;
+
+    if (!mpTauCache || mpTauCache->getWidth() != dim.x || mpTauCache->getHeight() != dim.y || mpTauCache->getDepth() != dim.z)
+    {
+        mpTauCache = mpDevice->createTexture3D(
+            dim.x, dim.y, dim.z, ResourceFormat::R16Float, 1, nullptr,
+            ResourceBindFlags::UnorderedAccess | ResourceBindFlags::ShaderResource
+        );
+        mpTauCache->setName("VolumePathTracer::mpTauCache");
+    }
+    if (!mpTauDir)
+    {
+        mpTauDir = mpDevice->createStructuredBuffer(
+            sizeof(float4), 1, ResourceBindFlags::UnorderedAccess | ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal
+        );
+        mpTauDir->setName("VolumePathTracer::mpTauDir");
+    }
+    if (!mpTauSampler)
+    {
+        Sampler::Desc sd;
+        sd.setFilterMode(TextureFilteringMode::Linear, TextureFilteringMode::Linear, TextureFilteringMode::Linear);
+        sd.setAddressingMode(TextureAddressingMode::Clamp, TextureAddressingMode::Clamp, TextureAddressingMode::Clamp);
+        mpTauSampler = mpDevice->createSampler(sd);
+    }
+
+    // Both build passes bind only what they reference (reflection strips the
+    // rest of the module), so this stays minimal on purpose.
+    auto bindBuild = [&](const ShaderVar& var)
+    {
+        if (auto v = var.findMember("gTauDirBuf"); v.isValid())
+            v = mpTauDir;
+        if (auto v = var.findMember("gTauCacheUav"); v.isValid())
+            v = mpTauCache;
+        if (auto tcb = var.findMember("TauCB"); tcb.isValid())
+        {
+            tcb["gTauOrigin"] = mTauOrigin;
+            tcb["gTauCellSize"] = mTauCellSize;
+            tcb["gTauInvExtent"] = mTauInvExtent;
+            tcb["gTauDim"] = mTauDim;
+            tcb["gTauEnable"] = 0u; // Unused by the build kernels.
+        }
+    };
+
+    bindBuild(mpPassTauDir->getRootVar());
+    mpPassTauDir->execute(pRenderContext, uint3(1, 1, 1));
+    pRenderContext->uavBarrier(mpTauDir.get());
+
+    bindBuild(mpPassTauBuild->getRootVar());
+    mpPassTauBuild->execute(pRenderContext, uint3(dim));
+    pRenderContext->uavBarrier(mpTauCache.get());
+
+    mTauLastBuildFrame = mFrameCount;
+    logInfo(
+        "VolumePathTracer: tau cache baked - {}x{}x{} cells of {:.1f} world units ({} walks).",
+        dim.x, dim.y, dim.z, cell, dim.x * dim.y * dim.z
+    );
+}
+
 void VolumePathTracer::prepareProgram(RenderContext* pRenderContext)
 {
     FALCOR_ASSERT(mpScene && mpVolumeSampler);
@@ -836,6 +942,10 @@ void VolumePathTracer::prepareProgram(RenderContext* pRenderContext)
     // stays a single fused kernel, byte-identical ground truth).
     const bool compactionCompiled = mUseRIS && mUseCompaction;
     defines.add("USE_COMPACTION", compactionCompiled ? "1" : "0");
+    // Sun-tau cache: compiled only when it can actually be built (env light
+    // present), so a no-envmap scene never references an unbindable texture.
+    // The RUNTIME switch is gTauEnable in TauCB, not this define.
+    defines.add("USE_TAU_CACHE", (mUseRIS && mUseTauCache && mpEnvMapSampler) ? "1" : "0");
     // Size the sampler's per-thread arrays to the scene, not to a fixed 16.
     // These arrays dominate register/scratch usage, and this pass measured as
     // spill-bound rather than work-bound, so oversizing them costs real time.
@@ -860,6 +970,18 @@ void VolumePathTracer::prepareProgram(RenderContext* pRenderContext)
     {
         mpPassShade = ComputePass::create(mpDevice, makeDesc("shadeMain"), defines, true);
         mpPassArgs = ComputePass::create(mpDevice, makeDesc("argsMain"), defines, true);
+    }
+
+    // Sun-tau cache build passes (same module + DefineList, so the bake's
+    // coarseOpticalDepth agrees with the live path on every feature define).
+    // A fresh program means a fresh bake: defines can change the field.
+    mpPassTauDir = nullptr;
+    mpPassTauBuild = nullptr;
+    mTauLastBuildFrame = kTauNeverBuilt;
+    if (mUseRIS && mUseTauCache && mpEnvMapSampler)
+    {
+        mpPassTauDir = ComputePass::create(mpDevice, makeDesc("tauDirMain"), defines, true);
+        mpPassTauBuild = ComputePass::create(mpDevice, makeDesc("tauBuildMain"), defines, true);
     }
 
     // RIS stat buffers. Always created (and always bound) so the shader's UAV
@@ -899,6 +1021,10 @@ void VolumePathTracer::prepareProgram(RenderContext* pRenderContext)
     bindStatics(mpPass->getRootVar());
     if (mpPassShade)
         bindStatics(mpPassShade->getRootVar());
+    if (mpPassTauDir)
+        bindStatics(mpPassTauDir->getRootVar());
+    if (mpPassTauBuild)
+        bindStatics(mpPassTauBuild->getRootVar());
 }
 
 void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& renderData)
@@ -938,6 +1064,18 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
     if (!mpPass)
         prepareProgram(pRenderContext);
     FALCOR_ASSERT(mpPass);
+
+    // Sun-tau cache: bake on first use, then only on the interval (0 = never
+    // again - the scene and env are static). The bake is two dispatches and
+    // ~5M DDA cells at the default 64-cell res, vs 39.5M cells per frame for
+    // the live walks it replaces.
+    if (mpPassTauBuild)
+    {
+        const bool needBuild = (mTauLastBuildFrame == kTauNeverBuilt) ||
+                               (mTauCacheInterval > 0 && mFrameCount - mTauLastBuildFrame >= mTauCacheInterval);
+        if (needBuild)
+            buildTauCache(pRenderContext);
+    }
 
     // Tell the shaders which optional outputs are actually connected.
     mpPass->getProgram()->addDefines(getValidResourceDefines(kOutputChannels, renderData));
@@ -1057,6 +1195,25 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
                 v = mpReservoir[(mReservoirFrame + 1) & 1];
         }
 
+        // Sun-tau cache: baked tau grid + constants. gTauEnable is the
+        // runtime A/B switch; both paths stay compiled (measurement
+        // discipline: same-session toggle, no recompile).
+        {
+            const bool tauUsable = mpTauCache != nullptr && mTauLastBuildFrame != kTauNeverBuilt;
+            if (auto v = var.findMember("gTauTex"); v.isValid())
+                v = mpTauCache;
+            if (auto v = var.findMember("gTauSmp"); v.isValid())
+                v = mpTauSampler;
+            if (auto tcb = var.findMember("TauCB"); tcb.isValid())
+            {
+                tcb["gTauOrigin"] = mTauOrigin;
+                tcb["gTauCellSize"] = mTauCellSize;
+                tcb["gTauInvExtent"] = mTauInvExtent;
+                tcb["gTauDim"] = mTauDim;
+                tcb["gTauEnable"] = (tauUsable && mTauCacheApply) ? 1u : 0u;
+            }
+        }
+
         // Merged coarse tail: baked summed-field grid + its constants.
         if (mUseMergedTail && mpTailTex)
         {
@@ -1090,9 +1247,49 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
         }
     };
 
+    // Roulette sweep driver (see the member note). Runs the PT Enhanced
+    // 6.2.4 experiment unattended: schedule = baseline, then minQ
+    // {0.10, 0.15, 0.30} at the current start bounce, then {0.05, 0.15, 0.30}
+    // at start bounce 2. Each step gets mSweepFramesPerStep frames and one
+    // forced [SWEEP] readback on its last frame.
+    bool sweepLogFrame = false;
+    if (mSweepActive && mFrameCount >= mSweepStartFrame)
+    {
+        static constexpr float kSweepQ[6] = {0.10f, 0.15f, 0.30f, 0.05f, 0.15f, 0.30f};
+        static constexpr uint32_t kSweepB[6] = {3u, 3u, 3u, 2u, 2u, 2u};
+        constexpr uint32_t kSweepSteps = 7; // baseline + 6 table entries.
+
+        const uint32_t rel = mFrameCount - mSweepStartFrame;
+        const uint32_t step = rel / mSweepFramesPerStep;
+        if (step >= kSweepSteps)
+        {
+            mRouletteMinQ = mSweepSavedMinQ;
+            mRouletteStartBounce = mSweepSavedStartBounce;
+            mSweepActive = false;
+            mOptionsChanged = true;
+            logInfo("[SWEEP] done - restored minQ {:.2f} startBounce {}.", mRouletteMinQ, mRouletteStartBounce);
+        }
+        else
+        {
+            const float q = (step == 0) ? mSweepSavedMinQ : kSweepQ[step - 1];
+            const uint32_t b = (step == 0) ? mSweepSavedStartBounce : kSweepB[step - 1];
+            if (q != mRouletteMinQ || b != mRouletteStartBounce)
+            {
+                mRouletteMinQ = q;
+                mRouletteStartBounce = b;
+                // Step boundary: reset accumulation so each step's image can
+                // be judged for variance on its own.
+                mOptionsChanged = true;
+            }
+            sweepLogFrame = (rel % mSweepFramesPerStep) == mSweepFramesPerStep - 1;
+        }
+    }
+
     // Log the RIS branch histogram every mRisStatsInterval frames. The readback
     // needs a full GPU sync, so it is throttled rather than run every frame.
-    const bool logThisFrame = (mLogWorkStats || (mUseRIS && mLogRisStats)) && mpRisStats && (mFrameCount % mRisStatsInterval == 0);
+    const bool logThisFrame =
+        ((mLogWorkStats || (mUseRIS && mLogRisStats)) && mpRisStats && (mFrameCount % mRisStatsInterval == 0)) ||
+        (sweepLogFrame && mpRisStats);
     if (logThisFrame)
         pRenderContext->clearUAV(mpRisStats->getUAV().get(), uint4(0, 0, 0, 0));
 
@@ -1211,6 +1408,35 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
                     "| coarseDDA occ {:.3f} laneIters {} warpIters {}",
                     mFrameCount, rqOcc, s[38], s[39], ddaOcc, s[40], s[41]
                 );
+
+                // shadeMain path-length divergence. Unlike main, every lane
+                // holds a real path, so LOW occupancy here is directly the win
+                // available to per-bounce requeueing (wavefront scheduling):
+                // bounceOcc low + workOcc low = warps idle behind their longest
+                // path; both near 1.0 = roulette keeps warps coherent and the
+                // restructuring is not worth building.
+                const double sbOcc = s[43] > 0 ? double(s[42]) / (double(s[43]) * 32.0) : 0.0;
+                const double swOcc = s[45] > 0 ? double(s[44]) / (double(s[45]) * 32.0) : 0.0;
+                logInfo(
+                    "[SHADEOCC] frame {} | bounces occ {:.3f} laneSum {} warpMaxSum {} "
+                    "| march work occ {:.3f} laneSum {} warpMaxSum {}",
+                    mFrameCount, sbOcc, s[42], s[43], swOcc, s[44], s[45]
+                );
+
+                // One line per sweep step, greppable as a table. warpMaxSum is
+                // the number the sweep exists to move (the warp critical path);
+                // occ is the derived utilisation; gpuMs is same-session here so
+                // it is actually comparable across steps for once.
+                if (sweepLogFrame)
+                {
+                    const uint32_t step = (mFrameCount - mSweepStartFrame) / mSweepFramesPerStep;
+                    logInfo(
+                        "[SWEEP] step {}/7 minQ {:.2f} startB {} | bounces occ {:.3f} laneSum {} warpMaxSum {} "
+                        "| work occ {:.3f} | shadeCells+taps {} | gpuMs {:.3f}",
+                        step + 1, mRouletteMinQ, mRouletteStartBounce,
+                        sbOcc, s[42], s[43], swOcc, uint64_t(s[44]), mLastGpuMs
+                    );
+                }
 
                 const double px = double(pixels);
                 // Per-pixel averages: these are the units that explain the ms.
@@ -1398,6 +1624,53 @@ void VolumePathTracer::renderUI(Gui::Widgets& widget)
             );
             group.var("Roulette start bounce", mRouletteStartBounce, 0u, 64u);
             group.tooltip("Roulette applies only past this bounce index. Lower = shorter paths.", true);
+
+            if (!mSweepActive)
+            {
+                if (group.button("Run roulette sweep"))
+                {
+                    mSweepSavedMinQ = mRouletteMinQ;
+                    mSweepSavedStartBounce = mRouletteStartBounce;
+                    mSweepStartFrame = mFrameCount + 1; // Controller waits until reached (no wrap).
+                    mSweepActive = true;
+                    if (!mLogWorkStats)
+                    {
+                        // The sweep reads the shadeMain divergence counters,
+                        // which only compile under work stats.
+                        mLogWorkStats = true;
+                        mpPass = nullptr;
+                        logInfo("[SWEEP] work stats were off - enabling them for the sweep (recompiles once).");
+                    }
+                    logInfo(
+                        "[SWEEP] starting: baseline ({:.2f}, {}) then minQ {{0.10, 0.15, 0.30}} @ startB {} "
+                        "and {{0.05, 0.15, 0.30}} @ startB 2, {} frames per step.",
+                        mSweepSavedMinQ, mSweepSavedStartBounce, mSweepSavedStartBounce, mSweepFramesPerStep
+                    );
+                }
+                group.tooltip(
+                    "ReSTIR PT Enhanced 6.2.4 experiment, unattended: steps the two\n"
+                    "roulette CB values through 7 configs, ~1 [SWEEP] log line each,\n"
+                    "then restores. Same session, no recompiles between steps.\n"
+                    "Watch: warpMaxSum down + bounces occ up = the tail is roulette-\n"
+                    "tunable and per-bounce requeueing is NOT worth building.\n"
+                    "Judge the image per step too - this knob trades variance.",
+                    true
+                );
+                group.var("Sweep frames/step", mSweepFramesPerStep, 16u, 600u);
+            }
+            else
+            {
+                const uint32_t step =
+                    mFrameCount >= mSweepStartFrame ? std::min((mFrameCount - mSweepStartFrame) / mSweepFramesPerStep + 1, 7u) : 1u;
+                group.text(fmt::format("Sweep running: step {}/7 (minQ {:.2f}, startB {})", step, mRouletteMinQ, mRouletteStartBounce));
+                if (group.button("Cancel sweep"))
+                {
+                    mRouletteMinQ = mSweepSavedMinQ;
+                    mRouletteStartBounce = mSweepSavedStartBounce;
+                    mSweepActive = false;
+                    mOptionsChanged = true;
+                }
+            }
             group.tooltip(
                 "Defensive floor on the RIS target, relative to a fully-lit isotropic\n"
                 "vertex. Bounds the L/Lhat firefly mechanism (matrix: isolated 800-2200x\n"
@@ -1454,6 +1727,32 @@ void VolumePathTracer::renderUI(Gui::Widgets& widget)
                 "Takes effect on the next TLAS refresh - no shader rebuild.",
                 true
             );
+        }
+
+        rebuild |= group.checkbox("Tau shadow cache", mUseTauCache);
+        group.tooltip(
+            "Nubis3 (SIGGRAPH 2023) / UE transmittance-volume port: the RIS\n"
+            "target's per-candidate shadow walk becomes ONE trilinear fetch of\n"
+            "precomputed optical depth toward the dominant env direction.\n\n"
+            "The walk it replaces measured 39.5M DDA cells/frame at 0.342 SIMD\n"
+            "occupancy - 3.6x the warp-slots of the entire RayQuery traversal\n"
+            "([LOOPOCC] 2026-07-20). UNBIASED: tau only shapes which candidate\n"
+            "wins and the estimator divides the target back out, so cache\n"
+            "coarseness costs selection variance, never the converged image.\n\n"
+            "This checkbox COMPILES the feature; A/B with the runtime toggle\n"
+            "below (no recompile, same-session per measurement discipline).",
+            true
+        );
+        if (mUseTauCache)
+        {
+            group.checkbox("Apply tau cache (A/B)", mTauCacheApply);
+            group.tooltip("Runtime switch (CB uniform). OFF = live DDA walk, same session.", true);
+            if (group.var("Tau cache res", mTauCacheRes, 8u, 512u))
+                mTauLastBuildFrame = kTauNeverBuilt;
+            group.tooltip("Longest-axis cell count. Changing it rebakes next frame.", true);
+            if (group.var("Tau rebuild interval", mTauCacheInterval, 0u, 600u))
+                mTauLastBuildFrame = kTauNeverBuilt;
+            group.tooltip("Frames between rebakes. 0 = bake once (static scene + env).", true);
         }
 
         rebuild |= group.checkbox("Merged coarse tail", mUseMergedTail);
