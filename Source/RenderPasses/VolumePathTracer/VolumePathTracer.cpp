@@ -1173,13 +1173,20 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
                 logInfo(
                     "[COST] frame {} | per-pixel cells/taps: escapeT {:.1f}/{:.1f} candGen {:.1f}/{:.1f} "
                     "shadeNEE {:.1f}/{:.1f} sweep {:.1f}/{:.1f} | overlap steps {:.2f} lookups {:.2f} "
-                    "| tailRays {:.2f}/entry | totals: cells {} taps {}",
+                    "| tailRays {:.2f}/entry | totals: cells {} taps {} "
+                    "| brickCache hit {:.1f}% ({}/{})",
                     mFrameCount,
                     s[16] / px, s[17] / px, s[18] / px, s[19] / px,
                     s[20] / px, s[21] / px, s[13] / px, s[14] / px,
                     s[22] / px, s[23] / px,
                     s[15] > 0 ? double(s[24]) / s[15] : 0.0,
-                    totalCells, totalTaps
+                    totalCells, totalTaps,
+                    // Coherence of the brick-coherent tap path. The change is
+                    // only worth keeping if this is high: a hit skips both the
+                    // rangeMean and indirection loads AND removes the dependent
+                    // hop into atlasTex. A low rate means revert, not tune.
+                    (s[27] + s[28]) > 0 ? 100.0 * double(s[27]) / double(s[27] + s[28]) : 0.0,
+                    s[27], s[27] + s[28]
                 );
 
                 // What the projected-error LoD actually decided this frame:

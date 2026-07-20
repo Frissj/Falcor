@@ -115,6 +115,27 @@ uint gvsTapsNow()
     return 0;
 #endif
 }
+/** Brick-cache coherence. The whole value of the brick-coherent tap path rests
+    on consecutive taps landing in the same 8^3 brick; hits/(hits+misses) is that
+    assumption made measurable rather than believed. A low hit rate means the
+    cache is dead weight and should be reverted, not tuned.
+*/
+uint gvsBrickHitsNow()
+{
+#if GRID_VOLUME_SAMPLER_STATS
+    return gGvsStatBrickHits;
+#else
+    return 0;
+#endif
+}
+uint gvsBrickMissesNow()
+{
+#if GRID_VOLUME_SAMPLER_STATS
+    return gGvsStatBrickMisses;
+#else
+    return 0;
+#endif
+}
 
 /** Resource-bearing parameters must live in a ParameterBlock, not as bare
     globals. EnvMapSampler holds a SamplerState and a Texture2D; declaring it at
@@ -1072,6 +1093,13 @@ void main(uint3 dispatchThreadId: SV_DispatchThreadID)
         const uint h6 = WaveActiveSum(volumeSampler.statOverlapSteps);
         const uint h7 = WaveActiveSum(volumeSampler.statOverlapLookups);
         const uint h8 = WaveActiveSum(volumeSampler.statTailRays);
+        // Wave-reduce like every counter above. Reading these INSIDE the
+        // WaveIsFirstLane branch counted lane 0 only and undercounted by the wave
+        // width - that is the entire "brick cache only covers 3% of taps" result;
+        // it was a counting bug, not a coverage problem. Wave ops must be issued
+        // with all lanes active, so they belong here, not below.
+        const uint h9 = WaveActiveSum(gvsBrickHitsNow());
+        const uint h10 = WaveActiveSum(gvsBrickMissesNow());
         if (WaveIsFirstLane())
         {
             if (a > 0) InterlockedAdd(gRisStats[9], a);
@@ -1090,6 +1118,8 @@ void main(uint3 dispatchThreadId: SV_DispatchThreadID)
             if (h6 > 0) InterlockedAdd(gRisStats[22], h6);
             if (h7 > 0) InterlockedAdd(gRisStats[23], h7);
             if (h8 > 0) InterlockedAdd(gRisStats[24], h8);
+            if (h9 > 0) InterlockedAdd(gRisStats[27], h9);
+            if (h10 > 0) InterlockedAdd(gRisStats[28], h10);
         }
     }
 #endif
@@ -1206,6 +1236,13 @@ void shadeMain(uint3 dispatchThreadId: SV_DispatchThreadID)
         const uint h6 = WaveActiveSum(volumeSampler.statOverlapSteps);
         const uint h7 = WaveActiveSum(volumeSampler.statOverlapLookups);
         const uint h8 = WaveActiveSum(volumeSampler.statTailRays);
+        // Wave-reduce like every counter above. Reading these INSIDE the
+        // WaveIsFirstLane branch counted lane 0 only and undercounted by the wave
+        // width - that is the entire "brick cache only covers 3% of taps" result;
+        // it was a counting bug, not a coverage problem. Wave ops must be issued
+        // with all lanes active, so they belong here, not below.
+        const uint h9 = WaveActiveSum(gvsBrickHitsNow());
+        const uint h10 = WaveActiveSum(gvsBrickMissesNow());
         if (WaveIsFirstLane())
         {
             if (a > 0) InterlockedAdd(gRisStats[9], a);
@@ -1216,6 +1253,8 @@ void shadeMain(uint3 dispatchThreadId: SV_DispatchThreadID)
             if (h6 > 0) InterlockedAdd(gRisStats[22], h6);
             if (h7 > 0) InterlockedAdd(gRisStats[23], h7);
             if (h8 > 0) InterlockedAdd(gRisStats[24], h8);
+            if (h9 > 0) InterlockedAdd(gRisStats[27], h9);
+            if (h10 > 0) InterlockedAdd(gRisStats[28], h10);
         }
     }
 #endif

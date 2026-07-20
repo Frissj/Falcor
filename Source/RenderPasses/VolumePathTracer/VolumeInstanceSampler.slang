@@ -613,14 +613,86 @@ struct VolumeInstanceSampler
             statSegments++;
 
             float t = a;
+            if (countbits(mask) == 1)
+            {
+                // SINGLE COVERING INSTANCE - the overwhelmingly common case.
+                //
+                // The general path below re-fetches getGridVolume + getGrid for
+                // every instance on EVERY cell step, even though both are
+                // loop-invariant for the whole walk. That refetch is what inflates
+                // the inlined body and drives the NOINST 38% instruction-fetch
+                // stall measured on this loop. With one instance there is nothing
+                // to min over, so the volume/grid are hoisted out of the cell walk
+                // entirely and the inner instance loop disappears.
+                //
+                // This is a SPECIALIZATION, not an approximation: identical
+                // arithmetic, identical accumulation order, identical forward-
+                // progress guard. With one bit set, tExit = min(b, stepDDA(..))
+                // is exactly what the general form computes.
+                const uint i = firstbitlow(mask);
+                const GridVolume gv = gScene.getGridVolume(list.ids[i]);
+                Grid grid;
+                gScene.getGrid(gv.getDensityGrid(), grid);
+                // SOFTWARE-PIPELINED mean-field fetch.
+                //
+                // instanceSigmaMean is a single rangeMeanTex.Load per cell and
+                // profiles at LONG SCOREBOARD 98% - it is pure dependent-load
+                // latency, not bandwidth. Caching cannot help: the DDA visits a
+                // NEW coarse texel every step, so there is no reuse to exploit.
+                // What does help is issuing the load earlier. The naive form
+                // loads sigma and consumes it two instructions later, so the warp
+                // stalls for the full latency every cell.
+                //
+                // Here the NEXT cell's load is issued before the current cell's
+                // sigma is consumed, giving the memory system a whole iteration
+                // to cover. Same values, same order, same accumulation - only the
+                // issue point moves.
+                //
+                // The final iteration issues one extra load past the walk whose
+                // result is discarded. Out-of-range Load returns 0 and it never
+                // reaches tau, so this is harmless; it is the standard cost of a
+                // pipelined prologue/epilogue.
+                float3 p = ipos[i] + idir[i] * t;
+                float sigma = instanceSigmaMean(gv, grid, p);
+                while (t < b)
+                {
+                    float tExit = min(b, gvs.stepDDA(ipos[i], ri[i], p, kRisMip));
+                    if (tExit <= t) tExit = min(b, t + max(1e-4f, abs(t) * 1e-5f));
+                    const float3 pNext = ipos[i] + idir[i] * tExit;
+                    const float sigmaNext = instanceSigmaMean(gv, grid, pNext);
+                    statCoarseCells++;
+                    tau += sigma * (tExit - t);
+                    t = tExit;
+                    p = pNext;
+                    sigma = sigmaNext;
+                }
+                continue;
+            }
             while (t < b)
             {
                 // Cell exit = nearest coarse-cell boundary over covering instances.
                 float tExit = b;
                 float sigma = 0.f;
-                for (uint i = 0; i < list.count; ++i)
+                // Iterate only the SET bits of mask instead of scanning all
+                // list.count instances and skipping with a continue.
+                //
+                // WHY: this loop is the single largest item in the kernel
+                // (~13.6% of all SM samples across lines 621-629), and its top
+                // stalls are BRANCH 31% / SELECT 36% / NOINST 38% - divergence
+                // and instruction fetch, NOT memory. The old form issued the
+                // loop-control and mask test for every one of the up-to-9
+                // instances even though typically one covers, so most lanes did
+                // nothing but branch. firstbitlow + clear-lowest-bit visits
+                // exactly the covering instances, which cuts both the branch
+                // count and the inlined body size that drives NOINST.
+                //
+                // Identical results: same instances, same order (ascending bit
+                // index), same accumulation sequence into sigma and tExit.
+                uint m = mask;
+                while (m != 0)
                 {
-                    if ((mask & (1u << i)) == 0) continue;
+                    const uint i = firstbitlow(m);
+                    m &= m - 1;
                     const GridVolume gv = gScene.getGridVolume(list.ids[i]);
                     Grid grid;
                     gScene.getGrid(gv.getDensityGrid(), grid);
@@ -807,18 +879,22 @@ struct VolumeInstanceSampler
 
                         const float3 posW = ray.origin + tj * ray.dir;
                         const float3 u = sampleNext3D(sg);
-                        float densities[kMaxInstances];
+                        // No densities[] array: the selection pass below recomputes
+                        // instanceDensity() from the same (posW, u), both of which are
+                        // hoisted above this loop, so no RNG state is consumed twice.
+                        // Storing 9 floats live across the branch costs registers in
+                        // EVERY inlined copy of this function, because allocation is the
+                        // max over all paths -- including this overlap path, which never
+                        // executes in the shipping config (statOverlapSteps == 0).
                         float dSum = 0.f;
                         for (uint i = 0; i < list.count; ++i)
                         {
-                            densities[i] = 0.f;
                             if ((mask & (1u << i)) == 0) continue;
                             const GridVolume gv = gScene.getGridVolume(list.ids[i]);
                             Grid grid;
                             gScene.getGrid(gv.getDensityGrid(), grid);
                             statOverlapLookups++;
-                            densities[i] = instanceDensity(gv, grid, posW, u);
-                            dSum += densities[i];
+                            dSum += instanceDensity(gv, grid, posW, u);
                         }
 
                         if (sampleNext1D(sg) * majSum < dSum)
@@ -830,8 +906,11 @@ struct VolumeInstanceSampler
                             for (uint i = 0; i < list.count; ++i)
                             {
                                 if ((mask & (1u << i)) == 0) continue;
+                                const GridVolume gv = gScene.getGridVolume(list.ids[i]);
+                                Grid grid;
+                                gScene.getGrid(gv.getDensityGrid(), grid);
                                 chosen = i;
-                                pick -= densities[i];
+                                pick -= instanceDensity(gv, grid, posW, u);
                                 if (pick <= 0.f) break;
                             }
                             cands.t[cands.count] = tj;
@@ -873,18 +952,18 @@ struct VolumeInstanceSampler
 
             const float3 posW = ray.origin + t * ray.dir;
             const float3 u = sampleNext3D(sg);
-            float densities[kMaxInstances];
+            // See the note at the first overlap site: densities[] is recomputed in the
+            // selection pass instead of stored, to keep it out of the register
+            // high-water mark of every function this is inlined into.
             float dSum = 0.f;
             for (uint i = 0; i < list.count; ++i)
             {
-                densities[i] = 0.f;
                 if ((mask & (1u << i)) == 0) continue;
                 const GridVolume gridVolume = gScene.getGridVolume(list.ids[i]);
                 Grid densityGrid;
                 gScene.getGrid(gridVolume.getDensityGrid(), densityGrid);
                 statOverlapLookups++;
-                densities[i] = instanceDensity(gridVolume, densityGrid, posW, u);
-                dSum += densities[i];
+                dSum += instanceDensity(gridVolume, densityGrid, posW, u);
             }
 
             // Real collision with probability dSum / majSum.
@@ -897,8 +976,11 @@ struct VolumeInstanceSampler
                 for (uint i = 0; i < list.count; ++i)
                 {
                     if ((mask & (1u << i)) == 0) continue;
+                    const GridVolume gridVolume = gScene.getGridVolume(list.ids[i]);
+                    Grid densityGrid;
+                    gScene.getGrid(gridVolume.getDensityGrid(), densityGrid);
                     chosen = i;
-                    pick -= densities[i];
+                    pick -= instanceDensity(gridVolume, densityGrid, posW, u);
                     if (pick <= 0.f) break;
                 }
                 ds.t = t;
@@ -1394,18 +1476,18 @@ struct VolumeInstanceSampler
                     const float3 posW = ray.origin + tj * ray.dir;
                     const float3 u = sampleNext3D(sg);
                     const uint mask = coveringMask(list, tj);
-                    float densities[kMaxInstances];
+                    // See the note at the first overlap site: densities[] is recomputed
+                    // in the selection pass instead of stored, to keep it out of the
+                    // register high-water mark.
                     float dSum = 0.f;
                     for (uint i = 0; i < list.count; ++i)
                     {
-                        densities[i] = 0.f;
                         if ((mask & (1u << i)) == 0) continue;
                         const GridVolume gv = gScene.getGridVolume(list.ids[i]);
                         Grid grid;
                         gScene.getGrid(gv.getDensityGrid(), grid);
                         statOverlapLookups++;
-                        densities[i] = instanceDensity(gv, grid, posW, u);
-                        dSum += densities[i];
+                        dSum += instanceDensity(gv, grid, posW, u);
                     }
 
                     if (sampleNext1D(sg) * sigmaMaj < dSum)
@@ -1415,8 +1497,11 @@ struct VolumeInstanceSampler
                         for (uint i = 0; i < list.count; ++i)
                         {
                             if ((mask & (1u << i)) == 0) continue;
+                            const GridVolume gv = gScene.getGridVolume(list.ids[i]);
+                            Grid grid;
+                            gScene.getGrid(gv.getDensityGrid(), grid);
                             chosen = i;
-                            pick -= densities[i];
+                            pick -= instanceDensity(gv, grid, posW, u);
                             if (pick <= 0.f) break;
                         }
                         ds.t = tj;
@@ -1479,18 +1564,18 @@ struct VolumeInstanceSampler
                         const float3 posW = ray.origin + tj * ray.dir;
                         const float3 u = sampleNext3D(sg);
                         const uint mask = coveringMask(list, tj);
-                        float densities[kMaxInstances];
+                        // See the note at the first overlap site: densities[] is
+                        // recomputed in the selection pass instead of stored, to keep it
+                        // out of the register high-water mark.
                         float dSum = 0.f;
                         for (uint i = 0; i < list.count; ++i)
                         {
-                            densities[i] = 0.f;
                             if ((mask & (1u << i)) == 0) continue;
                             const GridVolume gv = gScene.getGridVolume(list.ids[i]);
                             Grid grid;
                             gScene.getGrid(gv.getDensityGrid(), grid);
                             statOverlapLookups++;
-                            densities[i] = instanceDensity(gv, grid, posW, u);
-                            dSum += densities[i];
+                            dSum += instanceDensity(gv, grid, posW, u);
                         }
 
                         if (sampleNext1D(sg) * sigmaMaj < dSum)
@@ -1500,8 +1585,11 @@ struct VolumeInstanceSampler
                             for (uint i = 0; i < list.count; ++i)
                             {
                                 if ((mask & (1u << i)) == 0) continue;
+                                const GridVolume gv = gScene.getGridVolume(list.ids[i]);
+                                Grid grid;
+                                gScene.getGrid(gv.getDensityGrid(), grid);
                                 chosen = i;
-                                pick -= densities[i];
+                                pick -= instanceDensity(gv, grid, posW, u);
                                 if (pick <= 0.f) break;
                             }
                             cands.t[cands.count] = tj;

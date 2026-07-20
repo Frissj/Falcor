@@ -84,6 +84,75 @@ void gvsStatTap()
 #endif
 }
 
+// ---------------------------------------------------------------------------
+// Brick-coherent density-tap cache.
+//
+// WHY: Grid::lookupIndexTex is the hottest line in the volume kernel (~9.8% of
+// all SM samples; top stall LONG SCOREBOARD at 86%). It is NOT bandwidth -
+// L1TEX and VRAM both sit near 10% - it is LATENCY: atlasTex cannot issue until
+// indirectionTex returns, so every tap pays a serialized two-hop dependent
+// chase. Holding (brick, ptr, range) across taps removes both the rangeMean and
+// indirection loads on a hit AND collapses the dependent hop, because the atlas
+// address becomes computable from registers immediately.
+//
+// This is UE's Nanite Foliage idea (NaniteRasterizer.usf:1278 stages brick data
+// in groupshared so the per-voxel loop never re-chases indirection), kept in
+// registers instead of LDS because VNA's shared memory is already ~82 KB/SM
+// against a ~100 KB ceiling.
+//
+// CORRECTNESS - READ BEFORE MOVING THESE:
+// the cached ptr/range are only valid FOR ONE Grid. Two volume instances can
+// produce the same brick coordinate with completely different atlas pointers, so
+// a cache that outlives a single grid returns silently wrong densities - wrong
+// image, no crash, no counter. These are reset at the entry of each walk, where
+// the grid is fixed for the duration. Do not hoist the reset outward, and do not
+// reuse this across a loop that switches instances.
+// ---------------------------------------------------------------------------
+static int3 gGvsBrickKey = int3(-1, -1, -1); ///< Cached brick coord; sentinel no valid index produces.
+static uint3 gGvsBrickPtr = uint3(0, 0, 0);  ///< Cached indirection result for gGvsBrickKey.
+static float2 gGvsBrickRange = float2(0.f, 0.f); ///< Cached (majorant, minorant) for gGvsBrickKey.
+#if GRID_VOLUME_SAMPLER_STATS
+static uint gGvsStatBrickHits = 0;   ///< Taps served from the cached brick.
+static uint gGvsStatBrickMisses = 0; ///< Taps that had to re-chase the indirection.
+#endif
+
+/** Invalidate the brick cache. MUST be called at the start of every walk, before
+    any tap, because the cache is only valid for a single Grid (see above).
+*/
+void gvsBrickCacheReset()
+{
+    gGvsBrickKey = int3(-1, -1, -1);
+}
+
+/** Brick-coherent replacement for Grid::lookupStochasticIndexTex.
+
+    Bitwise identical to the uncached path: on a hit it reuses ptr/range fetched
+    from the exact same addresses and the arithmetic is unchanged. The float3 ->
+    int3 conversion reproduces the implicit TRUNCATION in lookupStochasticIndexTex
+    (which does NOT floor, unlike lookupStochasticIndex).
+*/
+float gvsLookupStochasticCached(const Grid densityGrid, const float3 index, const float3 u)
+{
+    const int3 vox = int3(index + (u - 0.5f));
+    const int3 brick = vox >> 3;
+    if (any(brick != gGvsBrickKey))
+    {
+        gGvsBrickKey = brick;
+        gGvsBrickRange = densityGrid.rangeMeanTex[brick].xy;
+        gGvsBrickPtr = densityGrid.indirectionTex[brick].xyz;
+#if GRID_VOLUME_SAMPLER_STATS
+        gGvsStatBrickMisses++;
+#endif
+    }
+#if GRID_VOLUME_SAMPLER_STATS
+    else
+    {
+        gGvsStatBrickHits++;
+    }
+#endif
+    return densityGrid.atlasTex[(gGvsBrickPtr.xyz << 3) + (vox & 7)].x * (gGvsBrickRange.x - gGvsBrickRange.y) + gGvsBrickRange.y;
+}
+
 /** Helper class for sampling grid volumes in the scene.
     Note: For simplicity, this sampler only uses the first volume in the scene.
 */
@@ -233,7 +302,10 @@ struct GridVolumeSampler
         logVolumeLookup();
         gvsStatTap();
 #if GRID_VOLUME_SAMPLER_USE_BRICKEDGRID
-        return gridVolume.data.densityScale * densityGrid.lookupStochasticIndexTex(ipos, u);
+        // Brick-coherent path: see gvsLookupStochasticCached. Valid only because
+        // every walk resets the cache before its first tap, so densityGrid is
+        // fixed for the cache's lifetime.
+        return gridVolume.data.densityScale * gvsLookupStochasticCached(densityGrid, ipos, u);
 #else
         return gridVolume.data.densityScale * densityGrid.lookupStochasticIndex(ipos, u, densityAccessor);
 #endif
@@ -254,6 +326,11 @@ struct GridVolumeSampler
         // Setup access to density grid.
         Grid densityGrid;
         gScene.getGrid(gridVolume.getDensityGrid(), densityGrid);
+        // The brick cache holds an atlas pointer valid for THIS grid only. Reset
+        // at every walk entry so a brick cached during the previous instance's
+        // walk can never be reused against a different grid's atlas - that would
+        // be a silently wrong density, not a crash. See gvsBrickCacheReset.
+        gvsBrickCacheReset();
         DensityAccessor densityAccessor = createAccessor(densityGrid);
 
         // Transform to index-space.
@@ -284,6 +361,11 @@ struct GridVolumeSampler
         // Setup access to density grid.
         Grid densityGrid;
         gScene.getGrid(gridVolume.getDensityGrid(), densityGrid);
+        // The brick cache holds an atlas pointer valid for THIS grid only. Reset
+        // at every walk entry so a brick cached during the previous instance's
+        // walk can never be reused against a different grid's atlas - that would
+        // be a silently wrong density, not a crash. See gvsBrickCacheReset.
+        gvsBrickCacheReset();
         DensityAccessor densityAccessor = createAccessor(densityGrid);
 
         float3 ipos, idir;
@@ -348,6 +430,11 @@ struct GridVolumeSampler
         // Setup access to density grid.
         Grid densityGrid;
         gScene.getGrid(gridVolume.getDensityGrid(), densityGrid);
+        // The brick cache holds an atlas pointer valid for THIS grid only. Reset
+        // at every walk entry so a brick cached during the previous instance's
+        // walk can never be reused against a different grid's atlas - that would
+        // be a silently wrong density, not a crash. See gvsBrickCacheReset.
+        gvsBrickCacheReset();
         DensityAccessor densityAccessor = createAccessor(densityGrid);
 
         float3 ipos, idir;
@@ -411,6 +498,11 @@ struct GridVolumeSampler
         // Setup access to density grid.
         Grid densityGrid;
         gScene.getGrid(gridVolume.getDensityGrid(), densityGrid);
+        // The brick cache holds an atlas pointer valid for THIS grid only. Reset
+        // at every walk entry so a brick cached during the previous instance's
+        // walk can never be reused against a different grid's atlas - that would
+        // be a silently wrong density, not a crash. See gvsBrickCacheReset.
+        gvsBrickCacheReset();
         DensityAccessor densityAccessor = createAccessor(densityGrid);
 
         float3 ipos, idir;
@@ -485,6 +577,11 @@ struct GridVolumeSampler
         // Setup access to density grid.
         Grid densityGrid;
         gScene.getGrid(gridVolume.getDensityGrid(), densityGrid);
+        // The brick cache holds an atlas pointer valid for THIS grid only. Reset
+        // at every walk entry so a brick cached during the previous instance's
+        // walk can never be reused against a different grid's atlas - that would
+        // be a silently wrong density, not a crash. See gvsBrickCacheReset.
+        gvsBrickCacheReset();
         DensityAccessor densityAccessor = createAccessor(densityGrid);
 
         float3 ipos, idir;
@@ -518,6 +615,11 @@ struct GridVolumeSampler
         // Setup access to density grid.
         Grid densityGrid;
         gScene.getGrid(gridVolume.getDensityGrid(), densityGrid);
+        // The brick cache holds an atlas pointer valid for THIS grid only. Reset
+        // at every walk entry so a brick cached during the previous instance's
+        // walk can never be reused against a different grid's atlas - that would
+        // be a silently wrong density, not a crash. See gvsBrickCacheReset.
+        gvsBrickCacheReset();
         DensityAccessor densityAccessor = createAccessor(densityGrid);
 
         float3 ipos, idir;

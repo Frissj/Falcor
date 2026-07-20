@@ -199,6 +199,86 @@ struct Grid
         return atlasTex[(ptr.xyz << 3) + (index & 7)].x * (range.x - range.y) + range.y;
     }
 
+    /** Brick-coherent cache for lookupIndexTex.
+
+        WHY: the uncached lookup above is the single hottest line in the volume
+        kernel (~9.8% of all SM samples, top stall LONG SCOREBOARD at 86%). The
+        cost is not bandwidth - L1TEX and VRAM both sit near 10% - it is LATENCY:
+        atlasTex cannot issue until indirectionTex returns, so every tap pays a
+        serialized two-hop dependent chase, ~33M times a frame.
+
+        Consecutive taps along a walk usually land in the same 8^3 brick, so
+        holding (brick, ptr, range) in registers removes BOTH the rangeMean and
+        indirection loads AND the dependent hop on a hit - the atlas address is
+        then computable immediately. Costs ~8 VGPRs against ~50k registers/SM.
+
+        This is UE's Nanite Foliage technique (NaniteRasterizer.usf:1278 stages
+        brick data in groupshared so the per-voxel loop never re-chases the
+        indirection). Register-resident rather than LDS, because VNA's shared
+        memory is already ~82 KB/SM against a ~100 KB ceiling.
+
+        LIFETIME MATTERS: the cache only pays if it outlives a single tap. Declare
+        it OUTSIDE the walk loop, alongside a hoisted Grid, never per iteration.
+
+        hits/misses are carried here rather than in a global counter because
+        Grid.slang has no stat infrastructure; fold them into the caller's stats.
+    */
+    struct BrickCache
+    {
+        int3 brick;
+        uint3 ptr;
+        float2 range;
+        uint hits;
+        uint misses;
+    };
+
+    static BrickCache initBrickCache()
+    {
+        BrickCache c;
+        // Sentinel brick that no real index can produce (index >> 3 of a valid
+        // voxel is always >= 0), so the first lookup always misses.
+        c.brick = int3(-1, -1, -1);
+        c.ptr = uint3(0, 0, 0);
+        c.range = float2(0.f, 0.f);
+        c.hits = 0;
+        c.misses = 0;
+        return c;
+    }
+
+    /** Brick-coherent variant of lookupIndexTex. Bitwise identical to the
+        uncached version: on a hit it reuses ptr/range fetched from the exact same
+        addresses, and the arithmetic is unchanged.
+    */
+    float lookupIndexTexCached(const int3 index, inout BrickCache cache)
+    {
+        const int3 brick = index >> 3;
+        if (any(brick != cache.brick))
+        {
+            cache.brick = brick;
+            cache.range = rangeMeanTex[brick].xy;
+            cache.ptr = indirectionTex[brick].xyz;
+            cache.misses++;
+        }
+        else
+        {
+            cache.hits++;
+        }
+        return atlasTex[(cache.ptr.xyz << 3) + (index & 7)].x * (cache.range.x - cache.range.y) + cache.range.y;
+    }
+
+    /** Stochastic-filtered wrapper, mirroring lookupStochasticIndexTex.
+
+        NOTE: lookupStochasticIndexTex passes a float3 straight into an int3
+        parameter, which TRUNCATES toward zero - it does NOT floor (unlike
+        lookupStochasticIndex, which floors explicitly). The implicit conversion
+        is reproduced verbatim here; substituting floor() would change results for
+        negative indices and break bitwise identity.
+    */
+    float lookupStochasticIndexTexCached(const float3 index, float3 u, inout BrickCache cache)
+    {
+        return lookupIndexTexCached(int3(index + (u - 0.5f)), cache);
+    }
+
     /** Lookup the local majorant of the grid on a given mipmap level.
         \param[in] index Fractional voxel index.
         \return Returns the value in the grid.
