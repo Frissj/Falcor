@@ -35,14 +35,19 @@ namespace Falcor
 {
     struct BrickedGrid
     {
-        ref<Texture> range;
+        // Per-brick (majorant, minorant, MEAN, unused) as RGBA16Float, 4 mips.
+        // The majorant/minorant pair bounds the brick; the mean is the
+        // control-variate field for residual ratio tracking (VNA spec section 2
+        // / P2). These were two textures (RG16Float range + R16Float mean) with
+        // identical dimensions and mip layouts, which cost the residual walk TWO
+        // texture fetches per DDA cell at the SAME address. Packed into one
+        // texel they cost one: measured ~230M -> ~165M fetches/frame at 1080p.
+        // NOTE: majorant/minorant and mean are different quantities - the .xy
+        // mips are a max/min pyramid, the .z mip is a mean pyramid. Do not
+        // conflate them.
+        ref<Texture> rangeMean;
         ref<Texture> indirection;
         ref<Texture> atlas;
-        // Per-brick MEAN density, same brick grid and 4-mip layout as 'range'.
-        // The control-variate field for residual ratio tracking (VNA spec
-        // section 2 / P2). NOTE: 'range' stores majorant/minorant (max/min) -
-        // a different quantity; the mips of 'range' are NOT a mean pyramid.
-        ref<Texture> mean;
 
         // CPU-side copies of the range/mean pyramids, kept after conversion.
         // Consumers (UE-lesson ports, see VNA_UE_SOURCE_LESSONS.md):
@@ -51,13 +56,13 @@ namespace Falcor
         //    is how LoD becomes a property of the acceleration structure;
         //  - the merged-coarse-tail bake, which needs conservative per-cell
         //    bounds of the SUM of instanced grids.
-        // Layout matches the GPU textures exactly: cumulative 4-mip brick grid,
-        // rangeData = f16 majorant | f16 minorant << 16, meanData = f16 mean.
+        // Layout matches the GPU texture exactly: cumulative 4-mip brick grid,
+        // one uint64 per brick = f16 majorant | f16 minorant << 16 |
+        // f16 mean << 32 | 0 << 48, i.e. the RGBA16Float texel bit-for-bit.
         // Coordinates are in SHIFTED index space (NanoVDB index minus
         // getMinIndex()), i.e. the space the sampler marches in.
-        std::vector<uint32_t> rangeData;
-        std::vector<uint16_t> meanData;
+        std::vector<uint64_t> rangeMeanData;
         int3 leafDim[4] = {};       ///< Brick-grid dimensions per mip (mip m cells are 8<<m voxels wide).
-        uint32_t leafOffset[4] = {}; ///< Start of each mip's cells within rangeData/meanData.
+        uint32_t leafOffset[4] = {}; ///< Start of each mip's cells within rangeMeanData.
     };
 }

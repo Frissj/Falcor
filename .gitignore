@@ -31,3 +31,5 @@
 *.tlog
 *.bak
 *.swp
+/vna_measurements
+/vna_measurements

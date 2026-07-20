@@ -127,10 +127,9 @@ namespace Falcor
     void Grid::bindShaderData(const ShaderVar& var)
     {
         var["buf"] = mpBuffer;
-        var["rangeTex"] = mBrickedGrid.range;
+        var["rangeMeanTex"] = mBrickedGrid.rangeMean;
         var["indirectionTex"] = mBrickedGrid.indirection;
         var["atlasTex"] = mBrickedGrid.atlas;
-        var["meanTex"] = mBrickedGrid.mean;
         var["minIndex"] = getMinIndex();
         var["minValue"] = getMinValue();
         var["maxIndex"] = getMaxIndex();
@@ -165,10 +164,9 @@ namespace Falcor
     uint64_t Grid::getGridSizeInBytes() const
     {
         const uint64_t nvdb = mpBuffer ? mpBuffer->getSize() : (uint64_t)0;
-        const uint64_t bricks = (mBrickedGrid.range ? mBrickedGrid.range->getTextureSizeInBytes() : (uint64_t)0) +
+        const uint64_t bricks = (mBrickedGrid.rangeMean ? mBrickedGrid.rangeMean->getTextureSizeInBytes() : (uint64_t)0) +
             (mBrickedGrid.indirection ? mBrickedGrid.indirection->getTextureSizeInBytes() : (uint64_t)0) +
-            (mBrickedGrid.atlas ? mBrickedGrid.atlas->getTextureSizeInBytes() : (uint64_t)0) +
-            (mBrickedGrid.mean ? mBrickedGrid.mean->getTextureSizeInBytes() : (uint64_t)0);
+            (mBrickedGrid.atlas ? mBrickedGrid.atlas->getTextureSizeInBytes() : (uint64_t)0);
         return nvdb + bricks;
     }
 

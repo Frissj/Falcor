@@ -52,3 +52,18 @@ PROBE p9_spatial_rw done
 PROBE COMPLETE
 PROBE p10_spatial_pad done
 PROBE COMPLETE
+ROULETTE rq_baseline done
+ROULETTE rq_q10 done
+ROULETTE rq_q20 done
+ROULETTE rq_q30 done
+ROULETTE rq_b1 done
+ROULETTE rq_b2 done
+ROULETTE rq_q20_b1 done
+ROULETTE SWEEP COMPLETE
+ROULETTE2 rq2_baseline done (1spp + converged)
+ROULETTE2 rq2_q075 done (1spp + converged)
+ROULETTE2 rq2_q10 done (1spp + converged)
+ROULETTE2 rq2_q125 done (1spp + converged)
+ROULETTE2 rq2_q15 done (1spp + converged)
+ROULETTE2 rq2_q175 done (1spp + converged)
+ROULETTE2 SWEEP COMPLETE

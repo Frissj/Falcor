@@ -91,7 +91,7 @@ namespace Falcor
             return float2(std::max(a.x, b.x), std::min(a.y, b.y));
         }
 
-        inline float2 unpackMajMin(const uint32_t* data)
+        inline float2 unpackMajMin(const uint64_t* data)
         {
             const uint16_t* data16 = (const uint16_t*)data;
             return float2(f16tof32(data16[0]), f16tof32(data16[1]));
@@ -108,15 +108,28 @@ namespace Falcor
         int3 mLeafDim[4];
         int3 mBBMin, mBBMax, mPixDim;
         uint32_t mLeafCount[4];
-        std::vector<uint32_t> mRangeData;
+        // Per-brick (majorant, minorant, mean, unused) packed as 4x f16 = the
+        // RGBA16Float texel bit-for-bit. The mean is the control-variate field
+        // sigma_c for residual ratio tracking (VNA spec section 2 / P2); it is a
+        // MEAN pyramid, while .xy's mips are a max/min pyramid - a different
+        // quantity that cannot substitute for it. These were two arrays feeding
+        // two textures; the residual walk read both at the SAME address every
+        // DDA cell, so packing them halves that fetch.
+        std::vector<uint64_t> mRangeMeanData;
         std::vector<uint32_t> mPtrData;
         std::vector<TexelType> mAtlasData;
-        // Per-brick mean density (f16), same 4-mip layout as mRangeData. This is
-        // the control-variate field sigma_c for residual ratio tracking (VNA
-        // spec section 2 / P2). It is a MEAN pyramid; mRangeData's mips are a
-        // max/min pyramid - a different quantity that cannot substitute for it.
-        std::vector<uint16_t> mMeanData;
         std::atomic_uint32_t mNonEmptyCount;
+
+        /** Pack one brick's (majorant, minorant, mean) into an RGBA16Float texel. */
+        static inline uint64_t packRangeMean(float majorant, float minorant, float mean)
+        {
+            return (uint64_t)f32tof16(majorant)
+                | ((uint64_t)f32tof16(minorant) << 16)
+                | ((uint64_t)f32tof16(mean) << 32);
+        }
+        static inline float unpackMajorant(uint64_t v) { return f16tof32((uint32_t)(v & 0xffff)); }
+        static inline float unpackMinorant(uint64_t v) { return f16tof32((uint32_t)((v >> 16) & 0xffff)); }
+        static inline float unpackMean(uint64_t v)     { return f16tof32((uint32_t)((v >> 32) & 0xffff)); }
     };
 
     template <typename TexelType, unsigned int kBitsPerTexel>
@@ -140,9 +153,8 @@ namespace Falcor
         mAtlasSizeBricks = uint3(approxdim, approxdim, lastdim);
         uint3 atlasSizePixels = getAtlasSizePixels();
         uint leafTexelCount = atlasSizePixels.x * atlasSizePixels.y * atlasSizePixels.z;
-        mRangeData.resize(mLeafCount[3]);
+        mRangeMeanData.resize(mLeafCount[3]);
         mPtrData.resize(mLeafCount[0]);
-        mMeanData.resize(mLeafCount[3]);
         mAtlasData.resize(kBC4Compress ? (leafTexelCount / 16) : leafTexelCount);
     }
 
@@ -155,9 +167,8 @@ namespace Falcor
         uint pixelsPerSlice = atlasSizePixels.x * atlasSizePixels.y;
 
         size_t offset = z * mLeafDim[0].x * mLeafDim[0].y;
-        uint32_t* rangedst = mRangeData.data() + offset;
+        uint64_t* rangemeandst = mRangeMeanData.data() + offset;
         uint32_t* ptrdst = mPtrData.data() + offset;
-        uint16_t* meandst = mMeanData.data() + offset;
         auto a = mpFloatGrid->getAccessor();
         for (int y = 0; y < mLeafDim[0].y; ++y)
         {
@@ -194,24 +205,26 @@ namespace Falcor
                 }
                 if (majorant == minorant || myleaf >= brickMax || leaf == nullptr)
                 {
-                    *rangedst++ = f32tof16(majorant) + (f32tof16(majorant) << 16); // force identical major and minor
+                    // Force identical major and minor. With a collapsed range the
+                    // sampler returns exactly 'majorant' everywhere in this brick,
+                    // so that IS the runtime mean. Writing it makes the residual
+                    // identically zero here: transmittance through uniform/empty
+                    // bricks becomes purely analytic.
+                    *rangemeandst++ = packRangeMean(majorant, majorant, majorant);
                     *ptrdst++ = 0;
-                    // With a collapsed range the sampler returns exactly 'majorant'
-                    // everywhere in this brick, so that IS the runtime mean. Writing
-                    // it makes the residual identically zero here: transmittance
-                    // through uniform/empty bricks becomes purely analytic.
-                    *meandst++ = (uint16_t)f32tof16(majorant);
                 }
                 else
                 {
                     // True mean of the brick's voxels. Any value in [minorant,majorant]
                     // keeps residual tracking unbiased (control variate); the mean
-                    // minimises the residual and thus the variance.
-                    *meandst++ = (uint16_t)f32tof16(float(valueSum * (1.0 / (kBrickSize * kBrickSize * kBrickSize))));
+                    // minimises the residual and thus the variance. Computed from the
+                    // ORIGINAL voxel sum, before the majorant/minorant f16 nudge
+                    // below - keep this order.
+                    const float brickMean = float(valueSum * (1.0 / (kBrickSize * kBrickSize * kBrickSize)));
                     const float* data = leaf->data()->mValues;
                     majorant = f16tof32(f32tof16(majorant) + 1);
                     minorant = f16tof32(f32tof16(minorant));
-                    *rangedst++ = f32tof16(majorant) + (f32tof16(minorant) << 16);
+                    *rangemeandst++ = packRangeMean(majorant, minorant, brickMean);
                     uint32_t atlasx = myleaf % mAtlasSizeBricks.x;
                     uint32_t atlasy = (myleaf / mAtlasSizeBricks.x) % mAtlasSizeBricks.y;
                     uint32_t atlasz = myleaf / bricksPerSlice;
@@ -272,13 +285,12 @@ namespace Falcor
     template <typename TexelType, unsigned int kBitsPerTexel>
     void NanoVDBToBricksConverter<TexelType, kBitsPerTexel>::computeMip(int mip)
     {
-        uint32_t* rangedst = mRangeData.data() + mLeafCount[mip - 1];
-        uint32_t* rangesrc = mRangeData.data() + ((mip > 1) ? mLeafCount[mip - 2] : 0);
-        // Mean pyramid walks the same brick layout. Children are equal-size
-        // regions, so the average of the 8 child means IS the exact mean of the
-        // parent region - the pyramid is exact at every level, not an estimate.
-        uint16_t* meandst = mMeanData.data() + mLeafCount[mip - 1];
-        uint16_t* meansrc = mMeanData.data() + ((mip > 1) ? mLeafCount[mip - 2] : 0);
+        // One interleaved pyramid now: .xy reduces as max/min, .z as a mean.
+        // Children are equal-size regions, so the average of the 8 child means
+        // IS the exact mean of the parent region - the mean pyramid is exact at
+        // every level, not an estimate.
+        uint64_t* rangemeandst = mRangeMeanData.data() + mLeafCount[mip - 1];
+        uint64_t* rangemeansrc = mRangeMeanData.data() + ((mip > 1) ? mLeafCount[mip - 2] : 0);
         int3 leafdim_src = mLeafDim[mip - 1];
         uint32_t rowstride_src = leafdim_src.x;
         uint32_t slicestride_src = leafdim_src.y * rowstride_src;
@@ -287,30 +299,30 @@ namespace Falcor
         uint32_t rowstride_tgt = leafdim_tgt.x;
         uint32_t slicestride_tgt = leafdim_tgt.y * rowstride_tgt;
 
-        for (int z = 0; z < leafdim_tgt.z; ++z, rangesrc += slicestride_src, meansrc += slicestride_src)
+        for (int z = 0; z < leafdim_tgt.z; ++z, rangemeansrc += slicestride_src)
         {
-            for (int y = 0; y < leafdim_tgt.y; ++y, rangesrc += rowstride_src, meansrc += rowstride_src)
+            for (int y = 0; y < leafdim_tgt.y; ++y, rangemeansrc += rowstride_src)
             {
-                for (int x = 0; x < leafdim_tgt.x; ++x, rangesrc += 2, meansrc += 2)
+                for (int x = 0; x < leafdim_tgt.x; ++x, rangemeansrc += 2)
                 {
                     float2 majmin_dst = combineMajMin(
                         combineMajMin(
-                            combineMajMin(unpackMajMin(rangesrc), unpackMajMin(rangesrc + 1)),
-                            combineMajMin(unpackMajMin(rangesrc + rowstride_src), unpackMajMin(rangesrc + 1 + rowstride_src))
+                            combineMajMin(unpackMajMin(rangemeansrc), unpackMajMin(rangemeansrc + 1)),
+                            combineMajMin(unpackMajMin(rangemeansrc + rowstride_src), unpackMajMin(rangemeansrc + 1 + rowstride_src))
                         ),
                         combineMajMin(
-                            combineMajMin(unpackMajMin(rangesrc + slicestride_src), unpackMajMin(rangesrc + slicestride_src + 1)),
-                            combineMajMin(unpackMajMin(rangesrc + slicestride_src + rowstride_src), unpackMajMin(rangesrc + slicestride_src + 1 + rowstride_src))
+                            combineMajMin(unpackMajMin(rangemeansrc + slicestride_src), unpackMajMin(rangemeansrc + slicestride_src + 1)),
+                            combineMajMin(unpackMajMin(rangemeansrc + slicestride_src + rowstride_src), unpackMajMin(rangemeansrc + slicestride_src + 1 + rowstride_src))
                         )
                     );
-                    *rangedst++ = f32tof16(majmin_dst.x) + (f32tof16(majmin_dst.y) << 16);
 
                     const float meanSum =
-                        f16tof32(meansrc[0]) + f16tof32(meansrc[1]) +
-                        f16tof32(meansrc[rowstride_src]) + f16tof32(meansrc[1 + rowstride_src]) +
-                        f16tof32(meansrc[slicestride_src]) + f16tof32(meansrc[slicestride_src + 1]) +
-                        f16tof32(meansrc[slicestride_src + rowstride_src]) + f16tof32(meansrc[slicestride_src + 1 + rowstride_src]);
-                    *meandst++ = (uint16_t)f32tof16(meanSum * 0.125f);
+                        unpackMean(rangemeansrc[0]) + unpackMean(rangemeansrc[1]) +
+                        unpackMean(rangemeansrc[rowstride_src]) + unpackMean(rangemeansrc[1 + rowstride_src]) +
+                        unpackMean(rangemeansrc[slicestride_src]) + unpackMean(rangemeansrc[slicestride_src + 1]) +
+                        unpackMean(rangemeansrc[slicestride_src + rowstride_src]) + unpackMean(rangemeansrc[slicestride_src + 1 + rowstride_src]);
+
+                    *rangemeandst++ = packRangeMean(majmin_dst.x, majmin_dst.y, meanSum * 0.125f);
                 } // x
             } // y
         } // z
@@ -325,10 +337,9 @@ namespace Falcor
         for (int mip = 1; mip < 4; ++mip) computeMip(mip);
 
         BrickedGrid bricks;
-        bricks.range = pDevice->createTexture3D(mLeafDim[0].x, mLeafDim[0].y, mLeafDim[0].z, ResourceFormat::RG16Float, 4, mRangeData.data(), ResourceBindFlags::ShaderResource);
+        bricks.rangeMean = pDevice->createTexture3D(mLeafDim[0].x, mLeafDim[0].y, mLeafDim[0].z, ResourceFormat::RGBA16Float, 4, mRangeMeanData.data(), ResourceBindFlags::ShaderResource);
         bricks.indirection = pDevice->createTexture3D(mLeafDim[0].x, mLeafDim[0].y, mLeafDim[0].z, ResourceFormat::RGBA8Uint, 1, mPtrData.data(), ResourceBindFlags::ShaderResource);
         bricks.atlas = pDevice->createTexture3D(getAtlasSizePixels().x, getAtlasSizePixels().y, getAtlasSizePixels().z, getAtlasFormat(), 1, mAtlasData.data(), ResourceBindFlags::ShaderResource);
-        bricks.mean = pDevice->createTexture3D(mLeafDim[0].x, mLeafDim[0].y, mLeafDim[0].z, ResourceFormat::R16Float, 4, mMeanData.data(), ResourceBindFlags::ShaderResource);
 
         // Hand the CPU pyramids to the BrickedGrid (moved, not copied - the
         // converter is done with them). Needed by the HW-BVH brick-AABB
@@ -338,8 +349,7 @@ namespace Falcor
             bricks.leafDim[i] = mLeafDim[i];
             bricks.leafOffset[i] = i ? mLeafCount[i - 1] : 0;
         }
-        bricks.rangeData = std::move(mRangeData);
-        bricks.meanData = std::move(mMeanData);
+        bricks.rangeMeanData = std::move(mRangeMeanData);
 
         double dt = CpuTimer::calcDuration(t0, CpuTimer::getCurrentTimePoint());
         logDebug("Converted '{}' in {:.4}ms: mNonEmptyCount {} vs max {}", mpFloatGrid->gridName(), dt, mNonEmptyCount.load(), getAtlasMaxBrick());

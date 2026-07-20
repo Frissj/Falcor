@@ -210,6 +210,13 @@ private:
     /// IS an estimator change, so the conservative default is 0 (raw target);
     /// the everything-on shortcut sets 0.01 explicitly per house policy.
     float mRisTargetFloor = 0.f;
+    /// Russian-roulette survival floor and start bounce (see gRouletteMinQ in
+    /// the shader). shadeMain - the bounce loop - is the largest single item in
+    /// the frame (Nsight: 18.5-19.8ms of ~33ms), and its cost is path length.
+    /// Roulette is unbiased at any q, so these only trade cost against
+    /// variance. Defaults reproduce the previous hardcoded 0.05f / bounce > 3.
+    float mRouletteMinQ = 0.05f;
+    uint32_t mRouletteStartBounce = 3;
     /// Mip of the coarse mean field used for the TARGET's shadow estimate (0..3).
     /// Candidates no longer come from this field (they are real delta-tracking
     /// collisions), so this only decides how cheap/crude the "is this candidate

@@ -377,7 +377,7 @@ struct GridVolumeSampler
         VNA spec section 2 / P2 "prefilter == control variate").
 
         Per DDA node at mip kResidualMip the density is split
-            sigma = sigma_c + sigma_r,   sigma_c = node MEAN (meanTex)
+            sigma = sigma_c + sigma_r,   sigma_c = node MEAN (rangeMeanTex.z)
         so transmittance factorises EXACTLY: T = T_c * T_r, where
             T_c = exp(-integral of sigma_c)   -> ANALYTIC (zero variance), and
             T_r                               -> ratio-tracked with the residual
@@ -433,8 +433,13 @@ struct GridVolumeSampler
             const float dt = tExit - t;
 
             logVolumeLookup();
-            const float2 majMin = densityGrid.lookupIndexLocalRangeTex(int3(pos), residualMip);
-            const float mean = densityGrid.lookupIndexLocalMeanTex(int3(pos), residualMip);
+            // ONE fetch for (majorant, minorant, mean) - these live in a single
+            // RGBA16Float texel. Reading range and mean separately cost two
+            // fetches per cell at the identical address, and cells are the
+            // dominant term in this pass's memory traffic.
+            const float3 majMinMean = densityGrid.lookupIndexLocalRangeMeanTex(int3(pos), residualMip);
+            const float2 majMin = majMinMean.xy;
+            const float mean = majMinMean.z;
             const float sigmaC = scale * mean;
             const float sigmaRbar = scale * max(majMin.x - mean, mean - majMin.y);
 

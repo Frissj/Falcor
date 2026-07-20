@@ -505,7 +505,7 @@ struct VolumeInstanceSampler
     // TWO DIFFERENT COARSE FIELDS, TWO DIFFERENT JOBS. Conflating them is what
     // produced a black cloud once already; the distinction is load-bearing.
     //
-    //  PROPOSAL (where to put candidates) = MAJORANT, from rangeTex.
+    //  PROPOSAL (where to put candidates) = MAJORANT, from rangeMeanTex.x.
     //    An importance-sampling proposal must COVER the integrand: it may never
     //    be small where the real density is large. The majorant bounds density
     //    by construction, so it covers everywhere. The MEAN does NOT: a wisp's
@@ -514,7 +514,7 @@ struct VolumeInstanceSampler
     //    structures - measured as avgCandidates 1.8/8 and 94% of survivors
     //    landing on zero real density.
     //
-    //  TARGET / SHADOW ESTIMATE (which candidate to keep) = MEAN, from meanTex.
+    //  TARGET / SHADOW ESTIMATE (which candidate to keep) = MEAN, from rangeMeanTex.z.
     //    Here we want the best GUESS of actual optical depth and actual local
     //    density, and the mean is exactly that. Being wrong here costs variance
     //    only - never correctness - which is the P1 licence (spec section 2).
@@ -569,6 +569,25 @@ struct VolumeInstanceSampler
         const uint nBounds = buildBoundaries(list, bounds);
 
         // Per-instance index-space rays, transformed once for the whole walk.
+        //
+        // MEASURED AND REVERTED (Nsight traces 00_49 vs 01_00): hoisting these
+        // out and recomputing transformRayToIndexSpace per (cell, instance)
+        // instead did reduce register pressure exactly as intended - avg
+        // registers/SM 46,211 -> 44,916, occupancy limiter 70.5% -> 68.5%,
+        // unused warp slots 57.0% -> 51.0%, CTAs/SM 11.7 -> 13.4 - and made the
+        // frame 25% SLOWER (32.5ms -> 40.7ms). Reason: this kernel is SM-bound
+        // (SM 56.2% top unit; L1TEX 14%, VRAM 9%), so trading ALU for registers
+        // moves work INTO the bottleneck. That trade only pays when the limiter
+        // is latency or memory.
+        //
+        // Also note the register win was tiny (-2.8%) for 81 floats removed, so
+        // coarseOpticalDepth is NOT the kernel's register high-water mark -
+        // look in main/shadeMain before trying this again.
+        //
+        // If register pressure IS attacked later, do it the way UE's voxel
+        // raster does (NaniteRasterizer.usf ~1278): stage the data in
+        // groupshared - LDS is at 36.9% with headroom - rather than recomputing
+        // it. That drops registers WITHOUT adding SM work.
         GridVolumeSampler gvs = {};
         float3 ipos[kMaxInstances];
         float3 idir[kMaxInstances];

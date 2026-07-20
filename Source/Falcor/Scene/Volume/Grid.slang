@@ -40,14 +40,16 @@ struct Grid
     // NanoVDB data.
     typedef pnanovdb_readaccessor_t Accessor;
     StructuredBuffer<uint> buf;
-    // Brick atlas data.
-    Texture3D<float2> rangeTex;
+    // Brick atlas data. rangeMeanTex packs, per brick and per mip,
+    // (majorant, minorant, mean, unused). The majorant/minorant pair bounds the
+    // brick; the mean is the control-variate field for residual ratio tracking
+    // (VNA spec section 2). These were two textures at identical addresses, so
+    // the residual walk paid two fetches per DDA cell to read three floats.
+    // The .xy mips are a max/min pyramid, the .z mip is a MEAN pyramid - they
+    // are different quantities; do not conflate them.
+    Texture3D<float4> rangeMeanTex;
     Texture3D<uint4> indirectionTex;
     Texture3D<float> atlasTex;
-    // Per-brick mean density, same brick grid + 4-mip layout as rangeTex.
-    // Control-variate field for residual ratio tracking (VNA spec section 2).
-    // rangeTex mips are max/min - NOT means; do not conflate the two pyramids.
-    Texture3D<float> meanTex;
 
     /** Get the minimum index stored in the grid.
         \return Returns minimum index stored in the grid.
@@ -192,7 +194,7 @@ struct Grid
     float lookupIndexTex(const int3 index)
     {
         const int3 brick = index >> 3;
-        const float2 range = rangeTex[brick];
+        const float2 range = rangeMeanTex[brick].xy;
         const uint3 ptr = indirectionTex[brick].xyz;
         return atlasTex[(ptr.xyz << 3) + (index & 7)].x * (range.x - range.y) + range.y;
     }
@@ -204,7 +206,7 @@ struct Grid
     float lookupIndexLocalMajorantTex(int3 index, const int mip)
     {
         index >>= (3 + mip);
-        return rangeTex.Load(int4(index, mip)).x;
+        return rangeMeanTex.Load(int4(index, mip)).x;
     }
 
     /** Lookup the local (majorant, minorant) pair on a given mipmap level.
@@ -214,7 +216,20 @@ struct Grid
     float2 lookupIndexLocalRangeTex(int3 index, const int mip)
     {
         index >>= (3 + mip);
-        return rangeTex.Load(int4(index, mip)).xy;
+        return rangeMeanTex.Load(int4(index, mip)).xy;
+    }
+
+    /** Lookup the local (majorant, minorant, mean) triple in ONE fetch.
+        The residual ratio tracker needs all three per DDA cell; reading them
+        separately costs two texture fetches at the same address. Callers in the
+        hot marching loop should use this instead of the range/mean pair.
+        \param[in] index Fractional voxel index.
+        \return Returns (max, min, mean) over the node's region.
+    */
+    float3 lookupIndexLocalRangeMeanTex(int3 index, const int mip)
+    {
+        index >>= (3 + mip);
+        return rangeMeanTex.Load(int4(index, mip)).xyz;
     }
 
     /** Lookup the local MEAN density on a given mipmap level.
@@ -227,7 +242,7 @@ struct Grid
     float lookupIndexLocalMeanTex(int3 index, const int mip)
     {
         index >>= (3 + mip);
-        return meanTex.Load(int4(index, mip));
+        return rangeMeanTex.Load(int4(index, mip)).z;
     }
 
     /** Lookup the grid using tri-linear sampling.

@@ -36,6 +36,15 @@ def render_graph_VNA():
         'useSingleNeePerPath': True,
         # Section 2/P2: analytic control-variate transmittance.
         'transmittanceEstimator': 'ResidualRatioTrackingLocalMajorant',
+        # MEASURED AND REJECTED (log 57): residualMip 1 cut cells 65.7M -> 59.5M
+        # (-9.5%) but RAISED taps 32.9M -> 39.0M (+18.6%); per-pixel candGen went
+        # 21.7->19.9 cells for 9.3->11.9 taps, i.e. taps rose more in absolute
+        # terms than cells fell. Coarsening the control field grows sigmaRbar, so
+        # the inner residual ratio-track loop takes more density taps per cell,
+        # and a stochastic trilinear tap is not cheaper than a cell's two
+        # majorant fetches. Net ~164M -> ~158M lookups: a wash. mip 2 is worse by
+        # the same trend. The footprint rule clamping to 0 is CORRECT, not a bug:
+        # control-field accuracy beats cell count here. Do not re-litigate.
         'residualMip': 0,
         # UE projected-error rule: per instance+segment, coarsest mean/range
         # mip whose cell stays under the pixel footprint. Unbiased at any mip.
@@ -64,6 +73,21 @@ def render_graph_VNA():
         # L/Lhat firefly mechanism the validation matrix isolated (single
         # 800-2200x pixels at 1 spp). Unbiased at any value.
         'risTargetFloor': 0.01,   # firefly bound; CLEAN under exact pairwise MIS (+0.08%, p8_m2_floor) - the old -1.1% was the constant-MIS feedback
+        # Russian roulette survival floor. Was hardcoded 0.05; swept because
+        # Nsight put shadeMain (the bounce loop) at ~56% of the frame and its
+        # cost is path LENGTH. 0.10 is strictly better than 0.05 on EVERY axis
+        # (rq2 sweep, gate metric = cloudy mean vs 01_ref):
+        #   q=0.05  rel -0.0168%  1spp MSE 4.648e-01  >10: 360  >100: 13  sc 2.6
+        #   q=0.10  rel +0.0044%  1spp MSE 3.521e-02  >10:  94  >100:  1  sc 2.1
+        # 13x lower 1-spp MSE and 19% fewer sampler calls. Killing low-throughput
+        # paths EARLY removes the L/Lhat firefly source (a path that limps on at
+        # tiny throughput then hits a bright NEE sample) - the same mechanism
+        # risTargetFloor bounds. The x1.11 reweight is far too mild to reintroduce it.
+        # Knee is sharp: q=0.15 FAILS the gate (+0.331%). Do not raise past 0.125.
+        # Starting roulette earlier (rouletteStartBounce 1/2) FAILED at every
+        # floor tested - that lever is dead, leave it at 3.
+        'rouletteMinQ': 0.10,
+        'rouletteStartBounce': 3,
         # Stream compaction (ReSTIR PT Enhanced 6.2.2 / UE dense-dispatch):
         # phase A queues the ~13% of pixels that scatter, an indirect phase B
         # shades one thread per real path. Attacks the measured 87%-idle
@@ -84,9 +108,13 @@ def render_graph_VNA():
         # alone, and work-stats additionally recompile the sampler with
         # per-step counters. Re-enable in the UI (or here) to diagnose cost;
         # the interval keeps any re-enabled logging to one sync per 60 frames.
-        'logWorkStats': False,
-        'logRisStats': False,
-        'risStatsInterval': 60,
+        # TEMPORARILY ON to diagnose the 30 ms steady state. Interval 64 is one
+        # sync per 64 frames and matches the frame cadence of the logs 52/53
+        # blocks, so the numbers compare directly. Set back to False/False/60
+        # before quoting any shipping perf number.
+        'logWorkStats': True,
+        'logRisStats': True,
+        'risStatsInterval': 64,
     })
     g.addPass(VolumePathTracer, "VolumePathTracer")
 

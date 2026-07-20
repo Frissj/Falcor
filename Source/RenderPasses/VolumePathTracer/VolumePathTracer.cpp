@@ -72,6 +72,8 @@ const char kUseSpatialReuse[] = "useSpatialReuse";
 const char kSpatialNeighbors[] = "spatialNeighbors";
 const char kSpatialRadiusPx[] = "spatialRadiusPx";
 const char kRisTargetFloor[] = "risTargetFloor";
+const char kRouletteMinQ[] = "rouletteMinQ";
+const char kRouletteStartBounce[] = "rouletteStartBounce";
 const char kUseCompaction[] = "useCompaction";
 } // namespace
 
@@ -143,6 +145,10 @@ void VolumePathTracer::parseProperties(const Properties& props)
             mSpatialRadiusPx = value;
         else if (key == kRisTargetFloor)
             mRisTargetFloor = value;
+        else if (key == kRouletteMinQ)
+            mRouletteMinQ = std::clamp((float)value, 0.f, 1.f);
+        else if (key == kRouletteStartBounce)
+            mRouletteStartBounce = (uint32_t)value;
         else if (key == kUseCompaction)
             mUseCompaction = value;
         else
@@ -181,6 +187,8 @@ Properties VolumePathTracer::getProperties() const
     props[kSpatialNeighbors] = mSpatialNeighbors;
     props[kSpatialRadiusPx] = mSpatialRadiusPx;
     props[kRisTargetFloor] = mRisTargetFloor;
+    props[kRouletteMinQ] = mRouletteMinQ;
+    props[kRouletteStartBounce] = mRouletteStartBounce;
     props[kUseCompaction] = mUseCompaction;
     return props;
 }
@@ -309,7 +317,7 @@ void VolumePathTracer::buildBrickBlases(RenderContext* pRenderContext)
     for (uint32_t g = 0; g < mUniqueGrids.size(); ++g)
     {
         const BrickedGrid& bricked = mUniqueGrids[g]->getBrickedGrid();
-        if (bricked.rangeData.empty())
+        if (bricked.rangeMeanData.empty())
         {
             logWarning("VolumePathTracer: grid {} has no CPU bricked data; brick TLAS disabled.", g);
             return;
@@ -321,7 +329,7 @@ void VolumePathTracer::buildBrickBlases(RenderContext* pRenderContext)
             blas.aabbOffset = (uint32_t)aabbs.size();
 
             const int3 dim = bricked.leafDim[mip];
-            const uint32_t* range = bricked.rangeData.data() + bricked.leafOffset[mip];
+            const uint64_t* rangeMean = bricked.rangeMeanData.data() + bricked.leafOffset[mip];
             const float cellSize = float(8u << mip);
             for (int z = 0; z < dim.z; ++z)
             {
@@ -329,7 +337,7 @@ void VolumePathTracer::buildBrickBlases(RenderContext* pRenderContext)
                 {
                     for (int x = 0; x < dim.x; ++x)
                     {
-                        const uint32_t packed = range[(z * dim.y + y) * dim.x + x];
+                        const uint64_t packed = rangeMean[(z * dim.y + y) * dim.x + x];
                         const float majorant = f16tof32((uint16_t)(packed & 0xffffu));
                         if (majorant <= 0.f) continue;
                         RtAABB bb;
@@ -671,7 +679,7 @@ void VolumePathTracer::bakeMergedTail()
     for (const auto& pVolume : volumes)
     {
         const ref<Grid>& pGrid = pVolume->getDensityGrid();
-        if (!pGrid || pGrid->getBrickedGrid().rangeData.empty()) continue;
+        if (!pGrid || pGrid->getBrickedGrid().rangeMeanData.empty()) continue;
         BakeSource src;
         src.bricked = &pGrid->getBrickedGrid();
         src.invTransform = pVolume->getData().invTransform;
@@ -721,8 +729,7 @@ void VolumePathTracer::bakeMergedTail()
 
                         // Walk covering mip-3 cells (64 voxels wide).
                         const int3 dimM = src.bricked->leafDim[3];
-                        const uint32_t* range = src.bricked->rangeData.data() + src.bricked->leafOffset[3];
-                        const uint16_t* mean = src.bricked->meanData.data() + src.bricked->leafOffset[3];
+                        const uint64_t* rangeMean = src.bricked->rangeMeanData.data() + src.bricked->leafOffset[3];
                         const int3 c0 = int3(
                             std::clamp((int)std::floor(iMin.x / 64.f), 0, dimM.x - 1),
                             std::clamp((int)std::floor(iMin.y / 64.f), 0, dimM.y - 1),
@@ -746,9 +753,10 @@ void VolumePathTracer::bakeMergedTail()
                             {
                                 for (int cx = c0.x; cx <= c1.x; ++cx)
                                 {
-                                    const uint32_t packed = range[(cz * dimM.y + cy) * dimM.x + cx];
+                                    // Packed texel: f16 majorant | f16 minorant << 16 | f16 mean << 32.
+                                    const uint64_t packed = rangeMean[(cz * dimM.y + cy) * dimM.x + cx];
                                     instMaj = std::max(instMaj, f16tof32((uint16_t)(packed & 0xffffu)));
-                                    instMeanSum += f16tof32(mean[(cz * dimM.y + cy) * dimM.x + cx]);
+                                    instMeanSum += f16tof32((uint16_t)((packed >> 32) & 0xffffu));
                                     covered++;
                                 }
                             }
@@ -1022,6 +1030,8 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
         var["CB"]["gTemporalMCap"] = mTemporalMCap;
         var["CB"]["gSpatialRadiusPx"] = mSpatialRadiusPx;
         var["CB"]["gRisTargetFloor"] = mRisTargetFloor;
+        var["CB"]["gRouletteMinQ"] = mRouletteMinQ;
+        var["CB"]["gRouletteStartBounce"] = mRouletteStartBounce;
 
         if (mUseBrickTlas && mBrickBlasesValid && mpBrickTlas)
         {
@@ -1299,6 +1309,17 @@ void VolumePathTracer::renderUI(Gui::Widgets& widget)
                 }
             }
             group.var("Target floor (x isotropic)", mRisTargetFloor, 0.f, 1.f);
+            group.var("Roulette min q", mRouletteMinQ, 0.f, 1.f);
+            group.tooltip(
+                "Russian-roulette survival floor: q = max(this, 1 - maxThroughput).\n"
+                "shadeMain (the bounce loop) is the largest single item in the frame\n"
+                "and its cost is path LENGTH; in a high-albedo cloud throughput stays\n"
+                "near 1 so q sits at this floor. Unbiased at any value - raising it\n"
+                "shortens paths and trades cost for variance.",
+                true
+            );
+            group.var("Roulette start bounce", mRouletteStartBounce, 0u, 64u);
+            group.tooltip("Roulette applies only past this bounce index. Lower = shorter paths.", true);
             group.tooltip(
                 "Defensive floor on the RIS target, relative to a fully-lit isotropic\n"
                 "vertex. Bounds the L/Lhat firefly mechanism (matrix: isolated 800-2200x\n"

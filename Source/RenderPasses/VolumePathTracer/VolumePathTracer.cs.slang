@@ -54,6 +54,19 @@ cbuffer CB
     /// target is unbiased, so flooring trades a little selection quality in
     /// dark regions for a bounded weight spread.
     float gRisTargetFloor;
+
+    /// Russian-roulette survival floor and start bounce for the continuation
+    /// loop. Nsight per-dispatch timing puts shadeMain (phase B: shading, NEE
+    /// and the bounce loop) at 18.5-19.8ms of a ~33ms frame - the single
+    /// largest item in the pass, despite only ~13% of pixels enqueueing a path.
+    /// The cost is path LENGTH: in a high-albedo cloud throughput stays near 1,
+    /// so q = max(floor, 1 - maxThp) sits at its floor and paths run tens of
+    /// bounces deep. Roulette is unbiased at ANY q, so both are a pure
+    /// cost/variance trade - raise the floor or start earlier to shorten the
+    /// tail, and let the validation matrix price the variance.
+    /// CB values, not defines: sweeping them must not recompile the shader.
+    float gRouletteMinQ;
+    uint  gRouletteStartBounce;
 }
 
 #ifndef USE_SPATIAL_REUSE
@@ -425,10 +438,10 @@ bool scatterAtVertex<S : ISampleGenerator>(
         return false;
     throughput *= weight;
 
-    if (kUseRussianRoulette && bounce > 3)
+    if (kUseRussianRoulette && bounce > gRouletteStartBounce)
     {
         const float maxThp = max(throughput.x, max(throughput.y, throughput.z));
-        const float q = max(0.05f, 1.f - maxThp);
+        const float q = max(gRouletteMinQ, 1.f - maxThp);
         if (sampleNext1D(sg) < q)
             return false;
         throughput /= (1.f - q);
@@ -784,19 +797,33 @@ void main(uint3 dispatchThreadId: SV_DispatchThreadID)
                                             // stored W's live in the ratio space of
                                             // their OWN ray; a spatial shift needs
                                             // sigmaT_c(y')/sigmaT_i(y_i) (measured
-                                            // -2.2%/neighbor when omitted). The
-                                            // denominator is the source pixel's
-                                            // write-time certificate (_pad1). Best
-                                            // measured residual so far: +0.5..1.0%
-                                            // converged - still above the gate, so
-                                            // spatial ships OFF; kept for iteration.
+                                            // -2.2%/neighbor when omitted). Both
+                                            // halves from the DETERMINISTIC coarse
+                                            // fields. Best measured residual:
+                                            // +0.52% converged at +4.4 ms - still
+                                            // above the gate, so spatial ships OFF;
+                                            // kept for iteration. (The amortized
+                                            // _pad1-certificate variant measured
+                                            // WORSE, +1.0%: its sigma sum lacks the
+                                            // covering-mask restriction this
+                                            // numerator uses - see HANDOFF_4.)
                                             float shiftRatio = 1.f;
 #if USE_SPATIAL_REUSE
                                             if (src > 0)
                                             {
+                                                float sigmaSrc = 0.f;
+                                                for (uint gi = 0; gi < gScene.getGridVolumeCount(); ++gi)
+                                                {
+                                                    const GridVolume gvS = gScene.getGridVolume(gi);
+                                                    Grid gridS;
+                                                    gScene.getGrid(gvS.getDensityGrid(), gridS);
+                                                    const float3 iposS = mul(gvS.data.invTransform, float4(prev.pos, 1.f)).xyz - gridS.getMinIndex();
+                                                    sigmaSrc += volumeSampler.instanceSigmaMean(gvS, gridS, iposS);
+                                                }
                                                 const float odC = volumeSampler.coarseOpticalDepth(Ray(ray.origin, ray.dir, 0.f, tNew));
+                                                const float odS = volumeSampler.coarseOpticalDepth(Ray(gPrevCamPos, dirSrc, 0.f, srcDist));
                                                 const float num = meanSigma * exp(-odC);
-                                                const float den = prev._pad1;
+                                                const float den = sigmaSrc * exp(-odS);
                                                 shiftRatio = den > 1e-8f ? clamp(num / den, 0.f, 8.f) : 0.f;
                                             }
 #endif
@@ -883,32 +910,7 @@ void main(uint3 dispatchThreadId: SV_DispatchThreadID)
                 // T hint for next frame's fused-sweep candidate budget
                 // (MegaLights temporal feedback).
                 cur._pad0 = primaryT;
-#if USE_SPATIAL_REUSE
-                // Cross-ray shift certificate: sigma-hat * T-hat of the
-                // stored sample on THIS ray, so next frame's neighbors get
-                // the reweight denominator for free.
-                float selfH = 0.f;
-                if (selW > 0.f && W > 0.f)
-                {
-                    float sigmaSelf = 0.f;
-                    for (uint gi = 0; gi < gScene.getGridVolumeCount(); ++gi)
-                    {
-                        const GridVolume gvS = gScene.getGridVolume(gi);
-                        Grid gridS;
-                        gScene.getGrid(gvS.getDensityGrid(), gridS);
-                        const float3 iposS = mul(gvS.data.invTransform, float4(cur.pos, 1.f)).xyz - gridS.getMinIndex();
-                        sigmaSelf += volumeSampler.instanceSigmaMean(gvS, gridS, iposS);
-                    }
-                    if (sigmaSelf > 0.f)
-                    {
-                        const float odSelf = volumeSampler.coarseOpticalDepth(Ray(ray.origin, ray.dir, 0.f, selDs.t));
-                        selfH = sigmaSelf * exp(-odSelf);
-                    }
-                }
-                cur._pad1 = selfH;
-#else
                 cur._pad1 = 0.f;
-#endif
                 gReservoirCurr[pixel.y * gFrameDim.x + pixel.x] = cur;
             }
 #endif

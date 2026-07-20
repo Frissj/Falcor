@@ -84,7 +84,7 @@ namespace Falcor
 
             The bricked path (GridVolumeSampler with useBrickedGrid = true, i.e. the
             RatioTrackingLocalMajorant / DeltaTrackingLocalMajorant modes) reads only
-            rangeTex/indirectionTex/atlasTex and never touches the NanoVDB buffer, so
+            rangeMeanTex/indirectionTex/atlasTex and never touches the NanoVDB buffer, so
             keeping it resident is pure waste: the buffer is roughly 6-7x the size of
             the brick textures (see the "~15% increased footprint" note in the ctor).
 
