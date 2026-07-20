@@ -96,6 +96,20 @@ def render_graph_VNA():
         # Section 4: HW-BVH brick TLAS (UE HeterogeneousVolumes port) with
         # per-instance projected-error mip selection.
         'useBrickTlas': True,
+        # 1.0 is correct - do not "fix" the fact that [LOD] shows every instance
+        # at mip 0. Footprints are 0.3-3.5 wu against a 3.60 wu mip0 cell, i.e.
+        # ~6 sub-pixel voxels per pixel, so the projected-error rule is DECLINING
+        # to coarsen, which is UE's Nanite Foliage rule working as intended
+        # (brick size tracks ~1 pixel at every distance; coarser = blocky).
+        # Measured 2026-07-20 at 540p: forcing 16.0 coarsens 6 of 9 instances to
+        # mip 1-2 and moves segments/px 13.6 -> 12.1. It does NOT move
+        # aabbTests/px off 14.6 - but that proves nothing, because statAabbTests
+        # is `+= getGridVolumeCount()` per gatherIntervals call
+        # (VolumeInstanceSampler.slang:246), i.e. 9 software slab tests against
+        # whole-instance bounds in the INTERVAL-LIST path. It is unrelated to the
+        # brick TLAS and cannot respond to mip. There is currently NO counter for
+        # real brick-AABB intersection-shader invocations; add one before making
+        # any claim about RayQuery candidate count.
         'mipPixelThreshold': 1.0,
         # Section 3: merged coarse tail (UE Nanite Assemblies lesson) - far
         # rays march one world-space summed grid.
@@ -164,3 +178,33 @@ m.scene.addViewpoint(float3(792, 258, -320), float3(792, 258, -934), float3(0, 1
 m.scene.addViewpoint(float3(80, 190, 640),   float3(80, 170, 40),    float3(0, 1, 0))
 m.scene.addViewpoint(float3(100, 40, 2000),  float3(-50, 250, -600), float3(0, 1, 0))
 m.scene.selectViewpoint(1)
+
+# ---------------------------------------------------------------------------
+# RESOLUTION - 960x540.
+#
+# The VolumePathTracer pass is ~93% of the frame and EVERY term in it is
+# per-pixel, so quartering the pixels quarters the pass. This is the single
+# largest lever in the project and it is one line.
+#
+# COMPOUNDING BONUS - the LoD system switches itself on. footprintSpread is
+# 2 * tanHalfFovY / targetDim.y * footprintScale, i.e. INVERSELY proportional to
+# vertical resolution. At 1080p footprints are 0.2-1.8 wu against a 3.60 wu mip0
+# cell, so selectResidualMip clamps to mip 0 on every instance every frame and
+# the whole LoD path is dead (this is why footprintScale 2 measured as a null
+# result - it could not fire). At 540p footprints double to 0.4-3.6 wu and start
+# crossing the threshold, so far instances begin selecting mip 1 on their own.
+# Extra saving on top of the 4x, for free, with no code change.
+#
+# Reference point: Nubis3 ships at exactly 960x540; their 2.2-4ms headline is at
+# this resolution, not 1080p.
+#
+# COSTS: image quality, and a temporal upscale pass if you want 1080p output.
+# The temporal machinery (Stage B reservoirs, accumulation) already exists.
+#
+# MEASURE THE QUALITY COST, do not assume it: capture here and at 1280x720 and
+# score both with scripts/VNA_RouletteScore.py against the SAME gate (cloudy-mean
+# masked to top-40% luminance of 01_ref). Note the existing reference baselines
+# are 1080p, so a like-for-like comparison needs references regenerated at each
+# resolution - a raw diff against the 1080p 01_ref measures resampling, not the
+# renderer.
+m.resizeFrameBuffer(960, 540)

@@ -22,7 +22,7 @@ const char kShaderFile[] = "RenderPasses/VolumePathTracer/VolumePathTracer.cs.sl
 const ChannelList kOutputChannels = {
     // clang-format off
     { "color", "gOutputColor", "Output color (radiance)", false, ResourceFormat::RGBA32Float },
-    { "work",  "gWorkDebug",   "Raw work counters: R=segments G=overlapSteps B=aabbTests A=maxCover", true, ResourceFormat::RGBA32Float },
+    { "work",  "gWorkDebug",   "Raw work counters: R=segments G=overlapSteps B=instSlabs A=maxCover", true, ResourceFormat::RGBA32Float },
     // Demodulated split (spec section 6). The three channels below decompose
     // 'color' EXACTLY: color = Lin + transmittance * background, per sample.
     //  - Lin: radiance of paths that scattered at least once (the cloud's own
@@ -1155,12 +1155,12 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
                 // operation volume, and compare against gpuMs to find the
                 // dominant term. No thresholds, no interpretation baked in.
                 logInfo(
-                    "[WORK] frame {} res {}x{} gpuMs {:.3f} | per-pixel: samplerCalls {:.1f} aabbTests {:.1f} "
-                    "segments {:.1f} coarseWalks {:.2f} coarseCells {:.1f} sweepCells {:.1f} sweepTaps {:.2f} "
-                    "| totals: aabb {} coarseCells {}",
+                    "[WORK] frame {} res {}x{} gpuMs {:.3f} | per-pixel: samplerCalls {:.1f} instSlabs {:.1f} "
+                    "brickCands {:.1f} segments {:.1f} coarseWalks {:.2f} coarseCells {:.1f} sweepCells {:.1f} "
+                    "sweepTaps {:.2f} | totals: instSlabs {} brickCands {} coarseCells {}",
                     mFrameCount, targetDim.x, targetDim.y, mLastGpuMs,
-                    s[15] / px, s[9] / px, s[10] / px, s[11] / px, s[12] / px, s[13] / px, s[14] / px,
-                    s[9], s[12]
+                    s[15] / px, s[9] / px, s[29] / px, s[10] / px, s[11] / px, s[12] / px, s[13] / px, s[14] / px,
+                    s[9], s[29], s[12]
                 );
 
                 // Phase attribution of the sampler-internal marching. 'cells'

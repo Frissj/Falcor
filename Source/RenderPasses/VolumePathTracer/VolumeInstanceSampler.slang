@@ -157,7 +157,13 @@ struct VolumeInstanceSampler
     // instance of this struct, so declaring it once per pixel in main() gives
     // per-pixel totals for the whole path, NEE shadow rays included.
     uint statRays;          ///< sampleDistance + evalTransmittance calls.
-    uint statAabbTests;     ///< Instance AABB intersection tests.
+    uint statAabbTests;     ///< Whole-INSTANCE slab tests in gatherIntervals (interval-list path only).
+                            ///< NOTE: this is `+= getGridVolumeCount()` per gather, i.e. a constant
+                            ///< multiple of the gather count. It says nothing about the brick TLAS and
+                            ///< cannot respond to LoD mip - use statBrickCandidates for that.
+    uint statBrickCandidates; ///< Procedural-primitive candidates the brick-TLAS RayQuery handed back,
+                              ///< i.e. real brick AABBs tested. This is the candidate count that
+                              ///< coarser bricks / a two-level BLAS are meant to reduce.
     uint statHitRays;       ///< Rays that intersected at least one instance.
     uint statSegments;      ///< Segments marched (single-cover + overlap).
     uint statOverlapSegs;   ///< Segments that took the slow summed-majorant path.
@@ -1073,6 +1079,7 @@ struct VolumeInstanceSampler
         while (q.Proceed())
         {
             if (q.CandidateType() != CANDIDATE_PROCEDURAL_PRIMITIVE) continue;
+            statBrickCandidates++; // One brick AABB handed back by traversal.
 
             const BrickTlasInstanceInfo info = visInstanceInfo(q.CandidateInstanceIndex());
             const BrickAABB bb = gBrickAABBs[info.aabbOffset + q.CandidatePrimitiveIndex()];
@@ -1119,6 +1126,7 @@ struct VolumeInstanceSampler
         while (q.Proceed())
         {
             if (q.CandidateType() != CANDIDATE_PROCEDURAL_PRIMITIVE) continue;
+            statBrickCandidates++; // One brick AABB handed back by traversal.
 
             const BrickTlasInstanceInfo info = visInstanceInfo(q.CandidateInstanceIndex());
             const BrickAABB bb = gBrickAABBs[info.aabbOffset + q.CandidatePrimitiveIndex()];
@@ -1178,6 +1186,7 @@ struct VolumeInstanceSampler
         while (q.Proceed())
         {
             if (q.CandidateType() != CANDIDATE_PROCEDURAL_PRIMITIVE) continue;
+            statBrickCandidates++; // One brick AABB handed back by traversal.
 
             float allBest = 0.f;
             for (uint j = 0; j < nProc; ++j) allBest = max(allBest, bestT[j]);
@@ -1279,6 +1288,7 @@ struct VolumeInstanceSampler
         while (q.Proceed())
         {
             if (q.CandidateType() != CANDIDATE_PROCEDURAL_PRIMITIVE) continue;
+            statBrickCandidates++; // One brick AABB handed back by traversal.
 
             const BrickTlasInstanceInfo info = visInstanceInfo(q.CandidateInstanceIndex());
             const BrickAABB bb = gBrickAABBs[info.aabbOffset + q.CandidatePrimitiveIndex()];

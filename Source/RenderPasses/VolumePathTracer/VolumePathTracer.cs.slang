@@ -189,6 +189,14 @@ RWTexture2D<float4> gRisDebug;
            s[25]/pixels = average M; equals kRisM when the feature is off)
     [26] = pixels whose reservoir merged a previous-frame sample (Stage B
            temporal reuse activity; 0 when history is invalid or disabled)
+    [27] = brick-cache hits          [28] = brick-cache misses
+    [29] = brick-TLAS procedural candidates (real brick AABBs tested by the
+           RayQuery). THIS is the candidate count, not [9]: [9] is
+           `+= getGridVolumeCount()` per gatherIntervals call and is a constant
+           multiple of the gather count, blind to the brick TLAS and to LoD mip.
+           Measured 2026-07-20: forcing 6 of 9 instances to mip 1-2 left [9]
+           pinned at 14.6/px, which is why [27] had to exist before any claim
+           about coarser bricks (HANDOFF_6 6.1) can be made.
 */
 RWStructuredBuffer<uint> gRisStats;
 
@@ -1078,6 +1086,7 @@ void main(uint3 dispatchThreadId: SV_DispatchThreadID)
         const uint tapsShade = gvsTapsNow() - tapsMark;
 
         const uint a = WaveActiveSum(volumeSampler.statAabbTests);
+        const uint a2 = WaveActiveSum(volumeSampler.statBrickCandidates);
         const uint b = WaveActiveSum(volumeSampler.statSegments);
         const uint c = WaveActiveSum(volumeSampler.statCoarseWalks);
         const uint d = WaveActiveSum(volumeSampler.statCoarseCells);
@@ -1103,6 +1112,7 @@ void main(uint3 dispatchThreadId: SV_DispatchThreadID)
         if (WaveIsFirstLane())
         {
             if (a > 0) InterlockedAdd(gRisStats[9], a);
+            if (a2 > 0) InterlockedAdd(gRisStats[29], a2);
             if (b > 0) InterlockedAdd(gRisStats[10], b);
             if (c > 0) InterlockedAdd(gRisStats[11], c);
             if (d > 0) InterlockedAdd(gRisStats[12], d);
@@ -1229,6 +1239,7 @@ void shadeMain(uint3 dispatchThreadId: SV_DispatchThreadID)
     // kernel's shading bucket, so the log stays comparable across modes.
     {
         const uint a = WaveActiveSum(volumeSampler.statAabbTests);
+        const uint a2 = WaveActiveSum(volumeSampler.statBrickCandidates);
         const uint b = WaveActiveSum(volumeSampler.statSegments);
         const uint g2 = WaveActiveSum(volumeSampler.statRays);
         const uint h4 = WaveActiveSum(gvsCellsNow());
@@ -1246,6 +1257,7 @@ void shadeMain(uint3 dispatchThreadId: SV_DispatchThreadID)
         if (WaveIsFirstLane())
         {
             if (a > 0) InterlockedAdd(gRisStats[9], a);
+            if (a2 > 0) InterlockedAdd(gRisStats[29], a2);
             if (b > 0) InterlockedAdd(gRisStats[10], b);
             if (g2 > 0) InterlockedAdd(gRisStats[15], g2);
             if (h4 > 0) InterlockedAdd(gRisStats[20], h4);
