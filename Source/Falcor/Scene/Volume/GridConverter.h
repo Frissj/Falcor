@@ -118,6 +118,29 @@ namespace Falcor
         std::vector<uint64_t> mRangeMeanData;
         std::vector<uint32_t> mPtrData;
         std::vector<TexelType> mAtlasData;
+
+        // Per-brick occupancy bitmask, one uint32 per mip-0 brick (UE Nanite
+        // Foliage lesson, HANDOFF_6 6.3 - their FBrick carries a 64-bit mask and
+        // steps DDA in registers with zero memory traffic).
+        //
+        // A bit is 1 if that group of voxels can decode to anything other than
+        // exactly 0. Granularity is deliberately ONE BC4 TILE (4x4x1), giving
+        // 2*2*8 = 32 tiles per 8^3 brick, so the whole mask is a single uint32
+        // that lives in a register at runtime.
+        //
+        // WHY TILE GRANULARITY AND NOT 2^3 CELLS: the atlas is BC4-compressed
+        // (Grid.cpp uses NanoVDBConverterBC4). BC4 fits endpoints across all 16
+        // texels of a 4x4 tile, so a sub-cell that straddles tiles can decode to
+        // a nonzero value even when its own source voxels were empty - masking
+        // at that granularity would skip taps that should have returned more
+        // than the minorant, i.e. a systematic BIAS. At tile granularity the
+        // test is exact by construction: all 16 quantized texels 0 => both BC4
+        // endpoints 0 => every texel decodes to exactly 0 => the sampler's
+        // 0 * (majorant - minorant) + minorant is exactly the minorant, which
+        // the brick cache already holds. Skipping is bit-identical, not an
+        // approximation. Do not "improve" this to a finer granularity without
+        // decoding the compressed block first.
+        std::vector<uint32_t> mOccupancyData;
         std::atomic_uint32_t mNonEmptyCount;
 
         /** Pack one brick's (majorant, minorant, mean) into an RGBA16Float texel. */
@@ -155,6 +178,7 @@ namespace Falcor
         uint leafTexelCount = atlasSizePixels.x * atlasSizePixels.y * atlasSizePixels.z;
         mRangeMeanData.resize(mLeafCount[3]);
         mPtrData.resize(mLeafCount[0]);
+        mOccupancyData.resize(mLeafCount[0]); // Zero = fully empty; filled per non-empty brick below.
         mAtlasData.resize(kBC4Compress ? (leafTexelCount / 16) : leafTexelCount);
     }
 
@@ -169,6 +193,7 @@ namespace Falcor
         size_t offset = z * mLeafDim[0].x * mLeafDim[0].y;
         uint64_t* rangemeandst = mRangeMeanData.data() + offset;
         uint32_t* ptrdst = mPtrData.data() + offset;
+        uint32_t* occdst = mOccupancyData.data() + offset;
         auto a = mpFloatGrid->getAccessor();
         for (int y = 0; y < mLeafDim[0].y; ++y)
         {
@@ -212,6 +237,11 @@ namespace Falcor
                     // bricks becomes purely analytic.
                     *rangemeandst++ = packRangeMean(majorant, majorant, majorant);
                     *ptrdst++ = 0;
+                    // Collapsed range: the sampler returns exactly 'majorant'
+                    // everywhere here regardless of what the atlas holds, so an
+                    // all-zero mask makes every tap in this brick skip the atlas
+                    // read and return the cached minorant (== majorant). Exact.
+                    *occdst++ = 0;
                 }
                 else
                 {
@@ -230,6 +260,11 @@ namespace Falcor
                     uint32_t atlasz = myleaf / bricksPerSlice;
                     *ptrdst++ = (atlasx + (atlasy << 8) + (atlasz << 16));
 
+                    // Occupancy bits for this brick, indexed the same way the
+                    // sampler will: tile = (vx>>2) | ((vy>>2)<<1) | (vz<<2),
+                    // where (vx,vy,vz) = vox & 7.
+                    uint32_t occ = 0;
+
                     if (!kBC4Compress) {
                         float invRange = ((1 << kBitsPerTexel) - 1.f) / (majorant - minorant);
                         TexelType* atlasdst = (TexelType*)mAtlasData.data() + atlasx * kBrickSize + atlasy * (atlasSizePixels.x * kBrickSize) + atlasz * (pixelsPerSlice * kBrickSize);
@@ -240,7 +275,12 @@ namespace Falcor
                                 for (int pixx = 0; pixx < kBrickSize; ++pixx)
                                 {
                                     float f = data[pixx * kBrickSize * kBrickSize + pixy * kBrickSize + pixz];
-                                    *atlasdst++ = TexelType((f - minorant) * invRange);
+                                    const TexelType texel = TexelType((f - minorant) * invRange);
+                                    // Same tile granularity as the BC4 path so
+                                    // the runtime test is identical either way.
+                                    if (texel != TexelType(0))
+                                        occ |= 1u << ((pixx >> 2) | ((pixy >> 2) << 1) | (pixz << 2));
+                                    *atlasdst++ = texel;
                                 }
                                 atlasdst += (atlasSizePixels.x - kBrickSize); // next scanline
                             }
@@ -269,6 +309,13 @@ namespace Falcor
                                             tilevals[pixy][pixx] = voxel;
                                         }
                                     }
+                                    // tilemajorant == 0 means all 16 quantized
+                                    // texels are 0, so BC4 emits both endpoints
+                                    // as 0 and every texel decodes to exactly 0.
+                                    // Anything else must keep its bit set.
+                                    if (tilemajorant != 0)
+                                        occ |= 1u << ((tilex >> 2) | ((tiley >> 2) << 1) | (pixz << 2));
+
                                     CompressAlphaDxt5((uint8_t*)&tilevals[0][0], atlasdst);
                                     atlasdst++;
                                 }
@@ -277,6 +324,8 @@ namespace Falcor
                             atlasdst += (pixelsPerSlice / 16 - (atlasSizePixels.x / 4 * kBrickSize / 4)); // next slice
                         } // z slice loop
                     } // bc4 compress?
+
+                    *occdst++ = occ;
                 } // non empty brick?
             } // x brick loop
         } // y brick loop
@@ -339,6 +388,7 @@ namespace Falcor
         BrickedGrid bricks;
         bricks.rangeMean = pDevice->createTexture3D(mLeafDim[0].x, mLeafDim[0].y, mLeafDim[0].z, ResourceFormat::RGBA16Float, 4, mRangeMeanData.data(), ResourceBindFlags::ShaderResource);
         bricks.indirection = pDevice->createTexture3D(mLeafDim[0].x, mLeafDim[0].y, mLeafDim[0].z, ResourceFormat::RGBA8Uint, 1, mPtrData.data(), ResourceBindFlags::ShaderResource);
+        bricks.occupancy = pDevice->createTexture3D(mLeafDim[0].x, mLeafDim[0].y, mLeafDim[0].z, ResourceFormat::R32Uint, 1, mOccupancyData.data(), ResourceBindFlags::ShaderResource);
         bricks.atlas = pDevice->createTexture3D(getAtlasSizePixels().x, getAtlasSizePixels().y, getAtlasSizePixels().z, getAtlasFormat(), 1, mAtlasData.data(), ResourceBindFlags::ShaderResource);
 
         // Hand the CPU pyramids to the BrickedGrid (moved, not copied - the

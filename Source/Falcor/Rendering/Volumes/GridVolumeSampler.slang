@@ -111,9 +111,40 @@ void gvsStatTap()
 static int3 gGvsBrickKey = int3(-1, -1, -1); ///< Cached brick coord; sentinel no valid index produces.
 static uint3 gGvsBrickPtr = uint3(0, 0, 0);  ///< Cached indirection result for gGvsBrickKey.
 static float2 gGvsBrickRange = float2(0.f, 0.f); ///< Cached (majorant, minorant) for gGvsBrickKey.
+static uint gGvsBrickOcc = 0u;               ///< Cached occupancy mask for gGvsBrickKey (see Grid.slang).
+
+/** Runtime A/B switch for the occupancy skip (HANDOFF_6 6.3).
+
+    A UNIFORM, not a define, on purpose: the only trustworthy way to price this
+    change is to flip it inside ONE process and compare [COST] lines from the
+    same session. Cross-session gpuMs on this machine has twice shown ~25% drift
+    with bit-identical work counters, which is larger than the effect being
+    measured. A define would force a reload and reintroduce exactly that drift.
+
+    Cost of the switch itself: the mask is loaded either way (it rides along with
+    the range/ptr fetch already on the cache-miss path), so disabling this
+    measures the skip, not the load. That asymmetry is deliberate - it isolates
+    the branch + saved-load from the added fetch. Set 0 and the sampler is
+    behaviourally identical to the pre-6.3 build.
+
+    A per-thread static set from the caller's CB, NOT a module-scope `uniform`.
+    Falcor core declares no module-scope uniforms anywhere, and introducing one
+    here produced an E_INVALIDARG on the very first dispatchCompute - the loose
+    global never got a valid binding. Statics are how this file already carries
+    per-thread state (see gGvsBrickKey), so the flag rides in the same way and
+    the pass owns the actual uniform.
+*/
+static uint gGvsOccSkipEnable = 1u;
+
+/** Set by the entry point once per thread, from the pass's CB. */
+void gvsSetOccSkipEnable(const uint enable)
+{
+    gGvsOccSkipEnable = enable;
+}
 #if GRID_VOLUME_SAMPLER_STATS
 static uint gGvsStatBrickHits = 0;   ///< Taps served from the cached brick.
 static uint gGvsStatBrickMisses = 0; ///< Taps that had to re-chase the indirection.
+static uint gGvsStatTapSkips = 0;    ///< Taps answered from the occupancy mask, atlasTex never read.
 #endif
 
 /** Invalidate the brick cache. MUST be called at the start of every walk, before
@@ -157,6 +188,7 @@ float gvsLookupMajorantCached(const Grid densityGrid, const int3 index, const in
         gGvsBrickKey = brick;
         gGvsBrickRange = densityGrid.rangeMeanTex[brick].xy;
         gGvsBrickPtr = densityGrid.indirectionTex[brick].xyz;
+        gGvsBrickOcc = densityGrid.occupancyTex[brick];
 #if GRID_VOLUME_SAMPLER_STATS
         gGvsStatBrickMisses++;
 #endif
@@ -179,6 +211,7 @@ float gvsLookupStochasticCached(const Grid densityGrid, const float3 index, cons
         gGvsBrickKey = brick;
         gGvsBrickRange = densityGrid.rangeMeanTex[brick].xy;
         gGvsBrickPtr = densityGrid.indirectionTex[brick].xyz;
+        gGvsBrickOcc = densityGrid.occupancyTex[brick];
 #if GRID_VOLUME_SAMPLER_STATS
         gGvsStatBrickMisses++;
 #endif
@@ -189,6 +222,25 @@ float gvsLookupStochasticCached(const Grid densityGrid, const float3 index, cons
         gGvsStatBrickHits++;
     }
 #endif
+    // Occupancy early-out (UE Nanite Foliage ProcessBrickPixel lesson): the mask
+    // is already in a register, so a tap into an all-zero BC4 tile is answered
+    // by one shift and one AND instead of a dependent atlasTex load. That load
+    // profiles at LONG SCOREBOARD 83-86% and is the single most-stalled
+    // instruction in the frame, so not issuing it is worth more than making it
+    // faster.
+    //
+    // This is EXACT, not an approximation. A clear bit means every voxel in the
+    // tile decodes to exactly 0, and 0 * (majorant - minorant) + minorant is
+    // exactly the minorant, which is the value we return. See GridConverter.h
+    // for why the granularity is a BC4 tile.
+    if (gGvsOccSkipEnable != 0u && (gGvsBrickOcc & (1u << gridBrickTileBit(vox))) == 0u)
+    {
+#if GRID_VOLUME_SAMPLER_STATS
+        gGvsStatTapSkips++;
+#endif
+        return gGvsBrickRange.y;
+    }
+
     return densityGrid.atlasTex[(gGvsBrickPtr.xyz << 3) + (vox & 7)].x * (gGvsBrickRange.x - gGvsBrickRange.y) + gGvsBrickRange.y;
 }
 

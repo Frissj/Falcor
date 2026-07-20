@@ -88,6 +88,20 @@ REM                              attribution comes from samples, not from timing
 REM --architecture Ada         : scopes the two options below to this GPU.
 REM --metric-set-id 2          : Ada's "Top-Level Triage" (the GUI default).
 REM --real-time-shader-profiler: the whole point of this script (see header).
+REM --multi-pass-metrics       : REQUIRED for the Trace Analysis view. Without
+REM                              it that view banners "Analysis view works best
+REM                              with the multi-pass metrics enabled - analysis
+REM                              results will be limited" and collapses almost
+REM                              every category: the 2026-07-20 capture produced
+REM                              exactly ONE populated entry under "Warp Launch
+REM                              Stalled by Reasons" (CS Warp Launch Stalled
+REM                              Register Allocation, 25.4%). That single entry
+REM                              was enough to prove the kernel is register-
+REM                              limited, but SM Warp Issue Stalls, SM Warp
+REM                              Occupancy and Unit Throughputs all stayed empty.
+REM                              Costs extra passes over MULTIPLE frames, so the
+REM                              capture takes longer - worth it for analysis
+REM                              runs, drop it for a quick sample-only pass.
 REM --limit-to-frames 5        : a handful of steady-state frames is plenty; 5
 REM                              frames already yields ~8M SM samples, ample for
 REM                              the entries that matter.
@@ -107,6 +121,7 @@ REM                              "Invalid activity options".
   --architecture Ada ^
   --metric-set-id 2 ^
   --real-time-shader-profiler ^
+  --multi-pass-metrics ^
   --start-after-frames 200 ^
   --limit-to-frames 5 ^
   --max-duration-ms 4000 ^

@@ -622,10 +622,18 @@ struct VolumeInstanceSampler
         // coarseOpticalDepth is NOT the kernel's register high-water mark -
         // look in main/shadeMain before trying this again.
         //
-        // If register pressure IS attacked later, do it the way UE's voxel
-        // raster does (NaniteRasterizer.usf ~1278): stage the data in
-        // groupshared - LDS is at 36.9% with headroom - rather than recomputing
-        // it. That drops registers WITHOUT adding SM work.
+        // If register pressure IS attacked later, the obvious move is UE's voxel
+        // raster trick (NaniteRasterizer.usf ~1278): stage the data in
+        // groupshared rather than recomputing it, dropping registers without
+        // adding SM work.
+        //
+        // DO NOT do that here without re-measuring first. The "LDS has headroom"
+        // premise is dead: a multi-pass Nsight capture (analysis.yaml, 2026-07-20)
+        // shows CS Warp Launch Stalled Shared Memory Allocation at 11.21%
+        // (FrameGain 10.6%) - the SECOND launch-stall reason behind register
+        // allocation's 22.78%. main already allocates 23552 B/CTA. Moving state
+        // into LDS trades a register stall for a smem stall on a kernel that is
+        // measurably limited by both.
         GridVolumeSampler gvs = {};
         float3 ipos[kMaxInstances];
         float3 idir[kMaxInstances];

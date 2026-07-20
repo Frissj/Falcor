@@ -61,6 +61,7 @@ const char kUseAdaptiveM[] = "useAdaptiveM";
 const char kUseTemporalReuse[] = "useTemporalReuse";
 const char kTemporalMCap[] = "temporalMCap";
 const char kUseBrickTlas[] = "useBrickTlas";
+const char kUseOccupancySkip[] = "useOccupancySkip";
 const char kMipPixelThreshold[] = "mipPixelThreshold";
 const char kUseMergedTail[] = "useMergedTail";
 const char kTailRes[] = "tailRes";
@@ -123,6 +124,8 @@ void VolumePathTracer::parseProperties(const Properties& props)
             mTemporalMCap = value;
         else if (key == kUseBrickTlas)
             mUseBrickTlas = value;
+        else if (key == kUseOccupancySkip)
+            mUseOccupancySkip = value;
         else if (key == kMipPixelThreshold)
             mMipPixelThreshold = value;
         else if (key == kUseMergedTail)
@@ -176,6 +179,7 @@ Properties VolumePathTracer::getProperties() const
     props[kUseTemporalReuse] = mUseTemporalReuse;
     props[kTemporalMCap] = mTemporalMCap;
     props[kUseBrickTlas] = mUseBrickTlas;
+    props[kUseOccupancySkip] = mUseOccupancySkip;
     props[kMipPixelThreshold] = mMipPixelThreshold;
     props[kUseMergedTail] = mUseMergedTail;
     props[kTailRes] = mTailRes;
@@ -1024,6 +1028,7 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
         var["CB"]["gFrameCount"] = mFrameCount;
         var["CB"]["gFrameDim"] = targetDim;
         var["CB"]["gFootprintSpread"] = footprintSpread;
+        var["CB"]["gOccSkipEnable"] = mUseOccupancySkip ? 1u : 0u;
         var["CB"]["gPrevViewProj"] = mPrevViewProj;
         var["CB"]["gPrevCamPos"] = mPrevCamPos;
         var["CB"]["gTemporalEnable"] = (temporalActive && mPrevCamValid) ? 1u : 0u;
@@ -1042,6 +1047,7 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
             if (auto v = var.findMember("gBrickAABBs"); v.isValid())
                 v = mpBrickAABBs;
         }
+
 
         if (temporalCompiled)
         {
@@ -1174,7 +1180,7 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
                     "[COST] frame {} | per-pixel cells/taps: escapeT {:.1f}/{:.1f} candGen {:.1f}/{:.1f} "
                     "shadeNEE {:.1f}/{:.1f} sweep {:.1f}/{:.1f} | overlap steps {:.2f} lookups {:.2f} "
                     "| tailRays {:.2f}/entry | totals: cells {} taps {} "
-                    "| brickCache hit {:.1f}% ({}/{})",
+                    "| brickCache hit {:.1f}% ({}/{}) | occSkip {:.1f}% ({})",
                     mFrameCount,
                     s[16] / px, s[17] / px, s[18] / px, s[19] / px,
                     s[20] / px, s[21] / px, s[13] / px, s[14] / px,
@@ -1186,7 +1192,15 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
                     // rangeMean and indirection loads AND removes the dependent
                     // hop into atlasTex. A low rate means revert, not tune.
                     (s[27] + s[28]) > 0 ? 100.0 * double(s[27]) / double(s[27] + s[28]) : 0.0,
-                    s[27], s[27] + s[28]
+                    s[27], s[27] + s[28],
+                    // Occupancy-mask payoff (HANDOFF_6 6.3): the share of taps
+                    // answered from the register-resident bitmask with no
+                    // atlasTex read. totalTaps still counts these - they are
+                    // real taps, just no longer memory-bound - so this is the
+                    // fraction of the most-stalled load in the frame that is
+                    // simply not issued any more.
+                    totalTaps > 0 ? 100.0 * double(s[30]) / double(totalTaps) : 0.0,
+                    s[30]
                 );
 
                 // What the projected-error LoD actually decided this frame:
@@ -1359,6 +1373,21 @@ void VolumePathTracer::renderUI(Gui::Widgets& widget)
             "identical to the interval backend.",
             true
         );
+        group.checkbox("Occupancy tap skip", mUseOccupancySkip);
+        group.tooltip(
+            "HANDOFF_6 6.3 / UE Nanite Foliage brick mask. A tap landing in an\n"
+            "all-zero BC4 tile returns the cached minorant from a register-\n"
+            "resident bitmask instead of reading atlasTex - the load that\n"
+            "profiles at LONG SCOREBOARD 83-86%.\n\n"
+            "EXACT: a clear bit means every voxel in the tile decodes to exactly\n"
+            "0, so the skipped result is bit-identical. Toggling this must not\n"
+            "change the image or any work counter - only occSkip and gpuMs.\n\n"
+            "Flip it WITHIN one session and compare [COST]. Cross-session gpuMs\n"
+            "here has twice drifted ~25% with identical work counters, which is\n"
+            "bigger than the effect being measured.",
+            true
+        );
+
         if (mUseBrickTlas)
         {
             group.var("Mip pixel threshold", mMipPixelThreshold, 0.125f, 16.f);

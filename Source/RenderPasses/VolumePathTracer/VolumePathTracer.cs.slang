@@ -32,6 +32,7 @@ cbuffer CB
     /// World-space pixel-footprint growth per unit distance
     /// (2*tan(fovY/2)/resY * user scale). 0 = footprint-driven residual mip off.
     float gFootprintSpread;
+    uint gOccSkipEnable;    ///< 6.3 occupancy tap skip on/off. Pushed into the sampler per thread.
     /// Stage B temporal reuse: previous frame's camera.
     float4x4 gPrevViewProj;
     float3 gPrevCamPos;
@@ -132,6 +133,20 @@ uint gvsBrickMissesNow()
 {
 #if GRID_VOLUME_SAMPLER_STATS
     return gGvsStatBrickMisses;
+#else
+    return 0;
+#endif
+}
+
+/** Taps answered from the per-brick occupancy mask without reading atlasTex
+    (HANDOFF_6 6.3). This is the payoff metric for the mask: skips/taps is the
+    fraction of the frame's most-stalled load that is no longer issued. If it is
+    near zero the bricks are internally dense and the mask is dead weight.
+*/
+uint gvsTapSkipsNow()
+{
+#if GRID_VOLUME_SAMPLER_STATS
+    return gGvsStatTapSkips;
 #else
     return 0;
 #endif
@@ -483,9 +498,59 @@ bool scatterAtVertex<S : ISampleGenerator>(
     return true;
 }
 
-[numthreads(16, 16, 1)]
+// CTA SHAPE IS A PERF KNOB, NOT A LAYOUT CHOICE. This kernel has no
+// groupshared, no SV_GroupThreadID, no barriers, and its only wave ops are
+// wave-scoped (32-lane) stat reductions, so any multiple of 32 is correct and
+// produces an identical image. The shape is tuned, and here is what it buys:
+//
+// The driver allocates ~92 B/thread of shared memory for the RayQuery inline-RT
+// traversal stack. Nothing declares it - there is no groupshared anywhere in
+// this pass or its includes, and the compiled DXIL has zero addrspace(3)
+// (verified by disassembling the shader cache, 2026-07-20). It is a fixed
+// per-thread cost of using RayQuery at all, so per-CTA smem = threads * 92 B:
+//     16x16 = 256 thr -> 23552 B/CTA   (what Nsight reported)
+//      8x8  =  64 thr ->  5888 B/CTA
+// Proof it is the traversal stack and not the indexable temp arrays: shadeMain
+// has ZERO allocas yet still gets 76 B/thread; main has 69 allocas and gets 92.
+// smem tracks threads and RayQuery, not array count.
+//
+// That mattered because analysis.yaml (multi-pass capture) shows BOTH launch
+// stalls live on this kernel: register allocation 22.78% and shared-memory
+// allocation 11.21%. A smaller CTA cuts smem/CTA directly, and also lets the
+// hardware hit finer register-count targets instead of the hard 2-CTA wall the
+// 128-register cap imposes at 256 threads.
+//
+// MEASURED (analysis2.yaml, 8x8 vs analysis.yaml, 16x16):
+//   smem launch stall   11.21% -> 0.43%   (10,607,172 -> 383,346 cycles)
+//   register stall      22.78% -> 28.05%  (now the SOLE limiter)
+//   CS warps/cycle      30.20% -> 31.22%  (unchanged, and correctly so)
+//
+// Occupancy did NOT move and could not have. While registers bind, total
+// resident warps = 65536 / (regs_per_thread * 32) and CTA SHAPE CANCELS:
+// 16x16 gives 2 CTAs * 8 warps, 8x8 gives 8 CTAs * 2 warps, both = 16 warps.
+// The reshape removes the shared-memory co-constraint; it does not and cannot
+// raise occupancy on its own.
+//
+// WHAT IT DOES BUY: a much finer register step function. At 256 threads every
+// value from 128 down to 81 gave the same 16 warps (which is why four separate
+// register-cutting attempts all returned <=3%). At 64 threads:
+//     128 regs -> 16 warps      96 regs -> 20 warps
+//     112 regs -> 18 warps      80 regs -> 24 warps
+// So incremental register cuts now pay incrementally. Do not carry over the old
+// "nothing between 128 and 81 changes anything" rule - it was a property of the
+// 256-thread CTA, not of the kernel.
+//
+// Frame-time effect is UNMEASURED. The cross-capture cycle delta is not
+// trustworthy (the two ranges swept different amounts of raster work: EarlyZ
+// samples 7.50M vs 3.46M) and cumulative CS warp latency moved only -2.75%.
+// Same-session A/B is the only trustworthy comparison on this machine.
+//
+// REVERT TO 16x16 IF IT REGRESSES. Smaller CTAs mean more of them and more
+// scheduling overhead. Worth trying 8x4 = 32 (one wave per CTA) as well.
+[numthreads(8, 8, 1)]
 void main(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
+    gvsSetOccSkipEnable(gOccSkipEnable);
     const uint2 pixel = dispatchThreadId.xy;
     if (any(pixel >= gFrameDim))
         return;
@@ -1108,6 +1173,7 @@ void main(uint3 dispatchThreadId: SV_DispatchThreadID)
         // it was a counting bug, not a coverage problem. Wave ops must be issued
         // with all lanes active, so they belong here, not below.
         const uint h9 = WaveActiveSum(gvsBrickHitsNow());
+        const uint h11 = WaveActiveSum(gvsTapSkipsNow());
         const uint h10 = WaveActiveSum(gvsBrickMissesNow());
         if (WaveIsFirstLane())
         {
@@ -1130,6 +1196,7 @@ void main(uint3 dispatchThreadId: SV_DispatchThreadID)
             if (h8 > 0) InterlockedAdd(gRisStats[24], h8);
             if (h9 > 0) InterlockedAdd(gRisStats[27], h9);
             if (h10 > 0) InterlockedAdd(gRisStats[28], h10);
+            if (h11 > 0) InterlockedAdd(gRisStats[30], h11);
         }
     }
 #endif
@@ -1159,6 +1226,7 @@ void main(uint3 dispatchThreadId: SV_DispatchThreadID)
 [numthreads(64, 1, 1)]
 void shadeMain(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
+    gvsSetOccSkipEnable(gOccSkipEnable);
     const uint queueIdx = dispatchThreadId.x;
     if (queueIdx >= gScatterCount[0])
         return;
@@ -1253,6 +1321,7 @@ void shadeMain(uint3 dispatchThreadId: SV_DispatchThreadID)
         // it was a counting bug, not a coverage problem. Wave ops must be issued
         // with all lanes active, so they belong here, not below.
         const uint h9 = WaveActiveSum(gvsBrickHitsNow());
+        const uint h11 = WaveActiveSum(gvsTapSkipsNow());
         const uint h10 = WaveActiveSum(gvsBrickMissesNow());
         if (WaveIsFirstLane())
         {
@@ -1267,6 +1336,7 @@ void shadeMain(uint3 dispatchThreadId: SV_DispatchThreadID)
             if (h8 > 0) InterlockedAdd(gRisStats[24], h8);
             if (h9 > 0) InterlockedAdd(gRisStats[27], h9);
             if (h10 > 0) InterlockedAdd(gRisStats[28], h10);
+            if (h11 > 0) InterlockedAdd(gRisStats[30], h11);
         }
     }
 #endif

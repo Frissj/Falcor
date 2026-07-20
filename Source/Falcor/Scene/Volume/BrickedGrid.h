@@ -49,6 +49,15 @@ namespace Falcor
         ref<Texture> indirection;
         ref<Texture> atlas;
 
+        // Per-brick occupancy bitmask, R32Uint, mip-0 brick dims. Bit t is set
+        // if BC4 tile t (4x4x1 voxels, t = (vx>>2) | ((vy>>2)<<1) | (vz<<2))
+        // can decode to anything other than exactly 0. A clear bit lets the
+        // sampler return the brick minorant WITHOUT touching the atlas - the
+        // dependent load that dominates the frame. See GridConverter.h for why
+        // the granularity is a BC4 tile and not a 2^3 cell (finer granularity
+        // would be biased under BC4).
+        ref<Texture> occupancy;
+
         // CPU-side copies of the range/mean pyramids, kept after conversion.
         // Consumers (UE-lesson ports, see VNA_UE_SOURCE_LESSONS.md):
         //  - brick-AABB extraction for the HW-BVH: occupied bricks at a chosen

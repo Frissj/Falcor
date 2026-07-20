@@ -28,6 +28,17 @@
 #define PNANOVDB_HLSL
 #include "nanovdb/PNanoVDB.h"
 
+/** Bit index, within a brick's occupancy mask, of the BC4 tile containing an
+    index-space voxel coordinate. Free function rather than a Grid member: it
+    depends only on the coordinate, and the sampler calls it as a bare
+    identifier. MUST match the bit order written by GridConverter.
+*/
+uint gridBrickTileBit(const int3 vox)
+{
+    const int3 v = vox & 7;
+    return uint((v.x >> 2) | ((v.y >> 2) << 1) | (v.z << 2));
+}
+
 /** Voxel grid based on NanoVDB.
 */
 struct Grid
@@ -50,6 +61,13 @@ struct Grid
     Texture3D<float4> rangeMeanTex;
     Texture3D<uint4> indirectionTex;
     Texture3D<float> atlasTex;
+
+    // Per-brick occupancy mask (see BrickedGrid.h). One uint32 per mip-0 brick,
+    // one bit per BC4 tile (4x4x1 voxels). A clear bit means every voxel in that
+    // tile decodes to exactly 0, so the sampler's
+    // 0 * (majorant - minorant) + minorant collapses to the minorant and the
+    // atlasTex read can be skipped entirely - the point of the whole mask.
+    Texture3D<uint> occupancyTex;
 
     /** Get the minimum index stored in the grid.
         \return Returns minimum index stored in the grid.

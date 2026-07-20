@@ -129,6 +129,7 @@ namespace Falcor
         var["buf"] = mpBuffer;
         var["rangeMeanTex"] = mBrickedGrid.rangeMean;
         var["indirectionTex"] = mBrickedGrid.indirection;
+        var["occupancyTex"] = mBrickedGrid.occupancy;
         var["atlasTex"] = mBrickedGrid.atlas;
         var["minIndex"] = getMinIndex();
         var["minValue"] = getMinValue();

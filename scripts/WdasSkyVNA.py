@@ -126,6 +126,39 @@ def render_graph_VNA():
         # sync per 64 frames and matches the frame cadence of the logs 52/53
         # blocks, so the numbers compare directly. Set back to False/False/60
         # before quoting any shipping perf number.
+        # OCCUPANCY EXPERIMENT (2026-07-20). Nsight says `main` uses 128
+        # registers -> 65536/128 = 512 threads = exactly 16 warps = 33.3%
+        # occupancy (measured CS occupancy 33.5%). Registers are the SOLE
+        # limiter: smem 23552 B/CTA would allow 4 CTAs, registers allow 2.
+        # Occupancy is a STEP function at a 256-thread CTA:
+        #     2 CTAs = 16 warps (33%)  <- here, at 128 regs
+        #     3 CTAs = 24 warps (50%)  <- needs <= 80 regs
+        #     4 CTAs = 32 warps (67%)  <- needs <= 64 regs
+        # 128->112->96 buys NOTHING. This is why register cuts measured as
+        # null results 4 times: they were on the flat part of the step.
+        #
+        # These two flags drive USE_WORK_STATS / USE_RIS_STATS /
+        # GRID_VOLUME_SAMPLER_STATS (VolumePathTracer.cpp ~822-826), which gate
+        # the readback of ~14 uint stat* fields on VolumeInstanceSampler plus
+        # the gGvs* statics. With them off those fields are write-only and
+        # should be dead-code eliminated. Being a define, this needs NO C++
+        # rebuild - Falcor recompiles the shader on the changed define.
+        #
+        # RESULT (measured, both captures 2026-07-20): turning these OFF moved
+        # `main` from 128 registers to ... 128 registers. Live registers 126 ->
+        # 125, warps 16 -> 16, smem 23552 -> 23552. shadeMain: 96 -> 96 regs
+        # (smem 4864 -> 2304, live 92 -> 87), still 20 warps.
+        #
+        # So THE INSTRUMENTATION IS FREE in register terms and does not cap
+        # occupancy - the ~14 stat* fields are write-only under the defines and
+        # DXC eliminates them. Left ON deliberately: there is no register reason
+        # to run blind. (The per-frame readback sync is a separate, real cost -
+        # that is what risStatsInterval is for.)
+        #
+        # The 128 registers are STRUCTURAL. Whatever gets `main` to <= 80 has to
+        # come out of the live state held across the marching loop - the
+        # RayQuery objects, the reservoir, the sampler's non-stat fields - not
+        # out of diagnostics.
         'logWorkStats': True,
         'logRisStats': True,
         'risStatsInterval': 64,
