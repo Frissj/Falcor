@@ -663,6 +663,29 @@ void main(uint3 dispatchThreadId: SV_DispatchThreadID)
             // the largest work term in the pass.
             const VolumeInstanceSampler::IntervalList primaryList = volumeSampler.gatherIntervals(ray);
 
+            // LIVE-STATE DIGEST (register cut, see the numthreads note on main).
+            // primaryList is 27 values (9 ids + 9 t0 + 9 t1). Its two LATE
+            // consumers - the tRep fallback and the temporal-shift domain guard -
+            // sit past the RayQuery traversals, which forced all 27 to stay live
+            // across the hottest stretch of the kernel. The fallback only ever
+            // wanted min(t0)/max(t1), so collapse it to two floats here and let
+            // the late shift path re-gather (deterministic: gatherIntervals reads
+            // only the Ray, no RNG, so this is image-identical).
+            //
+            // This is NOT the trade that regressed 25% in coarseOpticalDepth.
+            // That one recomputed 81 floats per (cell, instance) INSIDE the
+            // marching loop, moving work into an SM-bound inner loop. This adds
+            // 9 slab tests on a cold branch and one 9-iteration min/max per
+            // pixel, to shorten a 27-value live range spanning ~200 lines.
+            uint primaryCount = primaryList.count;
+            float primaryEnter = FLT_MAX;
+            float primaryExit = 0.f;
+            for (uint pi = 0; pi < primaryList.count; ++pi)
+            {
+                primaryEnter = min(primaryEnter, primaryList.t0[pi]);
+                primaryExit = max(primaryExit, primaryList.t1[pi]);
+            }
+
             // ---- Candidate generation: M real delta-tracking collisions. ----
 #if USE_FUSED_SWEEP
             // MegaLights temporal feedback: the budget comes from LAST
@@ -767,16 +790,11 @@ void main(uint3 dispatchThreadId: SV_DispatchThreadID)
                 // the merge weight below re-validates it - so a heuristic here
                 // can cost variance, never correctness.
                 float tRep = selDs.t;
-                if (selW <= 0.f && primaryList.count > 0)
+                if (selW <= 0.f && primaryCount > 0)
                 {
-                    float tEnter = FLT_MAX;
-                    float tExit = 0.f;
-                    for (uint i = 0; i < primaryList.count; ++i)
-                    {
-                        tEnter = min(tEnter, primaryList.t0[i]);
-                        tExit = max(tExit, primaryList.t1[i]);
-                    }
-                    tRep = 0.5f * (tEnter + tExit);
+                    // Digest computed at gather time - identical value, but it
+                    // does not pin the 27-value interval list live to here.
+                    tRep = 0.5f * (primaryEnter + primaryExit);
                 }
 
                 if (tRep > 0.f)
@@ -860,12 +878,18 @@ void main(uint3 dispatchThreadId: SV_DispatchThreadID)
                                     // that mass back to the current sample instead
                                     // of losing it.
                                     const float3 posNew = ray.origin + tNew * ray.dir;
-                                    const uint mask = volumeSampler.coveringMask(primaryList, tNew);
+                                    // Re-gather rather than hold primaryList live
+                                    // across the traversals above. Same ray, no
+                                    // RNG, so this list is bit-identical to the
+                                    // primary one; it costs 9 slab tests on a
+                                    // branch that is already three conditions deep.
+                                    const VolumeInstanceSampler::IntervalList shiftList = volumeSampler.gatherIntervals(ray);
+                                    const uint mask = volumeSampler.coveringMask(shiftList, tNew);
                                     float meanSigma = 0.f;
-                                    for (uint i = 0; i < primaryList.count; ++i)
+                                    for (uint i = 0; i < shiftList.count; ++i)
                                     {
                                         if ((mask & (1u << i)) == 0) continue;
-                                        const GridVolume gvI = gScene.getGridVolume(primaryList.ids[i]);
+                                        const GridVolume gvI = gScene.getGridVolume(shiftList.ids[i]);
                                         Grid gridI;
                                         gScene.getGrid(gvI.getDensityGrid(), gridI);
                                         const float3 iposI = mul(gvI.data.invTransform, float4(posNew, 1.f)).xyz - gridI.getMinIndex();
@@ -1175,8 +1199,85 @@ void main(uint3 dispatchThreadId: SV_DispatchThreadID)
         const uint h9 = WaveActiveSum(gvsBrickHitsNow());
         const uint h11 = WaveActiveSum(gvsTapSkipsNow());
         const uint h10 = WaveActiveSum(gvsBrickMissesNow());
+
+        // ---- DIVERGENCE PROBE (slots 31-35) ----
+        // Nsight's largest rule on this pass is Active Threads Per Warp: only
+        // 22.8% of lane-slots retire useful work (4.39x, against 1.38x for the
+        // register limiter). It cannot say WHY, and the two candidate
+        // mechanisms need opposite responses:
+        //   (a) MISS/HIT IMBALANCE - sky lanes finish instantly while cloud
+        //       lanes march thousands of cells. FIXABLE: enqueue only the
+        //       marching pixels and dispatch them packed, reusing the queue
+        //       that already feeds shadeMain.
+        //   (b) TAIL-LENGTH VARIANCE among cloud lanes - a heterogeneous
+        //       medium legitimately terminates rays at different depths.
+        //       NOT fixable by compaction; intrinsic to delta tracking.
+        // idleLanes is the discriminator: if most of the waste is lanes doing
+        // literally zero marching it is (a); if every lane is busy but for
+        // wildly different durations it is (b).
+        //
+        // waveMax is the warp's critical path - a warp holds its slots until
+        // its SLOWEST lane finishes - so sum(work) / (lanes * sum(waveMax)) is
+        // the fraction of lane-slots doing useful work, in OUR units and
+        // directly comparable to Nsight's 22.8%. Two independent measurements
+        // agreeing is what makes this trustworthy; if they disagree the probe
+        // is wrong, not Nsight.
+        //
+        // Wave ops belong HERE with all lanes active, never inside the
+        // WaveIsFirstLane branch (see the counting bug noted above).
+        // Work proxy must be non-zero on the SHIPPING path. cells alone is not:
+        // GridVolumeSampler.slang:71 says gGvsStatCells counts majorant-DDA
+        // steps only, and "the non-DDA estimators only tap", so the brick-TLAS
+        // RayQuery path this config actually runs would report ~0 cells and the
+        // probe would read as 100% idle - a blind probe that looks like a
+        // finding. Summing cells + taps + brick candidates covers every backend;
+        // the units are mixed, but divergence only needs RELATIVE per-lane
+        // duration, not an absolute cost model.
+        const uint laneWork = gvsCellsNow() + gvsTapsNow() + volumeSampler.statBrickCandidates;
+        const uint dvSum = WaveActiveSum(laneWork);
+        const uint dvMax = WaveActiveMax(laneWork);
+        const uint dvIdle = WaveActiveCountBits(laneWork == 0);
+        const uint dvLanes = WaveActiveCountBits(true);
+
+        // PER-LOOP SIMD occupancy (slots 38-41). laneUtil above measures load
+        // BALANCE across the whole kernel and came back 0.76 with 31.2/32 lanes
+        // busy - which rules out idle lanes and imbalance, but NOT lanes taking
+        // different branches at the same instruction. These two catch that:
+        // sum(iters) / (max(iters) * 32) per loop. The coarse DDA is the prime
+        // suspect - the comment on it records ~13.6% of all SM samples with
+        // BRANCH 31% / SELECT 36% / NOINST 38% stalls.
+        const uint rqSum = WaveActiveSum(volumeSampler.statRqIters);
+        const uint rqMax = WaveActiveMax(volumeSampler.statRqIters);
+        const uint ddaSum = WaveActiveSum(volumeSampler.statDdaIters);
+        const uint ddaMax = WaveActiveMax(volumeSampler.statDdaIters);
+
         if (WaveIsFirstLane())
         {
+            if (dvSum > 0) InterlockedAdd(gRisStats[31], dvSum);
+            if (dvMax > 0) InterlockedAdd(gRisStats[32], dvMax);
+            InterlockedAdd(gRisStats[33], 1);
+            if (dvIdle > 0) InterlockedAdd(gRisStats[34], dvIdle);
+            InterlockedAdd(gRisStats[35], dvLanes);
+
+            // Slots 36/37 settle the clustering question by MEASUREMENT rather
+            // than inference. The first run reported idleFrac 0.783 with
+            // laneUtil 0.760, which are only mutually consistent if the idle
+            // lanes sit in WHOLLY idle warps (evenly-spread idle lanes would
+            // cap laneUtil at ~0.22). That was arithmetic, not data. A warp
+            // with dvMax == 0 marched nothing at all, so slot 36 counts fully
+            // idle warps directly, and slot 37 counts busy lanes only in warps
+            // that DID march - giving the true average occupancy of a marching
+            // warp instead of one derived from an inconsistency.
+            if (dvMax == 0)
+                InterlockedAdd(gRisStats[36], 1);
+            else
+                InterlockedAdd(gRisStats[37], dvLanes - dvIdle);
+
+            if (rqSum > 0) InterlockedAdd(gRisStats[38], rqSum);
+            if (rqMax > 0) InterlockedAdd(gRisStats[39], rqMax);
+            if (ddaSum > 0) InterlockedAdd(gRisStats[40], ddaSum);
+            if (ddaMax > 0) InterlockedAdd(gRisStats[41], ddaMax);
+
             if (a > 0) InterlockedAdd(gRisStats[9], a);
             if (a2 > 0) InterlockedAdd(gRisStats[29], a2);
             if (b > 0) InterlockedAdd(gRisStats[10], b);

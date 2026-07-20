@@ -178,6 +178,16 @@ struct VolumeInstanceSampler
     uint statCandCells;     ///< Majorant DDA cells stepped by the shared candidate sweep.
     uint statRealTaps;      ///< Real (raw-VDB) density taps made by the shared candidate sweep.
     uint statTailRays;      ///< Public entries that took the merged-tail path (subset of statRays).
+    // SIMD-occupancy probes. Per-lane ITERATION counts for the two hot loops.
+    // For a loop lanes leave monotonically, sum(iters) / (max(iters) * 32) IS
+    // the instantaneous lane occupancy: at iteration i the live lanes are
+    // exactly those with iters > i, so summing over i gives sum(iters) while
+    // the warp burns max(iters) * 32 slots. That is the quantity the
+    // whole-kernel [DIVERGE] probe could NOT see - it measures load balance
+    // over the kernel, which stays high even when lanes take different
+    // branches at the same instruction.
+    uint statRqIters;       ///< while(q.Proceed()) traversal iterations this lane ran.
+    uint statDdaIters;      ///< coarseOpticalDepth majorant-DDA cell steps this lane ran.
 
     /** Footprint-driven residual-mip selection (UE Nanite lesson: LoD level is
         chosen by PROJECTED ERROR, where a voxel level's error is simply its
@@ -707,6 +717,7 @@ struct VolumeInstanceSampler
                     const float3 pNext = ipos[i] + idir[i] * tExit;
                     const float sigmaNext = instanceSigmaMean(gv, grid, pNext);
                     statCoarseCells++;
+                    statDdaIters++; // SIMD-occupancy probe (single-instance fast path).
                     tau += sigma * (tExit - t);
                     t = tExit;
                     p = pNext;
@@ -753,6 +764,7 @@ struct VolumeInstanceSampler
                 // zero-length cell and the dispatch never completes.
                 if (tExit <= t) tExit = min(b, t + max(1e-4f, abs(t) * 1e-5f));
                 statCoarseCells++;
+                statDdaIters++; // SIMD-occupancy probe (multi-instance covering path).
                 tau += sigma * (tExit - t);
                 t = tExit;
             }
@@ -1295,6 +1307,7 @@ struct VolumeInstanceSampler
         q.TraceRayInline(gBrickTlas, RAY_FLAG_NONE, 0xff, rd);
         while (q.Proceed())
         {
+            statRqIters++; // SIMD-occupancy probe: traversal iterations per lane.
             if (q.CandidateType() != CANDIDATE_PROCEDURAL_PRIMITIVE) continue;
             statBrickCandidates++; // One brick AABB handed back by traversal.
 

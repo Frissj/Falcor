@@ -1155,6 +1155,63 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
                 if (mpGpuTimer)
                     mLastGpuMs = mpGpuTimer->getElapsedTime();
 
+                // [DIVERGE] Why only ~23% of lane-slots retire useful work.
+                // laneUtil is computed the same way Nsight computes Active
+                // Threads Per Warp, but from marching cells instead of
+                // instructions - if the two disagree, distrust this probe.
+                //   idleFrac HIGH  -> miss/hit imbalance, compaction wins, and
+                //                     idleFrac is the CEILING on that win.
+                //   idleFrac LOW   -> tail-length variance inside the medium;
+                //                     compaction cannot pack it away and the
+                //                     divergence is intrinsic to delta tracking.
+                // A previous "busyUtil" column here was REMOVED: it divided
+                // frame-total work by frame-total waveMax scaled by an AVERAGE
+                // busy-lane count. That identity only holds per-warp, so mixing
+                // fully-idle warps (0 waveMax, 32 idle lanes) into the average
+                // produced utilisations above 1.0 - impossible, and a reminder
+                // that any ratio built from two independently-aggregated sums
+                // needs the per-unit identity checked first.
+                //
+                // Note laneUtil is ALREADY restricted to marching warps: idle
+                // warps contribute 0 to both numerator and denominator. So it
+                // reads as "of the 32 slots in a warp that marches, what
+                // fraction did useful work" - and 1/laneUtil is the ceiling on
+                // any intra-warp packing win.
+                const double dvWarps = double(s[33]);
+                const double dvLanes = double(s[35]);
+                const double dvMaxSum = double(s[32]);
+                const double lanesPerWarp = dvWarps > 0.0 ? dvLanes / dvWarps : 0.0;
+                const double critical = dvMaxSum * lanesPerWarp;
+                const double laneUtil = critical > 0.0 ? double(s[31]) / critical : 0.0;
+                const double idleFrac = dvLanes > 0.0 ? double(s[34]) / dvLanes : 0.0;
+                const double idleWarps = double(s[36]);
+                const double marchWarps = dvWarps - idleWarps;
+                const double idleWarpFrac = dvWarps > 0.0 ? idleWarps / dvWarps : 0.0;
+                const double busyLanesPerMarchWarp = marchWarps > 0.0 ? double(s[37]) / marchWarps : 0.0;
+                logInfo(
+                    "[DIVERGE] frame {} warps {} lanes/warp {:.1f} | laneUtil {:.3f} idleFrac {:.3f} "
+                    "| idleWarpFrac {:.3f} marchWarps {} busyLanes/marchWarp {:.1f} "
+                    "| work(cells+taps+cands): total {} avgPerLane {:.1f} avgWaveMax {:.1f}",
+                    mFrameCount, s[33], lanesPerWarp, laneUtil, idleFrac,
+                    idleWarpFrac, (uint32_t)marchWarps, busyLanesPerMarchWarp,
+                    s[31], dvLanes > 0.0 ? double(s[31]) / dvLanes : 0.0,
+                    dvWarps > 0.0 ? dvMaxSum / dvWarps : 0.0
+                );
+
+                // Per-loop SIMD occupancy. THIS is the branch-divergence test:
+                // occ = lane-iterations / iteration-slots burned. 1.0 means the
+                // warp never runs a step with idle lanes; 0.2 means four fifths
+                // of every step is wasted on lanes that already left the loop.
+                // A low occ here with the high laneUtil above is the signature
+                // of divergence the whole-kernel probe is blind to.
+                const double rqOcc = s[39] > 0 ? double(s[38]) / (double(s[39]) * 32.0) : 0.0;
+                const double ddaOcc = s[41] > 0 ? double(s[40]) / (double(s[41]) * 32.0) : 0.0;
+                logInfo(
+                    "[LOOPOCC] frame {} | rqTraversal occ {:.3f} laneIters {} warpIters {} "
+                    "| coarseDDA occ {:.3f} laneIters {} warpIters {}",
+                    mFrameCount, rqOcc, s[38], s[39], ddaOcc, s[40], s[41]
+                );
+
                 const double px = double(pixels);
                 // Per-pixel averages: these are the units that explain the ms.
                 // Multiply a per-pixel count by ~2M pixels to see the true

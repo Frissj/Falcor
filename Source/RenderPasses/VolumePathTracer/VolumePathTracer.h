@@ -236,7 +236,11 @@ private:
     // GridVolumeSampler (DDA cells + real density taps) attributed to the
     // escape term, candidate generation, and shading/NEE - the work the
     // original [WORK] line was measured to be blind to.
-    static const uint32_t kRisStatSlots = 31; // 27..28 = brick-cache hits/misses, 29 = brick candidates, 30 = occupancy tap skips.
+    // 27..28 = brick-cache hits/misses, 29 = brick candidates, 30 = occupancy tap skips,
+    // 31..35 = divergence probe (laneWork sum, waveMax sum, warps, idle lanes, active lanes),
+    // 36..37 = fully idle warps, busy lanes within marching warps,
+    // 38..41 = per-loop SIMD occupancy (RQ traversal sum/max, coarse-DDA sum/max).
+    static const uint32_t kRisStatSlots = 42;
     ref<Buffer> mpRisStats;         ///< Device-local counters (atomics).
     ref<Buffer> mpRisStatsReadback; ///< CPU-visible copy.
     bool mLogRisStats = false;      ///< Log the histogram while RIS is on.
