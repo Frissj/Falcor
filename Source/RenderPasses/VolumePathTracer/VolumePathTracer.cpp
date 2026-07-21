@@ -2010,6 +2010,29 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
                     );
                 }
 
+                // [PATHLEN] Shade path length split by radcache role. The role
+                // whose paths run LONG (high mean, high straggler %) sets the
+                // warp critical path and thus shade time. raw-uncut = paths that
+                // never cut to the cache (the suspected stragglers); cut/resid =
+                // cut at radCutBounce then continued as residual; training =
+                // training paths that run raw-length to deposit their suffix.
+                {
+                    const char* plName[3] = {"raw-uncut", "cut/resid", "training"};
+                    std::string pl;
+                    for (int c = 0; c < 3; ++c)
+                    {
+                        const uint64_t n = s[85 + c * 3];
+                        const uint64_t sumB = s[86 + c * 3];
+                        const uint64_t strag = s[87 + c * 3];
+                        const double mean = n > 0 ? double(sumB) / double(n) : 0.0;
+                        const double sp = n > 0 ? 100.0 * double(strag) / double(n) : 0.0;
+                        pl += fmt::format(
+                            "{} n={} mean={:.1f} strag>=16={:.1f}%{}", plName[c], n, mean, sp, c < 2 ? " | " : ""
+                        );
+                    }
+                    logInfo("[PATHLEN] frame {} | {}", mFrameCount, pl);
+                }
+
                 // What the projected-error LoD actually decided this frame:
                 // per-pixel footprint growth, the tail gate in the same units,
                 // and per-instance "mip@footprint" - so LoD questions are

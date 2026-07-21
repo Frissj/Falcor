@@ -1860,6 +1860,23 @@ void shadeMain(uint3 dispatchThreadId: SV_DispatchThreadID)
     // Shade-phase work lands in the same [WORK]/[COST] slots as the fused
     // kernel's shading bucket, so the log stays comparable across modes.
     {
+        // [PATHLEN] path-length by radcache role (slots 85..93). One bin per
+        // shaded path, HERE at the loop exit where bounce/radTraining/
+        // radIsResidual are final, and past shadeMain's out-of-range return so
+        // every lane holds a real queued path. Per-lane atomics (HANDOFF_9 6),
+        // no wave op. 3 roles x { count, sum-of-bounces, stragglers(>=16) };
+        // mean = sum/count. Tells us whether the long paths that set the warp
+        // critical path are raw-uncut (0), cut->residual (1), or training (2).
+        uint plCat = 0u; // raw: never cut (terminated early, or cache not confident at the cut)
+#if USE_RAD_CACHE
+        if (radTraining)        plCat = 2u; // training path: deposits at death, runs raw-length
+        else if (radIsResidual) plCat = 1u; // cut at radCutBounce, continued only as residual
+#endif
+        const uint plBase = 85u + plCat * 3u;
+        InterlockedAdd(gRisStats[plBase + 0u], 1u);
+        InterlockedAdd(gRisStats[plBase + 1u], bounce);
+        if (bounce >= 16u) InterlockedAdd(gRisStats[plBase + 2u], 1u);
+
         const uint a = WaveActiveSum(volumeSampler.statAabbTests);
         const uint a2 = WaveActiveSum(volumeSampler.statBrickCandidates);
         const uint b = WaveActiveSum(volumeSampler.statSegments);
