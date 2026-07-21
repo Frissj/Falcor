@@ -70,6 +70,7 @@ import GridVolumeSamplerParams;
 #if GRID_VOLUME_SAMPLER_STATS
 static uint gGvsStatCells = 0; ///< Majorant DDA cells stepped (range-tex fetch + stepDDA). The non-DDA estimators only tap, so their cost shows up entirely in taps.
 static uint gGvsStatTaps = 0;  ///< Real density taps (stochastic atlas fetches) - the memory-bound operation.
+static uint gGvsHomogBins[8] = { 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u }; ///< [HOMOG] histogram of sigma_mean/sigma_majorant over mip-0 majorant-DDA cells - the homogenization gauge (right-loaded = uniform interior, collapsible to an analytic segment).
 #endif
 void gvsStatCell()
 {
@@ -587,6 +588,21 @@ struct GridVolumeSampler
             // the taps that follow in this cell. Same float3 -> int3 implicit
             // truncation as the direct call it replaces.
             majorant = gridVolume.data.densityScale * gvsLookupMajorantCached(densityGrid, pos, mip);
+#if GRID_VOLUME_SAMPLER_STATS
+            // [HOMOG] gauge: bin sigma_mean/sigma_majorant for THIS traversed
+            // cell. At mip 0 the fetch above just populated gGvsBrickRange.x
+            // (majorant) and gGvsBrickMean (mean) from ONE texel, so both are
+            // current and free - no added memory traffic. Above mip 0 the cache
+            // holds a different mip's mean, so skip; adaptive-mip climbs happen
+            // only over empty space (majorant 0), which the >0 guard drops
+            // anyway. densityScale cancels in the ratio, so raw texel values
+            // suffice; mean <= majorant, saturate guards boundary slop.
+            if (mip == 0 && gGvsBrickRange.x > 0.f)
+            {
+                const float hratio = saturate(gGvsBrickMean / gGvsBrickRange.x);
+                gGvsHomogBins[min(uint(hratio * 8.f), 7u)]++;
+            }
+#endif
             // Speculative next-brick prefetch (see gvsBrickPrefetch). The next
             // cell's coordinate is pure ALU from tExit - the SAME expression
             // the next iteration truncates - so its loads can be in flight

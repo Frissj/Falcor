@@ -1958,6 +1958,36 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
                     s[30]
                 );
 
+                // [HOMOG] Uniformity of the cells the primary candidate sweep
+                // actually traversed - the gauge that decides whether uniform
+                // interior boxes can be collapsed into one analytic segment.
+                // Histogram of sigma_mean/sigma_majorant in 8 bins over [0,1].
+                // RIGHT-loaded (mass at ratio -> 1) = near-uniform = homogenize;
+                // LEFT-loaded (mass near 0) = turbulent = homogenization only
+                // adds bias. "homogenizable" = share of traversed cells with
+                // ratio >= 0.75 (bins 6-7); that is the fraction of candGen work
+                // an analytic segment could replace.
+                {
+                    uint64_t hb[8];
+                    uint64_t hbTotal = 0;
+                    for (int k = 0; k < 8; ++k) { hb[k] = s[77 + k]; hbTotal += hb[k]; }
+                    const double hd = hbTotal > 0 ? double(hbTotal) : 1.0;
+                    const double homogenizable = 100.0 * double(hb[6] + hb[7]) / hd;
+                    const double nearConst = 100.0 * double(hb[7]) / hd;
+                    logInfo(
+                        "[HOMOG] frame {} | sweptCells {} | ratio(mean/maj) hist %: "
+                        "[.00-.125] {:.1f} [.125-.25] {:.1f} [.25-.375] {:.1f} [.375-.50] {:.1f} "
+                        "[.50-.625] {:.1f} [.625-.75] {:.1f} [.75-.875] {:.1f} [.875-1.0] {:.1f} "
+                        "| homogenizable(>=0.75) {:.1f}% | near-const(>=0.875) {:.1f}%",
+                        mFrameCount, hbTotal,
+                        100.0 * double(hb[0]) / hd, 100.0 * double(hb[1]) / hd,
+                        100.0 * double(hb[2]) / hd, 100.0 * double(hb[3]) / hd,
+                        100.0 * double(hb[4]) / hd, 100.0 * double(hb[5]) / hd,
+                        100.0 * double(hb[6]) / hd, 100.0 * double(hb[7]) / hd,
+                        homogenizable, nearConst
+                    );
+                }
+
                 // What the projected-error LoD actually decided this frame:
                 // per-pixel footprint growth, the tail gate in the same units,
                 // and per-instance "mip@footprint" - so LoD questions are

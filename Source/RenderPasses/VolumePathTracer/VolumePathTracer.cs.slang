@@ -118,6 +118,14 @@ uint gvsTapsNow()
     return 0;
 #endif
 }
+uint gvsHomogBinNow(uint k)
+{
+#if GRID_VOLUME_SAMPLER_STATS
+    return gGvsHomogBins[k];
+#else
+    return 0;
+#endif
+}
 /** Brick-cache coherence. The whole value of the brick-coherent tap path rests
     on consecutive taps landing in the same 8^3 brick; hits/(hits+misses) is that
     assumption made measurable rather than believed. A low hit rate means the
@@ -1487,6 +1495,20 @@ void main(uint3 dispatchThreadId: SV_DispatchThreadID)
         const uint h10 = WaveActiveSum(gvsBrickMissesNow());
         const uint h12 = WaveActiveSum(gvsBrickPromotesNow());
 
+        // [HOMOG] mean/majorant histogram (slots 77..84). Source is the gvs
+        // majorant-DDA counter (the LIVE candGen traversal), NOT the dormant
+        // shared-candidate sweep. Explicit per-bin wave-sums, NOT an [unroll]'d
+        // loop: WaveActiveSum + WaveIsFirstLane + [unroll] + InterlockedAdd
+        // miscompiled here before (HANDOFF_9 6), dropping adds. One line per bin.
+        const uint hg0 = WaveActiveSum(gvsHomogBinNow(0));
+        const uint hg1 = WaveActiveSum(gvsHomogBinNow(1));
+        const uint hg2 = WaveActiveSum(gvsHomogBinNow(2));
+        const uint hg3 = WaveActiveSum(gvsHomogBinNow(3));
+        const uint hg4 = WaveActiveSum(gvsHomogBinNow(4));
+        const uint hg5 = WaveActiveSum(gvsHomogBinNow(5));
+        const uint hg6 = WaveActiveSum(gvsHomogBinNow(6));
+        const uint hg7 = WaveActiveSum(gvsHomogBinNow(7));
+
         // ---- DIVERGENCE PROBE (slots 31-35) ----
         // Nsight's largest rule on this pass is Active Threads Per Warp: only
         // 22.8% of lane-slots retire useful work (4.39x, against 1.38x for the
@@ -1564,6 +1586,15 @@ void main(uint3 dispatchThreadId: SV_DispatchThreadID)
             if (rqMax > 0) InterlockedAdd(gRisStats[39], rqMax);
             if (ddaSum > 0) InterlockedAdd(gRisStats[40], ddaSum);
             if (ddaMax > 0) InterlockedAdd(gRisStats[41], ddaMax);
+
+            if (hg0 > 0) InterlockedAdd(gRisStats[77], hg0);
+            if (hg1 > 0) InterlockedAdd(gRisStats[78], hg1);
+            if (hg2 > 0) InterlockedAdd(gRisStats[79], hg2);
+            if (hg3 > 0) InterlockedAdd(gRisStats[80], hg3);
+            if (hg4 > 0) InterlockedAdd(gRisStats[81], hg4);
+            if (hg5 > 0) InterlockedAdd(gRisStats[82], hg5);
+            if (hg6 > 0) InterlockedAdd(gRisStats[83], hg6);
+            if (hg7 > 0) InterlockedAdd(gRisStats[84], hg7);
 
             if (a > 0) InterlockedAdd(gRisStats[9], a);
             if (a2 > 0) InterlockedAdd(gRisStats[29], a2);
