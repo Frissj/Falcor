@@ -1687,6 +1687,7 @@ void shadeMain(uint3 dispatchThreadId: SV_DispatchThreadID)
     const bool radTraining = gRadCutBounce != 0u && radIsTraining(pixel);
     bool radHasCut = false;
     bool radIsResidual = false; ///< Path consumed the cache at the cut; its remaining bounces estimate the mean-zero residual.
+    float radRRComp = 1.f; ///< Cumulative 1/p this path has taken from warp-RR. Capped so a survivor's throughput cannot compound into a firefly (HANDOFF_9 5 fix 2).
     float3 radCutPos = float3(0.f);
     float3 radCutThp = float3(0.f);
     float3 radCutRad = float3(0.f);
@@ -1699,22 +1700,41 @@ void shadeMain(uint3 dispatchThreadId: SV_DispatchThreadID)
     while (traceLoop)
     {
 #if USE_RAD_CACHE
-        // Lever-1 warp-aware residual roulette (see gRadWarpRRLanes). Placed
-        // at the loop HEAD so a killed path skips this bounce's distance walk
-        // entirely - the walk is the cost being saved. Only RESIDUAL paths are
-        // eligible: their remaining contribution is (S - C), mean zero, so the
-        // variance price of killing them is the smallest in the kernel, and
-        // the CV already priced the survival algebra. alive counts every live
-        // lane (residual or not) - it IS the warp occupancy the [SHADEOCC]
-        // 0.229 measured; when it drops below the knob, this warp is mostly
-        // waiting on stragglers and each surviving straggler delays 32 slots.
-        if (radIsResidual && gRadWarpRRLanes != 0u)
+        // Lever-1 warp-aware residual roulette (see gRadWarpRRLanes), REDESIGNED
+        // per HANDOFF_9 5 after the first version failed the gate at -3.0%. Only
+        // RESIDUAL paths are eligible: their remaining contribution is (S - C),
+        // mean zero, so killing them costs the least variance in the kernel and
+        // the CV already priced the survival algebra. When warp occupancy drops
+        // below the knob, the warp is mostly waiting on stragglers and each one
+        // delays 32 slots - killing them retires the warp. Three fixes:
+        //  (1) COUNT ALL LIVE LANES. aliveWarp is read at the loop HEAD inside a
+        //      UNIFORM guard (gRadWarpRRLanes is a cbuffer constant, so every
+        //      lane still in the loop enters together) - so it is the true warp
+        //      occupancy [SHADEOCC] measured, NOT the residual-only count the old
+        //      code got by putting the wave op inside `if (radIsResidual)`. That
+        //      bug made a warp with 2 residual paths read aliveWarp=2 -> p=0.25
+        //      EVERY bounce, compounding to 1024x fireflies that read as bias.
+        //  (2) BOUND THE COMPENSATION. p is floored at 0.5 (each event <=2x) and
+        //      radRRComp caps the cumulative 1/p at 4x - past that the path is no
+        //      longer rouletted, so its throughput cannot spiral. Both are RR-
+        //      unbiased (any p in (0,1]; not-rouletting is exact).
+        //  (3) COUNTER-BASED COIN. frame+pixel+bounce+ray hash, sg NOT advanced -
+        //      generator-independent, like trRR bit4.
+        // Wave op is uniform-guarded and separated from the atomic below, so it
+        // is not the divergent-flow-around-atomic shape that miscompiled in
+        // runs 127/128.
+        if (gRadWarpRRLanes != 0u)
         {
-            const uint alive = WaveActiveCountBits(true);
-            if (alive < gRadWarpRRLanes)
+            const uint aliveWarp = WaveActiveCountBits(true);
+            if (radIsResidual && radRRComp < 4.f && aliveWarp < gRadWarpRRLanes)
             {
-                const float p = float(alive) / float(gRadWarpRRLanes);
-                if (sampleNext1D(sg) >= p)
+                const float p = max(float(aliveWarp) / float(gRadWarpRRLanes), 0.5f);
+                uint hc = (gFrameCount * 0x9e3779b9u) ^ (pixel.x * 9781u) ^ (pixel.y * 6271u);
+                hc = jenkinsHash(hc ^ (bounce * 0x85ebca6bu));
+                hc = jenkinsHash(hc ^ asuint(ray.dir.x));
+                hc = jenkinsHash(hc ^ asuint(ray.dir.y));
+                const float coin = (hc >> 8) * 0x1p-24f;
+                if (coin >= p)
                 {
 #if USE_WORK_STATS
                     InterlockedAdd(gRisStats[72], 1u); // Per-lane, wave-free (runs 127/128 lesson).
@@ -1722,6 +1742,7 @@ void shadeMain(uint3 dispatchThreadId: SV_DispatchThreadID)
                     break;
                 }
                 throughput /= p;
+                radRRComp /= p;
             }
         }
 #endif

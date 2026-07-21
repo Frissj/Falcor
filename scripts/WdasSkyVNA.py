@@ -30,13 +30,33 @@ from falcor import *
 # the camera aspect window-locked, so the intermediate size only softens, never
 # stretches. This REPLACES the old m.resizeFrameBuffer(960, 540), which resized
 # the WINDOW itself (and fought the window manager back up to native).
-#   - To change quality/perf: edit _RENDER_RES (smaller = faster + softer).
-#   - Or swap 'Fixed'/_RENDER_RES for {'outputSize': 'Half'} to auto-track the
-#     window at half its size (aspect-safe, ~4x, no fixed number to maintain).
 # EVERY downstream pass must carry _LOWRES; a pass left at full res would dispatch
 # window-sized and read these smaller textures out of bounds.
-_RENDER_RES = (960, 540)
-_LOWRES = {'outputSize': 'Fixed', 'fixedOutputSize': _RENDER_RES}
+#
+# Wrappers may override _RENDER_RES BEFORE exec'ing this file:
+#   (w, h) -> Fixed w x h (the fast Nubis-res daily path)
+#   None   -> FULL window res. Warp-RR / estimator gating MUST use this: the
+#             0.228 occupancy the redesign targets and the 1080p references both
+#             live at full res, and 960x540 changes the warp divergence.
+try:
+    _RENDER_RES
+except NameError:
+    _RENDER_RES = (960, 540)
+
+if _RENDER_RES is None:
+    _LOWRES = {'outputSize': 'Default'}   # full window res
+else:
+    _LOWRES = {'outputSize': 'Fixed', 'fixedOutputSize': _RENDER_RES}
+
+# Warp-aware residual roulette threshold (HANDOFF_9 5 redesign; GATE PENDING).
+# 0 = off (ship default). The WdasSkyVNA_wrrN.py test wrappers set this global
+# BEFORE exec'ing this file, so warp-RR can be A/B'd and swept without editing or
+# duplicating the config here. Never raise the ship default above 0 until a
+# VNA_RadCacheScore.py run PASSES the gate.
+try:
+    _WARP_RR_LANES
+except NameError:
+    _WARP_RR_LANES = 0
 
 def render_graph_VNA():
     g = RenderGraph("VNAStack")
@@ -146,10 +166,11 @@ def render_graph_VNA():
         'radCacheRes': 64,
         'radCutBounce': 3,
         'radResidualSurvival': 0.25,
-        # Lever-1 warp-aware residual roulette: BUILT, GATE PENDING (t_wrr8
-        # row in VNA_RadCacheSweep.py, judged vs t_p25 under the shared-mask
-        # scorer). Raise to 8 only on a PASS - estimator change discipline.
-        'radWarpRRLanes': 0,
+        # Lever-1 warp-aware residual roulette: REDESIGNED (HANDOFF_9 5 - all
+        # three fixes), GATE PENDING. Value comes from _WARP_RR_LANES (top of
+        # file / test wrapper), default 0 = off. Judged vs t_p25 under the
+        # shared-mask scorer; keep 0 in the ship config until a run PASSES.
+        'radWarpRRLanes': _WARP_RR_LANES,
         'radTrainEvery': 8,
         'radEma': 0.10,
         # Section 4: HW-BVH brick TLAS (UE HeterogeneousVolumes port) with

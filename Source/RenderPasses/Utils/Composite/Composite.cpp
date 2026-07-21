@@ -101,6 +101,10 @@ RenderPassReflection Composite::reflect(const CompileData& compileData)
 void Composite::compile(RenderContext* pRenderContext, const CompileData& compileData)
 {
     mFrameDim = RenderPassHelpers::calculateIOSize(mOutputSizeSelection, mFixedOutputSize, compileData.defaultTexDims);
+    // IOSize::Default returns {0,0} ("inherit"); as a dispatch size that writes
+    // nothing into a full-res output. Fall back to the graph default res.
+    if (mFrameDim.x == 0u || mFrameDim.y == 0u)
+        mFrameDim = compileData.defaultTexDims;
 }
 
 void Composite::execute(RenderContext* pRenderContext, const RenderData& renderData)

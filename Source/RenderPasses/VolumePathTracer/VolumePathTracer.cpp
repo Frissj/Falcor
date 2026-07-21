@@ -1274,7 +1274,12 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
     // targetDim.y) keys off this, so lowering it both quarters the pixel cost
     // AND activates the footprint LoD (finer footprints -> coarser mips) - the
     // compounding win the script's resolution note describes.
-    const uint2 targetDim = RenderPassHelpers::calculateIOSize(mOutputSizeSelection, mFixedOutputSize, renderData.getDefaultTextureDims());
+    uint2 targetDim = RenderPassHelpers::calculateIOSize(mOutputSizeSelection, mFixedOutputSize, renderData.getDefaultTextureDims());
+    // IOSize::Default returns {0,0} ("inherit whatever is bound"), which as a
+    // dispatch/buffer dimension is a zero-size buffer crash. Fall back to the
+    // graph default (window) res - identical to the pre-render-scale behavior.
+    if (targetDim.x == 0u || targetDim.y == 0u)
+        targetDim = renderData.getDefaultTextureDims();
     FALCOR_ASSERT(targetDim.x > 0 && targetDim.y > 0);
 
     // Footprint spread: world-space width one pixel spans per unit distance.
