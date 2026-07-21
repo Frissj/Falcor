@@ -344,6 +344,13 @@ cbuffer RadCB
     /// fine - it is independent of this path's future randomness.
     /// 0 = off. ESTIMATOR CHANGE: gate via the matrix sweep before adopting.
     uint   gRadWarpRRLanes;
+
+    /// Unconditional post-cut residual roulette: per-bounce KILL probability
+    /// applied to residual paths (0 = off). The residual is mean-zero (S - C),
+    /// so this is unbiased and caps the residual stragglers [PATHLEN] found to
+    /// set the shade critical path - the deep in-scatter Nubis simply omits.
+    /// Not warp-gated (unlike gRadWarpRRLanes). ESTIMATOR CHANGE: gate first.
+    float  gRadResidualTailQ;
 }
 RWStructuredBuffer<uint> gRadAccum;   ///< 4 uints/cell: fixed-point RGB sums + sample count.
 Texture3D<float4> gRadTex;            ///< Resolved cache (rgb = L_in estimate, a = confidence).
@@ -1744,6 +1751,33 @@ void shadeMain(uint3 dispatchThreadId: SV_DispatchThreadID)
                 throughput /= p;
                 radRRComp /= p;
             }
+        }
+
+        // Unconditional post-cut residual roulette (Lever-2). The residual is
+        // mean-zero (S - C), so per-bounce RR here is unbiased and the cheapest
+        // variance in the kernel. Unlike warp-RR this is NOT gated on warp
+        // occupancy - it caps EVERY residual straggler, which [PATHLEN] fingered
+        // as the shade critical path (mean ~9 bounces, 12% past 16). This is the
+        // point where Nubis stops computing the deep in-scatter entirely; we
+        // keep it unbiased by compensating survivors. Counter-based coin (frame+
+        // pixel+bounce+ray, sg untouched); distinct salt from warp-RR so the two
+        // coins are independent if both are ever enabled.
+        if (radIsResidual && gRadResidualTailQ > 0.f && radRRComp < 4.f)
+        {
+            const float p = 1.f - gRadResidualTailQ; // survival probability
+            uint hc = (gFrameCount * 0x9e3779b9u) ^ (pixel.x * 9781u) ^ (pixel.y * 6271u);
+            hc = jenkinsHash(hc ^ (bounce * 0xc2b2ae35u));
+            hc = jenkinsHash(hc ^ asuint(ray.dir.x));
+            hc = jenkinsHash(hc ^ asuint(ray.dir.z));
+            const float coin = (hc >> 8) * 0x1p-24f;
+            if (coin >= p)
+                break;
+            // Shared cumulative-compensation cap with warp-RR (radRRComp): per-
+            // bounce RR compounds (1/p each survival), so bound the survivor's
+            // throughput at 4x - past that, stop rouletting rather than mint a
+            // firefly. Both are still RR-unbiased.
+            throughput /= p;
+            radRRComp /= p;
         }
 #endif
         VolumeInstanceSampler::DistanceSample ds;

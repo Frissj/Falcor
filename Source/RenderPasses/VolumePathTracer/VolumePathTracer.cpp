@@ -91,6 +91,7 @@ const char kRadCacheRes[] = "radCacheRes";
 const char kRadCutBounce[] = "radCutBounce";
 const char kRadResidualSurvival[] = "radResidualSurvival";
 const char kRadWarpRRLanes[] = "radWarpRRLanes";
+const char kRadResidualTailQ[] = "radResidualTailQ";
 const char kRadTrainEvery[] = "radTrainEvery";
 const char kRadEma[] = "radEma";
 const char kTauCacheRes[] = "tauCacheRes";
@@ -205,6 +206,8 @@ void VolumePathTracer::parseProperties(const Properties& props)
             mRadResidualSurvival = std::clamp((float)value, 0.01f, 1.f);
         else if (key == kRadWarpRRLanes)
             mRadWarpRRLanes = std::clamp((uint32_t)value, 0u, 32u);
+        else if (key == kRadResidualTailQ)
+            mRadResidualTailQ = std::clamp((float)value, 0.f, 0.9f);
         else if (key == kRadTrainEvery)
             mRadTrainEvery = std::max(1u, (uint32_t)value);
         else if (key == kRadEma)
@@ -269,6 +272,7 @@ Properties VolumePathTracer::getProperties() const
     props[kRadCutBounce] = mRadCutBounce;
     props[kRadResidualSurvival] = mRadResidualSurvival;
     props[kRadWarpRRLanes] = mRadWarpRRLanes;
+    props[kRadResidualTailQ] = mRadResidualTailQ;
     props[kRadTrainEvery] = mRadTrainEvery;
     props[kRadEma] = mRadEma;
     props[kTauCacheRes] = mTauCacheRes;
@@ -1512,6 +1516,7 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
                 rcb["gRadCellSize"] = mRadCellSize;
                 rcb["gRadResidualSurvival"] = mRadResidualSurvival;
                 rcb["gRadWarpRRLanes"] = mRadWarpRRLanes;
+                rcb["gRadResidualTailQ"] = mRadResidualTailQ;
                 rcb["gRadInvExtent"] = mRadInvExtent;
                 rcb["gRadTrainEvery"] = mRadTrainEvery;
                 rcb["gRadDim"] = mRadDim;
@@ -1741,6 +1746,7 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
                 rcb["gRadCellSize"] = mRadCellSize;
                 rcb["gRadResidualSurvival"] = mRadResidualSurvival;
                 rcb["gRadWarpRRLanes"] = mRadWarpRRLanes;
+                rcb["gRadResidualTailQ"] = mRadResidualTailQ;
                 rcb["gRadInvExtent"] = mRadInvExtent;
                 rcb["gRadTrainEvery"] = mRadTrainEvery;
                 rcb["gRadDim"] = mRadDim;
@@ -2299,6 +2305,7 @@ void VolumePathTracer::renderUI(Gui::Widgets& widget)
                 group.tooltip("Bounce index where the CV applies. 0 = runtime off switch\nfor same-session A/B - no recompile.", true);
                 group.var("Residual survival p", mRadResidualSurvival, 0.01f, 1.f);
                 group.var("Warp-RR lanes (0=off)", mRadWarpRRLanes, 0u, 32u);
+                group.var("Residual tail-RR kill/bounce (0=off)", mRadResidualTailQ, 0.f, 0.9f);
                 group.tooltip(
                     "Lever 1 (2026-07-20): when fewer than this many lanes of a\n"
                     "shadeMain wave are alive, residual paths roulette per bounce\n"

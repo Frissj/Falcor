@@ -315,6 +315,7 @@ private:
     uint32_t mRadCutBounce = 3;         ///< Bounce index of the cut (0 disables at runtime).
     float mRadResidualSurvival = 0.25f; ///< p: residual survival at the cut.
     uint32_t mRadWarpRRLanes = 0; ///< Lever-1 warp-aware residual roulette threshold (0 = off; gate before adopting).
+    float mRadResidualTailQ = 0.f; ///< Lever-2 unconditional post-cut residual roulette: per-bounce kill prob (0 = off; gate before adopting).
     uint32_t mRadTrainEvery = 8;        ///< 1-in-N pixels train (deposit, never consume).
     float mRadEma = 0.10f;              ///< Per-frame resolve blend.
     ref<ComputePass> mpPassRadResolve;  ///< radResolveMain.

@@ -29,7 +29,15 @@ from falcor import *
 
 OUT_DIR = r"C:\Users\Friss\Documents\Clouds\Falcor\vna_measurements\matrix"
 WARM = 192          # cache warm-up frames per config (rad + tau cache have state)
-WRR_LANES = 8       # <-- warp-RR threshold under test (8 / 16 / 24)
+# The knob under test (the t_wrr8 capture always carries whatever is set here, so
+# the existing scorer pair ("t_wrr8","t_p25") matches unchanged):
+#   RESIDUAL_TAIL_Q  Lever-2: per-bounce kill prob on post-cut residual paths.
+#                    0 = off. This is the current lever - caps the residual
+#                    stragglers PATHLEN found. RR-unbiased, so it should PASS the
+#                    gate at any value; the real test is the shade-time delta.
+#   WRR_LANES        Lever-1: warp-RR threshold (set 0 - measured out already).
+RESIDUAL_TAIL_Q = 0.5
+WRR_LANES = 0
 
 ACCUM_PROPS = {'enabled': True, 'precisionMode': 'Single'}
 ACCUM_PROPS_OFF = {'enabled': False, 'precisionMode': 'Single'}
@@ -81,7 +89,7 @@ CONFIGS = [
     # name, props, capture windows. t_p25 / t_wrr8 differ ONLY in radWarpRRLanes,
     # so the scorer's delta is the roulette alone.
     ("t_p25",  dict(SHIP, useRadCache=True, trRRThreshold=0.05, trRRMode=7, radResidualSurvival=0.25), (256, 1024)),
-    ("t_wrr8", dict(SHIP, useRadCache=True, trRRThreshold=0.05, trRRMode=7, radResidualSurvival=0.25, radWarpRRLanes=WRR_LANES), (256, 1024)),
+    ("t_wrr8", dict(SHIP, useRadCache=True, trRRThreshold=0.05, trRRMode=7, radResidualSurvival=0.25, radWarpRRLanes=WRR_LANES, radResidualTailQ=RESIDUAL_TAIL_Q), (256, 1024)),
     # Noise floor: identical estimator, seed-only changes, temporal + cache OFF.
     ("ntb",    dict(SHIP, useTemporalReuse=False, useRadCache=False, trRRThreshold=0.0, trRRMode=0, radResidualSurvival=1.0), (256,)),
     ("ntb_s1", dict(SHIP, useTemporalReuse=False, useRadCache=False, trRRThreshold=0.0, trRRMode=0, seedOffset=7777,  radResidualSurvival=1.0), (256,)),
