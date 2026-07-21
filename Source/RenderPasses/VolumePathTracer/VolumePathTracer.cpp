@@ -70,6 +70,8 @@ const char kTailRes[] = "tailRes";
 const char kTailGateVoxels[] = "tailGateVoxels";
 const char kLogWorkStats[] = "logWorkStats";
 const char kLogRisStats[] = "logRisStats";
+const char kOutputSize[] = "outputSize";
+const char kFixedOutputSize[] = "fixedOutputSize";
 const char kRisStatsInterval[] = "risStatsInterval";
 const char kUseSpatialReuse[] = "useSpatialReuse";
 const char kSpatialNeighbors[] = "spatialNeighbors";
@@ -159,6 +161,10 @@ void VolumePathTracer::parseProperties(const Properties& props)
             mLogWorkStats = value;
         else if (key == kLogRisStats)
             mLogRisStats = value;
+        else if (key == kOutputSize)
+            mOutputSizeSelection = value;
+        else if (key == kFixedOutputSize)
+            mFixedOutputSize = value;
         else if (key == kRisStatsInterval)
             mRisStatsInterval = std::max(1u, (uint32_t)value);
         else if (key == kUseSpatialReuse)
@@ -241,6 +247,9 @@ Properties VolumePathTracer::getProperties() const
     props[kTailGateVoxels] = mTailGateVoxels;
     props[kLogWorkStats] = mLogWorkStats;
     props[kLogRisStats] = mLogRisStats;
+    props[kOutputSize] = mOutputSizeSelection;
+    if (mOutputSizeSelection == RenderPassHelpers::IOSize::Fixed)
+        props[kFixedOutputSize] = mFixedOutputSize;
     props[kRisStatsInterval] = mRisStatsInterval;
     props[kUseSpatialReuse] = mUseSpatialReuse;
     props[kSpatialNeighbors] = mSpatialNeighbors;
@@ -270,7 +279,10 @@ Properties VolumePathTracer::getProperties() const
 RenderPassReflection VolumePathTracer::reflect(const CompileData& compileData)
 {
     RenderPassReflection reflector;
-    addRenderPassOutputs(reflector, kOutputChannels);
+    // Size every output to the selected internal render resolution (Default = 0
+    // => full window res). The downstream chain must be set to the SAME size.
+    const uint2 sz = RenderPassHelpers::calculateIOSize(mOutputSizeSelection, mFixedOutputSize, compileData.defaultTexDims);
+    addRenderPassOutputs(reflector, kOutputChannels, ResourceBindFlags::UnorderedAccess, sz);
     return reflector;
 }
 
@@ -1257,7 +1269,12 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
     if (mpPassBounce)
         mpPassBounce->getProgram()->addDefines(getValidResourceDefines(kOutputChannels, renderData));
 
-    const uint2 targetDim = renderData.getDefaultTextureDims();
+    // Render at the selected internal resolution, not the window size. All
+    // per-pixel state (reservoirs at mReservoirDim, footprintSpread which uses
+    // targetDim.y) keys off this, so lowering it both quarters the pixel cost
+    // AND activates the footprint LoD (finer footprints -> coarser mips) - the
+    // compounding win the script's resolution note describes.
+    const uint2 targetDim = RenderPassHelpers::calculateIOSize(mOutputSizeSelection, mFixedOutputSize, renderData.getDefaultTextureDims());
     FALCOR_ASSERT(targetDim.x > 0 && targetDim.y > 0);
 
     // Footprint spread: world-space width one pixel spans per unit distance.
@@ -2027,6 +2044,18 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
 void VolumePathTracer::renderUI(Gui::Widgets& widget)
 {
     bool rebuild = false;
+
+    // Internal render resolution. Changing it changes reflect() output dims, so
+    // the graph must recompile. Remember to set the SAME size on the downstream
+    // Accum/Composite/ToneMapper passes.
+    if (widget.dropdown("Render size", mOutputSizeSelection))
+        requestRecompile();
+    if (mOutputSizeSelection == RenderPassHelpers::IOSize::Fixed)
+    {
+        if (widget.var("Fixed render size (px)", mFixedOutputSize, 32u, 16384u))
+            requestRecompile();
+    }
+    widget.tooltip("Internal cloud render resolution (Nubis-style low-res + upscale). Lower = faster and softer; upscaled to the window at present with no stretch.", true);
 
     rebuild |= widget.var("Max bounces", mMaxBounces, 0u, 1024u);
     widget.tooltip("Maximum number of volume scattering events per path.\nClouds need many bounces to look right.", true);

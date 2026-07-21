@@ -11,6 +11,7 @@
 #include "Core/API/Raytracing.h"
 #include "Core/API/RtAccelerationStructure.h"
 #include "RenderGraph/RenderPass.h"
+#include "RenderGraph/RenderPassHelpers.h"
 #include "Rendering/Volumes/GridVolumeSampler.h"
 #include "Rendering/Lights/EnvMapSampler.h"
 #include "Utils/Sampling/SampleGenerator.h"
@@ -197,6 +198,17 @@ private:
     ref<Buffer> mpReservoir[2];
     uint32_t mReservoirFrame = 0;
     uint2 mReservoirDim = uint2(0);
+
+    // Internal render resolution (VNA "Nubis res" lever). The pass renders - and
+    // all its per-pixel buffers (reservoirs, footprint) size - to this, then the
+    // graph output is upscaled to the native window by Mogwai's present blit.
+    // Camera aspect stays window-locked and the blit is full-to-full, so a
+    // reduced size cannot stretch, only soften. Default = full window res.
+    // Set the SAME size on every downstream graph pass or their full-res
+    // dispatch will read this pass's smaller textures out of bounds.
+    RenderPassHelpers::IOSize mOutputSizeSelection = RenderPassHelpers::IOSize::Default;
+    uint2 mFixedOutputSize = {960, 540};
+
     float4x4 mPrevViewProj = float4x4::identity();
     float3 mPrevCamPos = float3(0.f);
     bool mPrevCamValid = false;

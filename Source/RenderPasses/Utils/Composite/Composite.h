@@ -29,6 +29,7 @@
 #include "Falcor.h"
 #include "Core/Enum.h"
 #include "RenderGraph/RenderPass.h"
+#include "RenderGraph/RenderPassHelpers.h"
 
 using namespace Falcor;
 
@@ -80,6 +81,10 @@ private:
     float mScaleA = 1.f;
     float mScaleB = 1.f;
     ResourceFormat mOutputFormat = ResourceFormat::RGBA32Float;
+    // Optional fixed/scaled output size so this pass can sit in a reduced-res
+    // subgraph (e.g. the VNA cloud chain rendered at Nubis res). Default = full.
+    RenderPassHelpers::IOSize mOutputSizeSelection = RenderPassHelpers::IOSize::Default;
+    uint2 mFixedOutputSize = {960, 540};
 
     ref<ComputePass> mCompositePass;
 };

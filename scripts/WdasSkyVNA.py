@@ -24,6 +24,20 @@
 
 from falcor import *
 
+# Internal render resolution for the ENTIRE cloud subgraph (Nubis3 ships at
+# exactly 960x540). Every pass below renders at this size and Mogwai upscales the
+# final marked output to the native window at present - a full-to-full blit with
+# the camera aspect window-locked, so the intermediate size only softens, never
+# stretches. This REPLACES the old m.resizeFrameBuffer(960, 540), which resized
+# the WINDOW itself (and fought the window manager back up to native).
+#   - To change quality/perf: edit _RENDER_RES (smaller = faster + softer).
+#   - Or swap 'Fixed'/_RENDER_RES for {'outputSize': 'Half'} to auto-track the
+#     window at half its size (aspect-safe, ~4x, no fixed number to maintain).
+# EVERY downstream pass must carry _LOWRES; a pass left at full res would dispatch
+# window-sized and read these smaller textures out of bounds.
+_RENDER_RES = (960, 540)
+_LOWRES = {'outputSize': 'Fixed', 'fixedOutputSize': _RENDER_RES}
+
 def render_graph_VNA():
     g = RenderGraph("VNAStack")
 
@@ -207,20 +221,24 @@ def render_graph_VNA():
         'logWorkStats': True,
         'logRisStats': True,
         'risStatsInterval': 64,
+        # Internal render resolution (see _RENDER_RES at top). Lowering this both
+        # quarters the per-pixel cost AND activates the footprint LoD (the
+        # compounding win described in the RESOLUTION note below).
+        **_LOWRES,
     })
     g.addPass(VolumePathTracer, "VolumePathTracer")
 
     # Section 6: the two stochastic channels accumulate separately; background
     # is deterministic and never accumulated. Recombined AFTER accumulation.
-    AccumLin = createPass("AccumulatePass", {'enabled': True, 'precisionMode': 'Single'})
+    AccumLin = createPass("AccumulatePass", {'enabled': True, 'precisionMode': 'Single', **_LOWRES})
     g.addPass(AccumLin, "AccumLin")
-    AccumT = createPass("AccumulatePass", {'enabled': True, 'precisionMode': 'Single'})
+    AccumT = createPass("AccumulatePass", {'enabled': True, 'precisionMode': 'Single', **_LOWRES})
     g.addPass(AccumT, "AccumT")
-    Mul = createPass("Composite", {'mode': 'Multiply', 'outputFormat': 'RGBA32Float'})
+    Mul = createPass("Composite", {'mode': 'Multiply', 'outputFormat': 'RGBA32Float', **_LOWRES})
     g.addPass(Mul, "Mul")
-    Add = createPass("Composite", {'mode': 'Add', 'outputFormat': 'RGBA32Float'})
+    Add = createPass("Composite", {'mode': 'Add', 'outputFormat': 'RGBA32Float', **_LOWRES})
     g.addPass(Add, "Add")
-    ToneMapper = createPass("ToneMapper", {'autoExposure': False, 'exposureCompensation': 0.0})
+    ToneMapper = createPass("ToneMapper", {'autoExposure': False, 'exposureCompensation': 0.0, **_LOWRES})
     g.addPass(ToneMapper, "ToneMapper")
 
     g.addEdge("VolumePathTracer.Lin",           "AccumLin.input")
@@ -234,9 +252,9 @@ def render_graph_VNA():
 
     # Un-demodulated color through its own accumulator: flip between this and
     # ToneMapper.dst in the output dropdown - converged, they must match.
-    AccumColor = createPass("AccumulatePass", {'enabled': True, 'precisionMode': 'Single'})
+    AccumColor = createPass("AccumulatePass", {'enabled': True, 'precisionMode': 'Single', **_LOWRES})
     g.addPass(AccumColor, "AccumColor")
-    ToneMapperRef = createPass("ToneMapper", {'autoExposure': False, 'exposureCompensation': 0.0})
+    ToneMapperRef = createPass("ToneMapper", {'autoExposure': False, 'exposureCompensation': 0.0, **_LOWRES})
     g.addPass(ToneMapperRef, "ToneMapperRef")
     g.addEdge("VolumePathTracer.color", "AccumColor.input")
     g.addEdge("AccumColor.output",      "ToneMapperRef.src")
@@ -285,4 +303,10 @@ m.scene.selectViewpoint(1)
 # are 1080p, so a like-for-like comparison needs references regenerated at each
 # resolution - a raw diff against the 1080p 01_ref measures resampling, not the
 # renderer.
-m.resizeFrameBuffer(960, 540)
+#
+# Render resolution is now set PER-PASS via _RENDER_RES / outputSize=Fixed (see
+# the top of this file), NOT by resizing the window. The whole graph renders at
+# _RENDER_RES and Mogwai upscales the marked output to the native window at
+# present. The old `m.resizeFrameBuffer(960, 540)` resized the WINDOW itself,
+# which the window manager fought back to native after ~130 frames - the reason
+# it never stuck. Leaving the window at its native size is the point.

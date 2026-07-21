@@ -40,6 +40,8 @@ const std::string kMode = "mode";
 const std::string kScaleA = "scaleA";
 const std::string kScaleB = "scaleB";
 const std::string kOutputFormat = "outputFormat";
+const std::string kOutputSize = "outputSize";
+const std::string kFixedOutputSize = "fixedOutputSize";
 
 const Gui::DropdownList kModeList = {
     {(uint32_t)Composite::Mode::Add, "Add"},
@@ -60,6 +62,10 @@ Composite::Composite(ref<Device> pDevice, const Properties& props) : RenderPass(
             mScaleB = value;
         else if (key == kOutputFormat)
             mOutputFormat = value;
+        else if (key == kOutputSize)
+            mOutputSizeSelection = value;
+        else if (key == kFixedOutputSize)
+            mFixedOutputSize = value;
         else
             logWarning("Unknown property '{}' in Composite pass properties.", key);
     }
@@ -76,6 +82,9 @@ Properties Composite::getProperties() const
     props[kScaleB] = mScaleB;
     if (mOutputFormat != ResourceFormat::Unknown)
         props[kOutputFormat] = mOutputFormat;
+    props[kOutputSize] = mOutputSizeSelection;
+    if (mOutputSizeSelection == RenderPassHelpers::IOSize::Fixed)
+        props[kFixedOutputSize] = mFixedOutputSize;
     return props;
 }
 
@@ -84,13 +93,14 @@ RenderPassReflection Composite::reflect(const CompileData& compileData)
     RenderPassReflection reflector;
     reflector.addInput(kInputA, "Input A").bindFlags(ResourceBindFlags::ShaderResource).flags(RenderPassReflection::Field::Flags::Optional);
     reflector.addInput(kInputB, "Input B").bindFlags(ResourceBindFlags::ShaderResource).flags(RenderPassReflection::Field::Flags::Optional);
-    reflector.addOutput(kOutput, "Output").bindFlags(ResourceBindFlags::UnorderedAccess).format(mOutputFormat);
+    const uint2 sz = RenderPassHelpers::calculateIOSize(mOutputSizeSelection, mFixedOutputSize, compileData.defaultTexDims);
+    reflector.addOutput(kOutput, "Output").bindFlags(ResourceBindFlags::UnorderedAccess).format(mOutputFormat).texture2D(sz.x, sz.y);
     return reflector;
 }
 
 void Composite::compile(RenderContext* pRenderContext, const CompileData& compileData)
 {
-    mFrameDim = compileData.defaultTexDims;
+    mFrameDim = RenderPassHelpers::calculateIOSize(mOutputSizeSelection, mFixedOutputSize, compileData.defaultTexDims);
 }
 
 void Composite::execute(RenderContext* pRenderContext, const RenderData& renderData)
@@ -121,6 +131,13 @@ void Composite::renderUI(Gui::Widgets& widget)
 {
     widget.text("This pass scales and composites inputs A and B together");
     widget.dropdown("Mode", mMode);
+    if (widget.dropdown("Output size", mOutputSizeSelection))
+        requestRecompile();
+    if (mOutputSizeSelection == RenderPassHelpers::IOSize::Fixed)
+    {
+        if (widget.var("Fixed size (px)", mFixedOutputSize, 32u, 16384u))
+            requestRecompile();
+    }
     widget.var("Scale A", mScaleA);
     widget.var("Scale B", mScaleB);
 }
