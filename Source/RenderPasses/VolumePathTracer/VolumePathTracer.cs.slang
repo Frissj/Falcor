@@ -126,6 +126,45 @@ uint gvsHomogBinNow(uint k)
     return 0;
 #endif
 }
+/** [SUBHOMOG] counterparts, binned at the SAME cell visits as gvsHomogBinNow so
+    the two histograms are a paired comparison. See the binning site in
+    GridVolumeSampler::stepToNextCollision for how to read them.
+*/
+uint gvsSubHomogBinNow(uint k)
+{
+#if GRID_VOLUME_SAMPLER_STATS
+    return gGvsSubHomogBins[k];
+#else
+    return 0;
+#endif
+}
+float gvsBrickMajSumNow()
+{
+#if GRID_VOLUME_SAMPLER_STATS
+    return gGvsBrickMajSum;
+#else
+    return 0.f;
+#endif
+}
+float gvsSubMajSumNow()
+{
+#if GRID_VOLUME_SAMPLER_STATS
+    return gGvsSubMajSum;
+#else
+    return 0.f;
+#endif
+}
+/** Quantise a length-weighted majorant integral for the uint stat slots.
+    x16 is chosen from the budget, not taste: ~12M traversed cells at a
+    majorant-weighted dtau of a few units each puts the frame total near 1e8,
+    so x16 leaves an order of magnitude of headroom under uint32 while keeping
+    far more precision than the ratio needs. Quantising per WAVE (not per lane)
+    keeps the rounding error at <1/16 per wave against a sum of ~1e8.
+*/
+uint gvsQuantMajSum(float v)
+{
+    return uint(clamp(v, 0.f, 2.6e8f) * 16.f + 0.5f);
+}
 /** Brick-cache coherence. The whole value of the brick-coherent tap path rests
     on consecutive taps landing in the same 8^3 brick; hits/(hits+misses) is that
     assumption made measurable rather than believed. A low hit rate means the
@@ -351,6 +390,30 @@ cbuffer RadCB
     /// set the shade critical path - the deep in-scatter Nubis simply omits.
     /// Not warp-gated (unlike gRadWarpRRLanes). ESTIMATOR CHANGE: gate first.
     float  gRadResidualTailQ;
+
+    /// FRAME-GATED AMORTIZATION (gate log 164). 1 on a CORRECTION frame - full
+    /// behaviour, residual tracked and training paths deposit. 0 on a CONSUME
+    /// frame - every consuming path dies at the cut with the cache's mean, and
+    /// no path trains. Host picks it from radAmortPeriod; 1 always when off, so
+    /// the shipped default is byte-identical to the old estimator.
+    ///
+    /// WHY A WHOLE FRAME AND NOT A PIXEL SUBSET - measured, not assumed. A warp
+    /// costs max(bounces), not sum, so removing SOME long paths shortens
+    /// nothing: residual tail-RR cut 13.5% of all bounces and bought 3% of
+    /// shade. Frame-gating removes them uniformly. Gate log 164 confirms the
+    /// mechanism - [PATHLEN] on a consume frame is 97.7% raw-uncut at mean 2.7
+    /// with ZERO stragglers, against ship's 12% stragglers, and shade drops
+    /// 2.14 -> 1.53 ms (-28%). A pixel-gated version would reproduce the
+    /// tail-RR failure exactly.
+    ///
+    /// CONSISTENT, NOT UNBIASED - and the distinction is the whole point. On a
+    /// consume frame the image is C, which is biased by whatever the cache has
+    /// wrong. Correction frames measure the true residual and splat it back, so
+    /// the cache is driven toward E[S] by real path integrals: a static scene
+    /// converges to ground truth, unlike Nubis, which converges to a fitted
+    /// curve and cannot report its own error. Do not describe this mode as
+    /// unbiased in a log line or a handoff.
+    uint   gRadCorrectionFrame;
 }
 RWStructuredBuffer<uint> gRadAccum;   ///< 4 uints/cell: fixed-point RGB sums + sample count.
 Texture3D<float4> gRadTex;            ///< Resolved cache (rgb = L_in estimate, a = confidence).
@@ -1515,6 +1578,17 @@ void main(uint3 dispatchThreadId: SV_DispatchThreadID)
         const uint hg5 = WaveActiveSum(gvsHomogBinNow(5));
         const uint hg6 = WaveActiveSum(gvsHomogBinNow(6));
         const uint hg7 = WaveActiveSum(gvsHomogBinNow(7));
+        // [SUBHOMOG] paired flush - same kernel, same cell visits as hg0..hg7.
+        const uint sg0 = WaveActiveSum(gvsSubHomogBinNow(0));
+        const uint sg1 = WaveActiveSum(gvsSubHomogBinNow(1));
+        const uint sg2 = WaveActiveSum(gvsSubHomogBinNow(2));
+        const uint sg3 = WaveActiveSum(gvsSubHomogBinNow(3));
+        const uint sg4 = WaveActiveSum(gvsSubHomogBinNow(4));
+        const uint sg5 = WaveActiveSum(gvsSubHomogBinNow(5));
+        const uint sg6 = WaveActiveSum(gvsSubHomogBinNow(6));
+        const uint sg7 = WaveActiveSum(gvsSubHomogBinNow(7));
+        const uint sgB = gvsQuantMajSum(WaveActiveSum(gvsBrickMajSumNow()));
+        const uint sgS = gvsQuantMajSum(WaveActiveSum(gvsSubMajSumNow()));
 
         // ---- DIVERGENCE PROBE (slots 31-35) ----
         // Nsight's largest rule on this pass is Active Threads Per Warp: only
@@ -1603,6 +1677,17 @@ void main(uint3 dispatchThreadId: SV_DispatchThreadID)
             if (hg6 > 0) InterlockedAdd(gRisStats[83], hg6);
             if (hg7 > 0) InterlockedAdd(gRisStats[84], hg7);
 
+            if (sg0 > 0) InterlockedAdd(gRisStats[108], sg0);
+            if (sg1 > 0) InterlockedAdd(gRisStats[109], sg1);
+            if (sg2 > 0) InterlockedAdd(gRisStats[110], sg2);
+            if (sg3 > 0) InterlockedAdd(gRisStats[111], sg3);
+            if (sg4 > 0) InterlockedAdd(gRisStats[112], sg4);
+            if (sg5 > 0) InterlockedAdd(gRisStats[113], sg5);
+            if (sg6 > 0) InterlockedAdd(gRisStats[114], sg6);
+            if (sg7 > 0) InterlockedAdd(gRisStats[115], sg7);
+            if (sgB > 0) InterlockedAdd(gRisStats[116], sgB);
+            if (sgS > 0) InterlockedAdd(gRisStats[117], sgS);
+
             if (a > 0) InterlockedAdd(gRisStats[9], a);
             if (a2 > 0) InterlockedAdd(gRisStats[29], a2);
             if (b > 0) InterlockedAdd(gRisStats[10], b);
@@ -1680,8 +1765,39 @@ void shadeMain(uint3 dispatchThreadId: SV_DispatchThreadID)
     uint bounce = 0;
     bool traceLoop = false;
 
+#if USE_WORK_STATS
+    // ---- [BOUNCECOST] per-operation accumulators (slots 94..107) ----
+    // HANDOFF_10 7.1 asks where ONE BOUNCE's time goes. Until now every cell
+    // and tap shadeMain issued landed in the single [COST] "shadeNEE" bucket
+    // (slots 20/21 are written from the lane totals at this kernel's exit), so
+    // the label named the smallest of the three things inside it and 7.2's
+    // question - "is NEE re-marching the sun per bounce?" - was unanswerable
+    // from the log. These split the SAME lane counters into the three call
+    // sites that can march:
+    //   ds  = sampleDistance      : the delta-tracking free-flight, per bounce
+    //   sv  = scatterAtVertex     : phase + NEE bookkeeping. Under
+    //                               kSingleNeePerPath this must be ~0 marching;
+    //                               anything else IS the per-bounce sun march.
+    //   nee = deferred evalNEE    : the one shadow ray at path end, per path
+    // Mark/diff on the running per-lane counters, exactly the pattern the fused
+    // main uses for its escapeT/candGen split - register subtracts only, no
+    // atomics in the loop.
+    uint bcDsCells = 0, bcDsTaps = 0, bcDsHits = 0, bcDsMiss = 0, bcDsSkip = 0, bcDsCalls = 0;
+    uint bcSvCells = 0, bcSvTaps = 0;
+    uint bcNeeCells = 0, bcNeeTaps = 0, bcNeeHits = 0, bcNeeMiss = 0, bcNeeSkip = 0, bcNeeCalls = 0;
+#endif
+
     const float3 scatterPos = ray.origin + entry.t * ray.dir;
-    if (scatterAtVertex(scatterPos, wi, gv.data.anisotropy, 0, ray, throughput, radiance, neeReservoir, volumeSampler, sg))
+#if USE_WORK_STATS
+    const uint bcSv0C = gvsCellsNow(), bcSv0T = gvsTapsNow();
+#endif
+    const bool bcPrimaryAlive =
+        scatterAtVertex(scatterPos, wi, gv.data.anisotropy, 0, ray, throughput, radiance, neeReservoir, volumeSampler, sg);
+#if USE_WORK_STATS
+    bcSvCells += gvsCellsNow() - bcSv0C;
+    bcSvTaps += gvsTapsNow() - bcSv0T;
+#endif
+    if (bcPrimaryAlive)
     {
         bounce = 1;
         traceLoop = true;
@@ -1691,7 +1807,11 @@ void shadeMain(uint3 dispatchThreadId: SV_DispatchThreadID)
     // Control-variate state (see the RadCB note). Training paths snapshot at
     // the cut and deposit their measured suffix at death; consuming paths take
     // the cache's mean there and continue only to estimate the residual.
-    const bool radTraining = gRadCutBounce != 0u && radIsTraining(pixel);
+    // Training only happens on correction frames: a training path runs raw
+    // length to deposit its suffix, which is exactly the cost amortization
+    // exists to move off consume frames. gRadCorrectionFrame is 1 whenever
+    // amortization is off, so this reads as before in the shipped config.
+    const bool radTraining = gRadCutBounce != 0u && gRadCorrectionFrame != 0u && radIsTraining(pixel);
     bool radHasCut = false;
     bool radIsResidual = false; ///< Path consumed the cache at the cut; its remaining bounces estimate the mean-zero residual.
     float radRRComp = 1.f; ///< Cumulative 1/p this path has taken from warp-RR. Capped so a survivor's throughput cannot compound into a firefly (HANDOFF_9 5 fix 2).
@@ -1781,7 +1901,21 @@ void shadeMain(uint3 dispatchThreadId: SV_DispatchThreadID)
         }
 #endif
         VolumeInstanceSampler::DistanceSample ds;
+#if USE_WORK_STATS
+        // [BOUNCECOST] ds region. Diffed BEFORE any break below so a path that
+        // dies on this very bounce still books the march it paid for.
+        const uint bcDs0C = gvsCellsNow(), bcDs0T = gvsTapsNow(), bcDs0H = gvsBrickHitsNow(),
+                   bcDs0M = gvsBrickMissesNow(), bcDs0S = gvsTapSkipsNow();
+#endif
         const bool scattered = volumeSampler.sampleDistance(ray, sg, ds);
+#if USE_WORK_STATS
+        bcDsCells += gvsCellsNow() - bcDs0C;
+        bcDsTaps += gvsTapsNow() - bcDs0T;
+        bcDsHits += gvsBrickHitsNow() - bcDs0H;
+        bcDsMiss += gvsBrickMissesNow() - bcDs0M;
+        bcDsSkip += gvsTapSkipsNow() - bcDs0S;
+        bcDsCalls += 1u;
+#endif
 
         if (!scattered)
         {
@@ -1818,6 +1952,17 @@ void shadeMain(uint3 dispatchThreadId: SV_DispatchThreadID)
                 {
                     // L = C + (S - C): bank the cache's mean...
                     radiance += throughput * C.rgb;
+                    // ...and on a CONSUME frame stop right here. The path takes
+                    // the cache's mean and dies: L = C, no residual. This is
+                    // the biased leg of the amortization - correction frames
+                    // below measure what it got wrong and feed it back through
+                    // the cache. Placed after the bank and before the survival
+                    // draw so a consume frame does not touch sg, keeping the
+                    // random stream aligned with a correction frame at the same
+                    // pixel (frames stay comparable, and the RR draw below is
+                    // not silently reordered).
+                    if (gRadCorrectionFrame == 0u)
+                        break;
                     // ...then keep the path alive only to estimate the residual.
                     // This kill rate on RAW paths failed the matrix gate (it
                     // deleted real energy); on residuals the deleted term has
@@ -1833,7 +1978,16 @@ void shadeMain(uint3 dispatchThreadId: SV_DispatchThreadID)
 #endif
 
         const float g = gScene.getGridVolume(ds.instance).data.anisotropy;
-        if (!scatterAtVertex(pos, wiB, g, bounce, ray, throughput, radiance, neeReservoir, volumeSampler, sg))
+#if USE_WORK_STATS
+        const uint bcSv1C = gvsCellsNow(), bcSv1T = gvsTapsNow();
+#endif
+        const bool bcVertexAlive =
+            scatterAtVertex(pos, wiB, g, bounce, ray, throughput, radiance, neeReservoir, volumeSampler, sg);
+#if USE_WORK_STATS
+        bcSvCells += gvsCellsNow() - bcSv1C;
+        bcSvTaps += gvsTapsNow() - bcSv1T;
+#endif
+        if (!bcVertexAlive)
             break;
 
         bounce++;
@@ -1846,7 +2000,23 @@ void shadeMain(uint3 dispatchThreadId: SV_DispatchThreadID)
     if (kSingleNeePerPath && kUseNEE && neeReservoir.count > 0)
     {
         const HenyeyGreensteinPhaseFunction phase = HenyeyGreensteinPhaseFunction(neeReservoir.g);
+#if USE_WORK_STATS
+        // [BOUNCECOST] nee region: the ONE shadow ray per path. Its cells/taps
+        // divided by neeCalls is the true cost of a sun march - the number 7.2
+        // needs to decide whether tauCache is already covering NEE or whether a
+        // Nubis-style precomputed sun grid is still the biggest bulk lever.
+        const uint bcNee0C = gvsCellsNow(), bcNee0T = gvsTapsNow(), bcNee0H = gvsBrickHitsNow(),
+                   bcNee0M = gvsBrickMissesNow(), bcNee0S = gvsTapSkipsNow();
+#endif
         neeContrib = neeReservoir.thp * evalNEE(neeReservoir.pos, neeReservoir.wi, phase, volumeSampler, sg) * float(neeReservoir.count);
+#if USE_WORK_STATS
+        bcNeeCells += gvsCellsNow() - bcNee0C;
+        bcNeeTaps += gvsTapsNow() - bcNee0T;
+        bcNeeHits += gvsBrickHitsNow() - bcNee0H;
+        bcNeeMiss += gvsBrickMissesNow() - bcNee0M;
+        bcNeeSkip += gvsTapSkipsNow() - bcNee0S;
+        bcNeeCalls += 1u;
+#endif
         radiance += neeContrib;
     }
 
@@ -1944,6 +2114,45 @@ void shadeMain(uint3 dispatchThreadId: SV_DispatchThreadID)
         const uint swWork = gvsCellsNow() + gvsTapsNow();
         const uint swSum = WaveActiveSum(swWork);
         const uint swMax = WaveActiveMax(swWork);
+
+        // ---- [BOUNCECOST] flush (slots 94..107) ----
+        // Wave-reduced up here with every lane active (the h9/h11 lesson above),
+        // atomics below. The three regions partition this kernel's marching
+        // exactly: ds + sv + nee == h4/h5, so a shortfall in the log is a
+        // missed call site, not noise - check that identity before reading
+        // anything else off this line.
+        const uint q0 = WaveActiveSum(bcDsCells);
+        const uint q1 = WaveActiveSum(bcDsTaps);
+        const uint q2 = WaveActiveSum(bcDsHits);
+        const uint q3 = WaveActiveSum(bcDsMiss);
+        const uint q4 = WaveActiveSum(bcDsSkip);
+        const uint q5 = WaveActiveSum(bcDsCalls);
+        const uint q6 = WaveActiveSum(bcSvCells);
+        const uint q7 = WaveActiveSum(bcSvTaps);
+        const uint q8 = WaveActiveSum(bcNeeCells);
+        const uint q9 = WaveActiveSum(bcNeeTaps);
+        const uint q10 = WaveActiveSum(bcNeeHits);
+        const uint q11 = WaveActiveSum(bcNeeMiss);
+        const uint q12 = WaveActiveSum(bcNeeSkip);
+        const uint q13 = WaveActiveSum(bcNeeCalls);
+
+        if (WaveIsFirstLane())
+        {
+            if (q0 > 0) InterlockedAdd(gRisStats[94], q0);
+            if (q1 > 0) InterlockedAdd(gRisStats[95], q1);
+            if (q2 > 0) InterlockedAdd(gRisStats[96], q2);
+            if (q3 > 0) InterlockedAdd(gRisStats[97], q3);
+            if (q4 > 0) InterlockedAdd(gRisStats[98], q4);
+            if (q5 > 0) InterlockedAdd(gRisStats[99], q5);
+            if (q6 > 0) InterlockedAdd(gRisStats[100], q6);
+            if (q7 > 0) InterlockedAdd(gRisStats[101], q7);
+            if (q8 > 0) InterlockedAdd(gRisStats[102], q8);
+            if (q9 > 0) InterlockedAdd(gRisStats[103], q9);
+            if (q10 > 0) InterlockedAdd(gRisStats[104], q10);
+            if (q11 > 0) InterlockedAdd(gRisStats[105], q11);
+            if (q12 > 0) InterlockedAdd(gRisStats[106], q12);
+            if (q13 > 0) InterlockedAdd(gRisStats[107], q13);
+        }
 
         if (WaveIsFirstLane())
         {

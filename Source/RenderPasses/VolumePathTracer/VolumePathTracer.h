@@ -318,6 +318,37 @@ private:
     float mRadResidualTailQ = 0.f; ///< Lever-2 unconditional post-cut residual roulette: per-bounce kill prob (0 = off; gate before adopting).
     uint32_t mRadTrainEvery = 8;        ///< 1-in-N pixels train (deposit, never consume).
     float mRadEma = 0.10f;              ///< Per-frame resolve blend.
+    /// Frame-gated amortization: 1 CORRECTION frame every N, the rest CONSUME
+    /// only (path dies at the cut with the cache's mean, nothing trains).
+    /// 0 = off, every frame is a correction frame = the old estimator exactly.
+    /// Measured ceiling (gate log 164, 960x540): a consume frame is shade 1.53
+    /// vs ship 2.14 ms (-28%), frame 3.34 vs 3.94 (-15%); at N=8 that amortizes
+    /// to ~3.42 ms (-13%). CONSISTENT, not unbiased - see gRadCorrectionFrame.
+    uint32_t mRadAmortPeriod = 0;
+    /// Train-every to use ON a correction frame. 0 = keep mRadTrainEvery, so
+    /// the cache sees N x fewer training samples per second and converges N x
+    /// slower - cheapest, and the default. Setting this to mRadTrainEvery/N
+    /// restores the original training THROUGHPUT by concentrating it, but the
+    /// correction frame then carries N x the training paths: at N=8 with
+    /// trainEvery 8 that is every pixel training, ~470k bounces vs ship's 276k,
+    /// which by the log-164 rates costs back most of the win (~-8% frame
+    /// instead of -13%). Sweep it; do not assume compensation is free.
+    uint32_t mRadAmortTrainEvery = 0;
+
+    /// Is THIS frame a correction frame? Shared by every RadCB bind so the
+    /// shade kernel and radResolveMain can never disagree about what kind of
+    /// frame they are in - if they did, a frame could train without depositing
+    /// or deposit without training, and the cache would drift for reasons no
+    /// log line would explain.
+    bool radIsCorrectionFrame() const
+    {
+        return mRadAmortPeriod == 0 || (mFrameCount % mRadAmortPeriod) == 0;
+    }
+    /// Train-every actually in force this frame (see mRadAmortTrainEvery).
+    uint32_t radEffectiveTrainEvery() const
+    {
+        return (mRadAmortPeriod != 0 && mRadAmortTrainEvery != 0) ? mRadAmortTrainEvery : mRadTrainEvery;
+    }
     ref<ComputePass> mpPassRadResolve;  ///< radResolveMain.
     ref<Buffer> mpRadAccum;             ///< 4 uints/cell fixed-point deposit sums.
     ref<Texture> mpRadTex;              ///< Resolved cache (RGBA16F, .a = confidence).
@@ -404,7 +435,7 @@ private:
     // 42..45 = shadeMain divergence (bounce sum/max, marching-work sum/max),
     // 46..53 = [TRRPROBE] escape-walk E[T] with/without RR, 4 Tref bins x
     //          (RR sum, ref sum), x4096 fixed point.
-    static const uint32_t kRisStatSlots = 94; ///< 54..65 = [TRRPROBE2] coin telemetry (4 det-key bins x count/sumBefore/survives); 66..70 = [TRRPROBE2-CHK] self-checks + negative-Tr counts; 71 = brick-prefetch promotes; 72 = warp-RR kills; 73..76 = scatter-sort class histogram; 77..84 = [HOMOG] mean/majorant uniformity histogram (8 bins); 85..93 = [PATHLEN] shade path-length by radcache role (3 roles x count/sumBounces/stragglers>=16).
+    static const uint32_t kRisStatSlots = 118; ///< 54..65 = [TRRPROBE2] coin telemetry (4 det-key bins x count/sumBefore/survives); 66..70 = [TRRPROBE2-CHK] self-checks + negative-Tr counts; 71 = brick-prefetch promotes; 72 = warp-RR kills; 73..76 = scatter-sort class histogram; 77..84 = [HOMOG] mean/majorant uniformity histogram (8 bins); 85..93 = [PATHLEN] shade path-length by radcache role (3 roles x count/sumBounces/stragglers>=16); 94..107 = [BOUNCECOST] shadeMain work split by op (94..99 sampleDistance cells/taps/hits/misses/skips/calls, 100..101 scatterAtVertex cells/taps, 102..107 deferred evalNEE cells/taps/hits/misses/skips/calls); 108..117 = [SUBHOMOG] 4^3 sub-cell uniformity histogram (8 bins) + brick/sub majorant sums (x256 fixed point), paired with [HOMOG] over the same traversed cells.
     ref<Buffer> mpRisStats;         ///< Device-local counters (atomics).
     ref<Buffer> mpRisStatsReadback; ///< CPU-visible copy.
     bool mLogRisStats = false;      ///< Log the histogram while RIS is on.

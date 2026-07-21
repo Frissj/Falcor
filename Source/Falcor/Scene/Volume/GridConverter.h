@@ -31,6 +31,7 @@
 #include "Core/API/Device.h"
 #include "Core/API/Formats.h"
 #include "Utils/Logger.h"
+#include "Utils/StringUtils.h" // formatByteSize, for the [SUBRANGE] memory line.
 #include "Utils/HostDeviceShared.slangh"
 #include "Utils/NumericRange.h"
 #include "Utils/Math/Vector.h"
@@ -47,6 +48,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cfloat>
 #include <execution>
 #include <vector>
 
@@ -68,6 +70,7 @@ namespace Falcor
 
     private:
         const static uint32_t kBrickSize = 8; // Must be 8, to match both NanoVDB leaf size.
+        const static int kSubSize = 4;        // [SUBHOMOG] sub-cell edge, 2x2x2 of them per brick.
         const static int32_t kBC4Compress = kBitsPerTexel == 4;
 
         void convertSlice(int z);
@@ -143,6 +146,52 @@ namespace Falcor
         std::vector<uint32_t> mOccupancyData;
         std::atomic_uint32_t mNonEmptyCount;
 
+        // [SUBHOMOG] gate (HANDOFF_10 7.1 follow-up). Per-4^3-sub-cell
+        // (majorant, minorant, mean), 2x2x2 sub-cells per brick, so mip-0
+        // dims x2 in every axis = 8x the mip-0 texel count.
+        //
+        // WHY THIS EXISTS: every unbiased tracking estimator costs
+        // integral(sigma_bar ds). [HOMOG] measured sigma_mean/sigma_maj < 0.125
+        // in 67% of traversed mip-0 cells, so the majorant is ~8x the mean and
+        // ~8 of every 9 collisions are null. Delta tracking (sampleDistance,
+        // 68% of shade work) admits NO control variate, so granularity is its
+        // only lever. This level exists to MEASURE whether the majorant
+        // actually tightens at 4^3 before anything is built on the assumption
+        // that it does.
+        //
+        // THE CATCH THIS IS DESIGNED TO EXPOSE: stepDDA dilates each cell by
+        // half a voxel and taps are trilinear, so a cell's majorant must bound
+        // a 1-voxel HALO around its core. The bounded region therefore shrinks
+        // far less than the core does: 8^3 core -> 10^3 bounded (1.95x the core),
+        // 4^3 core -> 6^3 bounded (3.4x the core). If the medium is fractal at
+        // voxel scale the halo dominates and the majorant barely moves - which
+        // is exactly the outcome that would kill the finer-granularity fix.
+        std::vector<uint64_t> mSubRangeData;
+        int3 mSubDim = {};
+
+        /** Fill the 2x2x2 sub-cells belonging to brick (bx,by,bz).
+            'fill' receives the sub-cell's local coords and writes its
+            (minorant, majorant, mean). Sub-cells of one brick are contiguous
+            in neither axis, so the index is computed rather than incremented -
+            convertSlice is parallel over z and each z owns sub-slices 2z/2z+1,
+            so no two threads ever touch the same texel.
+        */
+        template <typename F>
+        inline void writeSubCells(int bx, int by, int bz, F&& fill)
+        {
+            for (int sz = 0; sz < 2; ++sz)
+            for (int sy = 0; sy < 2; ++sy)
+            for (int sx = 0; sx < 2; ++sx)
+            {
+                float sMin = 0.f, sMaj = 0.f, sMean = 0.f;
+                fill(sx, sy, sz, sMin, sMaj, sMean);
+                const size_t idx = (size_t)(2 * bx + sx)
+                    + (size_t)(2 * by + sy) * mSubDim.x
+                    + (size_t)(2 * bz + sz) * mSubDim.x * mSubDim.y;
+                mSubRangeData[idx] = packRangeMean(sMaj, sMin, sMean);
+            }
+        }
+
         /** Pack one brick's (majorant, minorant, mean) into an RGBA16Float texel. */
         static inline uint64_t packRangeMean(float majorant, float minorant, float mean)
         {
@@ -177,6 +226,8 @@ namespace Falcor
         uint3 atlasSizePixels = getAtlasSizePixels();
         uint leafTexelCount = atlasSizePixels.x * atlasSizePixels.y * atlasSizePixels.z;
         mRangeMeanData.resize(mLeafCount[3]);
+        mSubDim = mLeafDim[0] * 2; // 4^3 sub-cells: two per brick per axis.
+        mSubRangeData.resize((size_t)mSubDim.x * mSubDim.y * mSubDim.z);
         mPtrData.resize(mLeafCount[0]);
         mOccupancyData.resize(mLeafCount[0]); // Zero = fully empty; filled per non-empty brick below.
         mAtlasData.resize(kBC4Compress ? (leafTexelCount / 16) : leafTexelCount);
@@ -236,6 +287,13 @@ namespace Falcor
                     // identically zero here: transmittance through uniform/empty
                     // bricks becomes purely analytic.
                     *rangemeandst++ = packRangeMean(majorant, majorant, majorant);
+                    // Collapsed brick: every sub-cell inherits the same
+                    // collapsed range, so the sub level can never report a
+                    // tighter majorant here than the brick did. Uniform space
+                    // is where granularity provably cannot help - keeping these
+                    // in the histogram is what makes the comparison honest.
+                    writeSubCells(x, y, z, [&](int, int, int, float& sMin, float& sMaj, float& sMean)
+                        { sMin = sMaj = sMean = majorant; });
                     *ptrdst++ = 0;
                     // Collapsed range: the sampler returns exactly 'majorant'
                     // everywhere here regardless of what the atlas holds, so an
@@ -255,6 +313,40 @@ namespace Falcor
                     majorant = f16tof32(f32tof16(majorant) + 1);
                     minorant = f16tof32(f32tof16(minorant));
                     *rangemeandst++ = packRangeMean(majorant, minorant, brickMean);
+
+                    // [SUBHOMOG] 4^3 sub-cells for this brick. Range is taken
+                    // over the DILATED region (core +-1 voxel, i.e. 6^3) to
+                    // match what stepDDA/trilinear actually reach; the mean is
+                    // over the 4^3 core, the same convention the brick level
+                    // uses (mean over 8^3, range over 10^3). Voxels inside the
+                    // brick come from the leaf's own array, the halo from the
+                    // accessor - identical values, just different access paths.
+                    writeSubCells(x, y, z, [&](int sx, int sy, int sz, float& sMin, float& sMaj, float& sMean)
+                    {
+                        sMin = FLT_MAX;
+                        sMaj = -FLT_MAX;
+                        double sSum = 0.0;
+                        for (int k = -1; k <= kSubSize; ++k)
+                        for (int j = -1; j <= kSubSize; ++j)
+                        for (int i = -1; i <= kSubSize; ++i)
+                        {
+                            const int vx = sx * kSubSize + i, vy = sy * kSubSize + j, vz = sz * kSubSize + k;
+                            const bool inBrick = vx >= 0 && vx < kBrickSize && vy >= 0 && vy < kBrickSize && vz >= 0 && vz < kBrickSize;
+                            const float f = inBrick
+                                ? data[vx * kBrickSize * kBrickSize + vy * kBrickSize + vz]
+                                : a.getValue(ijk + nanovdb::Coord(vx, vy, vz));
+                            expandMinorantMajorant(f, sMin, sMaj);
+                            if (i >= 0 && i < kSubSize && j >= 0 && j < kSubSize && k >= 0 && k < kSubSize) sSum += f;
+                        }
+                        sMean = float(sSum * (1.0 / (kSubSize * kSubSize * kSubSize)));
+                        // Same f16 nudge the brick level applies: the STORED
+                        // majorant must still bound the true one after rounding
+                        // to half float, or the tracker's majorant assumption
+                        // breaks and the estimator is biased, not just noisy.
+                        sMaj = f16tof32(f32tof16(sMaj) + 1);
+                        sMin = f16tof32(f32tof16(sMin));
+                    });
+
                     uint32_t atlasx = myleaf % mAtlasSizeBricks.x;
                     uint32_t atlasy = (myleaf / mAtlasSizeBricks.x) % mAtlasSizeBricks.y;
                     uint32_t atlasz = myleaf / bricksPerSlice;
@@ -389,6 +481,10 @@ namespace Falcor
         bricks.rangeMean = pDevice->createTexture3D(mLeafDim[0].x, mLeafDim[0].y, mLeafDim[0].z, ResourceFormat::RGBA16Float, 4, mRangeMeanData.data(), ResourceBindFlags::ShaderResource);
         bricks.indirection = pDevice->createTexture3D(mLeafDim[0].x, mLeafDim[0].y, mLeafDim[0].z, ResourceFormat::RGBA8Uint, 1, mPtrData.data(), ResourceBindFlags::ShaderResource);
         bricks.occupancy = pDevice->createTexture3D(mLeafDim[0].x, mLeafDim[0].y, mLeafDim[0].z, ResourceFormat::R32Uint, 1, mOccupancyData.data(), ResourceBindFlags::ShaderResource);
+        // [SUBHOMOG] measurement level: 8x the mip-0 texel count, single mip.
+        // Cost is logged below so the memory side of the granularity trade is a
+        // number in the log rather than an estimate.
+        bricks.subRange = pDevice->createTexture3D(mSubDim.x, mSubDim.y, mSubDim.z, ResourceFormat::RGBA16Float, 1, mSubRangeData.data(), ResourceBindFlags::ShaderResource);
         bricks.atlas = pDevice->createTexture3D(getAtlasSizePixels().x, getAtlasSizePixels().y, getAtlasSizePixels().z, getAtlasFormat(), 1, mAtlasData.data(), ResourceBindFlags::ShaderResource);
 
         // Hand the CPU pyramids to the BrickedGrid (moved, not copied - the
@@ -403,6 +499,15 @@ namespace Falcor
 
         double dt = CpuTimer::calcDuration(t0, CpuTimer::getCurrentTimePoint());
         logDebug("Converted '{}' in {:.4}ms: mNonEmptyCount {} vs max {}", mpFloatGrid->gridName(), dt, mNonEmptyCount.load(), getAtlasMaxBrick());
+        logInfo(
+            "[SUBRANGE] grid '{}' | brick level {}x{}x{} ({} texels, {}) | sub level 4^3 {}x{}x{} ({} texels, {}) | added {}",
+            mpFloatGrid->gridName(),
+            mLeafDim[0].x, mLeafDim[0].y, mLeafDim[0].z, mLeafCount[0],
+            formatByteSize(bricks.rangeMean->getTextureSizeInBytes()),
+            mSubDim.x, mSubDim.y, mSubDim.z, mSubRangeData.size(),
+            formatByteSize(bricks.subRange->getTextureSizeInBytes()),
+            formatByteSize(bricks.subRange->getTextureSizeInBytes())
+        );
         return bricks;
     }
 }

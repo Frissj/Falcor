@@ -71,6 +71,21 @@ import GridVolumeSamplerParams;
 static uint gGvsStatCells = 0; ///< Majorant DDA cells stepped (range-tex fetch + stepDDA). The non-DDA estimators only tap, so their cost shows up entirely in taps.
 static uint gGvsStatTaps = 0;  ///< Real density taps (stochastic atlas fetches) - the memory-bound operation.
 static uint gGvsHomogBins[8] = { 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u }; ///< [HOMOG] histogram of sigma_mean/sigma_majorant over mip-0 majorant-DDA cells - the homogenization gauge (right-loaded = uniform interior, collapsible to an analytic segment).
+// [SUBHOMOG] the same ratio for the 4^3 SUB-CELL the walk entered, binned over
+// the IDENTICAL traversed-cell population as gGvsHomogBins so the two lines are
+// a paired comparison, not two surveys. gGvsSubMajSum/gGvsBrickMajSum are the
+// number the decision actually turns on: every tracking estimator costs
+// integral(sigma_bar ds), so sum(subMaj)/sum(brickMaj) over traversed cells IS
+// the predicted change in collisions if the DDA descended to 4^3.
+static uint gGvsSubHomogBins[8] = { 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u };
+// LENGTH-WEIGHTED, deliberately: the cost is integral(sigma_bar ds), so a cell
+// clipped at a corner must count less than one crossed end to end. Summing bare
+// majorants would let thin grazing cells vote as loudly as full traversals and
+// the ratio would not predict collisions at all. Accumulated in float (exact
+// per lane) and quantised once at flush - the printed raw sums make any
+// saturation visible rather than silent.
+static float gGvsBrickMajSum = 0.f; ///< sum(dt * brickMajorant) over traversed mip-0 cells.
+static float gGvsSubMajSum = 0.f;   ///< sum(dt * subMajorant) over the same cells.
 #endif
 void gvsStatCell()
 {
@@ -601,6 +616,35 @@ struct GridVolumeSampler
             {
                 const float hratio = saturate(gGvsBrickMean / gGvsBrickRange.x);
                 gGvsHomogBins[min(uint(hratio * 8.f), 7u)]++;
+
+                // [SUBHOMOG] paired sample: the 4^3 sub-cell this walk just
+                // entered, from the SAME cell visit. One extra texel fetch per
+                // mip-0 cell, gated on GRID_VOLUME_SAMPLER_STATS, so the
+                // shipping build pays nothing.
+                //
+                // Read the two lines together:
+                //  - if [SUBHOMOG] shifts RIGHT of [HOMOG], density is coherent
+                //    below brick scale and a finer DDA level is the fix for
+                //    BOTH shade buckets (delta tracking admits no control
+                //    variate, so this is its only lever);
+                //  - if the two histograms sit on top of each other, the medium
+                //    is fractal past the 1-voxel dilation halo, no majorant
+                //    scheme can tighten, and the finer-granularity fix is dead
+                //    before a line of traversal code is written.
+                const float3 sub = densityGrid.lookupIndexSubRangeMeanTex(int3(pos));
+                if (sub.x > 0.f)
+                {
+                    const float sratio = saturate(sub.z / sub.x);
+                    gGvsSubHomogBins[min(uint(sratio * 8.f), 7u)]++;
+                }
+                // Length-weighted majorant integrals over this cell. tExit is
+                // already known here and t is not yet advanced, so dt costs
+                // nothing; clamp to tFar so the final partial cell does not
+                // over-count. densityScale cancels in the ratio, so raw texel
+                // values are used on both sides - they must stay consistent.
+                const float hdt = max(min(tExit, tFar) - t, 0.f);
+                gGvsBrickMajSum += hdt * gGvsBrickRange.x;
+                gGvsSubMajSum += hdt * sub.x;
             }
 #endif
             // Speculative next-brick prefetch (see gvsBrickPrefetch). The next

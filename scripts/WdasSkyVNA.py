@@ -58,6 +58,26 @@ try:
 except NameError:
     _WARP_RR_LANES = 0
 
+# Frame-gated cache amortization. 0 = off (ship default): every frame tracks the
+# residual and trains, i.e. today's unbiased estimator byte-identical. N > 0 runs
+# 1 correction frame in N and CONSUMES the cache on the rest.
+#
+# Measured ceiling (VNA_CacheAmortGate, log 164, 960x540): a consume frame is
+# shade 1.53 vs ship 2.14 ms (-28%), frame 3.34 vs 3.94 (-15%); N=8 amortizes to
+# ~3.42 ms, about -13% of frame. Same run also showed the radcache as currently
+# configured buys only 8.6% over having no cache at all (2.396 -> 2.191) - the
+# residual eats roughly three quarters of the cache's value.
+#
+# CONSISTENT, NOT UNBIASED: consume frames render the cache's mean C, biased by
+# whatever the cache has wrong; correction frames measure the residual and splat
+# it back, so a static scene converges to ground truth. Leave at 0 until the
+# image is checked against a full-res unbiased reference - the timing is proven,
+# the quality is not.
+try:
+    _AMORT_PERIOD
+except NameError:
+    _AMORT_PERIOD = 0
+
 def render_graph_VNA():
     g = RenderGraph("VNAStack")
 
@@ -173,6 +193,14 @@ def render_graph_VNA():
         'radWarpRRLanes': _WARP_RR_LANES,
         'radTrainEvery': 8,
         'radEma': 0.10,
+        # Frame-gated amortization (see _AMORT_PERIOD at the top of this file).
+        # radAmortTrainEvery 0 = keep radTrainEvery on correction frames, so the
+        # cache converges N x slower but the correction frame costs the same as
+        # a ship frame does today. Compensating it (radTrainEvery/N) restores
+        # training throughput and costs back most of the win - sweep, do not
+        # assume.
+        'radAmortPeriod': _AMORT_PERIOD,
+        'radAmortTrainEvery': 0,
         # Section 4: HW-BVH brick TLAS (UE HeterogeneousVolumes port) with
         # per-instance projected-error mip selection.
         'useBrickTlas': True,
@@ -241,7 +269,13 @@ def render_graph_VNA():
         # out of diagnostics.
         'logWorkStats': True,
         'logRisStats': True,
-        'risStatsInterval': 64,
+        # 64 normally, but 64 is a multiple of every sane _AMORT_PERIOD (2,4,8,
+        # 16...), so with amortization on EVERY logged frame would land on
+        # frame % period == 0 - a correction frame - and consume frames would be
+        # invisible. The diagnostic would then show full residual work forever
+        # and read exactly like the lever was not firing. 63 is coprime with 8
+        # and odd, so the log walks through both frame types.
+        'risStatsInterval': 64 if _AMORT_PERIOD == 0 else 63,
         # Internal render resolution (see _RENDER_RES at top). Lowering this both
         # quarters the per-pixel cost AND activates the footprint LoD (the
         # compounding win described in the RESOLUTION note below).

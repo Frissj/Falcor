@@ -93,6 +93,8 @@ const char kRadResidualSurvival[] = "radResidualSurvival";
 const char kRadWarpRRLanes[] = "radWarpRRLanes";
 const char kRadResidualTailQ[] = "radResidualTailQ";
 const char kRadTrainEvery[] = "radTrainEvery";
+const char kRadAmortPeriod[] = "radAmortPeriod";
+const char kRadAmortTrainEvery[] = "radAmortTrainEvery";
 const char kRadEma[] = "radEma";
 const char kTauCacheRes[] = "tauCacheRes";
 const char kTauCacheInterval[] = "tauCacheInterval";
@@ -210,6 +212,10 @@ void VolumePathTracer::parseProperties(const Properties& props)
             mRadResidualTailQ = std::clamp((float)value, 0.f, 0.9f);
         else if (key == kRadTrainEvery)
             mRadTrainEvery = std::max(1u, (uint32_t)value);
+        else if (key == kRadAmortPeriod)
+            mRadAmortPeriod = (uint32_t)value;
+        else if (key == kRadAmortTrainEvery)
+            mRadAmortTrainEvery = (uint32_t)value;
         else if (key == kRadEma)
             mRadEma = std::clamp((float)value, 0.001f, 1.f);
         else if (key == kTauCacheRes)
@@ -274,6 +280,8 @@ Properties VolumePathTracer::getProperties() const
     props[kRadWarpRRLanes] = mRadWarpRRLanes;
     props[kRadResidualTailQ] = mRadResidualTailQ;
     props[kRadTrainEvery] = mRadTrainEvery;
+    props[kRadAmortPeriod] = mRadAmortPeriod;
+    props[kRadAmortTrainEvery] = mRadAmortTrainEvery;
     props[kRadEma] = mRadEma;
     props[kTauCacheRes] = mTauCacheRes;
     props[kTauCacheInterval] = mTauCacheInterval;
@@ -1518,9 +1526,10 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
                 rcb["gRadWarpRRLanes"] = mRadWarpRRLanes;
                 rcb["gRadResidualTailQ"] = mRadResidualTailQ;
                 rcb["gRadInvExtent"] = mRadInvExtent;
-                rcb["gRadTrainEvery"] = mRadTrainEvery;
+                rcb["gRadTrainEvery"] = radEffectiveTrainEvery();
                 rcb["gRadDim"] = mRadDim;
                 rcb["gRadEma"] = mRadEma;
+                rcb["gRadCorrectionFrame"] = radIsCorrectionFrame() ? 1u : 0u;
             }
         }
 
@@ -1748,10 +1757,16 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
                 rcb["gRadWarpRRLanes"] = mRadWarpRRLanes;
                 rcb["gRadResidualTailQ"] = mRadResidualTailQ;
                 rcb["gRadInvExtent"] = mRadInvExtent;
-                rcb["gRadTrainEvery"] = mRadTrainEvery;
+                rcb["gRadTrainEvery"] = radEffectiveTrainEvery();
                 rcb["gRadDim"] = mRadDim;
                 rcb["gRadEma"] = mRadEma;
+                rcb["gRadCorrectionFrame"] = radIsCorrectionFrame() ? 1u : 0u;
             }
+            // Left running on consume frames deliberately. radResolveMain is
+            // guarded by `a.w > 0`, and a consume frame deposits nothing, so it
+            // touches no cell - there is no EMA decay toward zero. Skipping the
+            // dispatch would save a 64^3 no-op and add a way to get the skip
+            // wrong; the trade is not worth it.
             mpPassRadResolve->execute(pRenderContext, uint3(mRadDim));
         }
     }
@@ -1953,8 +1968,14 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
                 const uint64_t totalCells = (uint64_t)s[16] + s[18] + s[20] + s[13];
                 const uint64_t totalTaps = (uint64_t)s[17] + s[19] + s[21] + s[14] + s[23];
                 logInfo(
+                    // 'shadeAll' was printed as 'shadeNEE' up to HANDOFF_10. The
+                    // name was wrong: slots 20/21 are shadeMain's whole-lane
+                    // totals, so the bucket is sampleDistance + scatterAtVertex
+                    // + the deferred shadow ray, and the NEE share of it was
+                    // never visible. [BOUNCECOST] splits it; this line keeps the
+                    // phase total. Old logs' 'shadeNEE' means this same number.
                     "[COST] frame {} | per-pixel cells/taps: escapeT {:.1f}/{:.1f} candGen {:.1f}/{:.1f} "
-                    "shadeNEE {:.1f}/{:.1f} sweep {:.1f}/{:.1f} | overlap steps {:.2f} lookups {:.2f} "
+                    "shadeAll {:.1f}/{:.1f} sweep {:.1f}/{:.1f} | overlap steps {:.2f} lookups {:.2f} "
                     "| tailRays {:.2f}/entry | totals: cells {} taps {} "
                     "| brickCache hit {:.1f}% ({}/{}) promote {:.1f}% ({}) | occSkip {:.1f}% ({})",
                     mFrameCount,
@@ -2014,6 +2035,63 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
                         100.0 * double(hb[6]) / hd, 100.0 * double(hb[7]) / hd,
                         homogenizable, nearConst
                     );
+
+                    // [SUBHOMOG] The granularity gate. Same histogram, same
+                    // traversed cells, but the ratio is taken over the 4^3
+                    // SUB-CELL the walk entered instead of the 8^3 brick.
+                    //
+                    // WHY THIS DECIDES SOMETHING: every unbiased tracking
+                    // estimator costs integral(sigma_bar ds). Delta tracking
+                    // (sampleDistance, the 68% [BOUNCECOST] bucket) admits no
+                    // control variate at all - distance sampling must be exact
+                    // - so tightening the majorant is its ONLY lever. Residual
+                    // ratio tracking (the NEE walk) already runs the correct
+                    // mean-control form, and [HOMOG]'s mean/maj ~ 0.125 is
+                    // exactly why it only removes ~12% of collisions:
+                    // sigma_r_bar = max(maj - mean, mean - min) ~ 0.875 * maj.
+                    // Both buckets therefore reduce to one question.
+                    //
+                    // 'majRatio' is the answer, and it is the number to read
+                    // FIRST - the histograms only explain it. It is
+                    // sum(subMaj)/sum(brickMaj) over the same cells, i.e. the
+                    // predicted change in collisions if the DDA descended to
+                    // 4^3. Near 1.00 = the medium is fractal past the 1-voxel
+                    // dilation halo, no majorant scheme can tighten, and the
+                    // finer-granularity fix is dead. Well below 1 = it is the
+                    // whole ballgame and pays on both buckets at once.
+                    //
+                    // Cost side of the same trade: 4^3 cells are half as wide,
+                    // so a ray crosses ~2x as many, i.e. ~2x the range fetches
+                    // bought for majRatio of the atlas taps. Range fetches hit
+                    // the brick cache (~60%); taps are the dependent two-hop
+                    // atlas chase this pass is latency-bound on. The memory
+                    // price is on the [SUBRANGE] line at load time.
+                    {
+                        uint64_t sb[8];
+                        uint64_t sbTotal = 0;
+                        for (int k = 0; k < 8; ++k) { sb[k] = s[108 + k]; sbTotal += sb[k]; }
+                        const double sd = sbTotal > 0 ? double(sbTotal) : 1.0;
+                        // x16 fixed point (gvsQuantMajSum). These are integral
+                        // sigma_bar ds in index-space units, length-weighted -
+                        // print them raw so a saturated slot is visible instead
+                        // of quietly deflating majRatio.
+                        const double brickMaj = double(s[116]) / 16.0;
+                        const double subMaj = double(s[117]) / 16.0;
+                        const double majRatio = brickMaj > 0.0 ? subMaj / brickMaj : 0.0;
+                        logInfo(
+                            "[SUBHOMOG] frame {} | subCells {} | ratio(mean/maj) hist %: "
+                            "[.00-.125] {:.1f} [.125-.25] {:.1f} [.25-.375] {:.1f} [.375-.50] {:.1f} "
+                            "[.50-.625] {:.1f} [.625-.75] {:.1f} [.75-.875] {:.1f} [.875-1.0] {:.1f} "
+                            "| homogenizable(>=0.75) {:.1f}% | majRatio sub/brick {:.3f} (sums {:.1f}/{:.1f})",
+                            mFrameCount, sbTotal,
+                            100.0 * double(sb[0]) / sd, 100.0 * double(sb[1]) / sd,
+                            100.0 * double(sb[2]) / sd, 100.0 * double(sb[3]) / sd,
+                            100.0 * double(sb[4]) / sd, 100.0 * double(sb[5]) / sd,
+                            100.0 * double(sb[6]) / sd, 100.0 * double(sb[7]) / sd,
+                            100.0 * double(sb[6] + sb[7]) / sd,
+                            majRatio, subMaj, brickMaj
+                        );
+                    }
                 }
 
                 // [PATHLEN] Shade path length split by radcache role. The role
@@ -2036,7 +2114,72 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
                             "{} n={} mean={:.1f} strag>=16={:.1f}%{}", plName[c], n, mean, sp, c < 2 ? " | " : ""
                         );
                     }
-                    logInfo("[PATHLEN] frame {} | {}", mFrameCount, pl);
+                    // Frame type is printed because it ALIASES with the log
+                    // interval and would otherwise lie silently: at
+                    // risStatsInterval 64 and radAmortPeriod 8, every logged
+                    // frame satisfies frame % 8 == 0, so every [PATHLEN] line
+                    // would come from a CORRECTION frame and consume frames
+                    // would be invisible. If you want to see both, pick an
+                    // interval coprime with the period (63 and 8, say).
+                    // Note also that a consume frame's paths break at the cut
+                    // BEFORE radIsResidual is set, so they bin as raw-uncut at
+                    // bounce == radCutBounce - that is the mechanism working,
+                    // not a misclassification, and it is why raw-uncut swells
+                    // while cut/resid empties.
+                    logInfo(
+                        "[PATHLEN] frame {} [{}] | {}",
+                        mFrameCount,
+                        mRadAmortPeriod == 0 ? "amort-off" : (radIsCorrectionFrame() ? "CORRECTION" : "consume"),
+                        pl
+                    );
+                }
+
+                // [BOUNCECOST] Where ONE BOUNCE's work goes (HANDOFF_10 7.1).
+                // Slots 20/21 ("shadeNEE" in [COST], relabelled shadeAll below)
+                // are the lane TOTALS of shadeMain, so they lumped three very
+                // different call sites together. This splits the same counters:
+                //   ds  - sampleDistance, once per bounce (the free-flight march)
+                //   sv  - scatterAtVertex, once per bounce (phase + NEE pick)
+                //   nee - the deferred evalNEE shadow ray, once per PATH
+                // Read it as: cells+taps per CALL, not per pixel - that is the
+                // unit a lever has to attack. sv/bounce marching must be ~0
+                // under useSingleNeePerPath; anything else is 7.2's suspected
+                // per-bounce sun re-march, caught red-handed.
+                // 'covered' is the self-check: ds+sv+nee must equal the shade
+                // totals, or a marching call site is missing from the split.
+                {
+                    const uint64_t dsCells = s[94], dsTaps = s[95], dsHits = s[96], dsMiss = s[97], dsSkip = s[98], dsCalls = s[99];
+                    const uint64_t svCells = s[100], svTaps = s[101];
+                    const uint64_t neeCells = s[102], neeTaps = s[103], neeHits = s[104], neeMiss = s[105], neeSkip = s[106],
+                                   neeCalls = s[107];
+                    const uint64_t shadeOps = (uint64_t)s[20] + s[21];
+                    const uint64_t splitOps = dsCells + dsTaps + svCells + svTaps + neeCells + neeTaps;
+                    const auto per = [](uint64_t v, uint64_t n) { return n > 0 ? double(v) / double(n) : 0.0; };
+                    const auto pct = [](uint64_t v, uint64_t d) { return d > 0 ? 100.0 * double(v) / double(d) : 0.0; };
+                    // Ops per millisecond on each phase. main marches coherent
+                    // primary rays, shade marches decorrelated continuation and
+                    // shadow rays; if these two rates differ a lot, the shade ms
+                    // is set by how EXPENSIVE its ops are (memory divergence),
+                    // not by how many it issues - a different lever entirely
+                    // from anything HANDOFF_10 2 measured out.
+                    const uint64_t mainOps = (uint64_t)s[16] + s[17] + s[18] + s[19];
+                    const double shadeMs = std::max(0.0, (double)mLastGpuMs - mLastGpuMsA);
+                    logInfo(
+                        "[BOUNCECOST] frame {} | ds calls {} cells/call {:.1f} taps/call {:.1f} brickHit {:.1f}% occSkip {:.1f}% "
+                        "| sv cells/bounce {:.2f} taps/bounce {:.2f} "
+                        "| nee calls {} cells/call {:.1f} taps/call {:.1f} brickHit {:.1f}% occSkip {:.1f}% "
+                        "| share of shade ops: ds {:.1f}% sv {:.1f}% nee {:.1f}% "
+                        "| covered {}/{} ({:.1f}%) | ops/ms: main {:.0f}k shade {:.0f}k",
+                        mFrameCount,
+                        dsCalls, per(dsCells, dsCalls), per(dsTaps, dsCalls), pct(dsHits, dsHits + dsMiss), pct(dsSkip, dsTaps),
+                        per(svCells, dsCalls), per(svTaps, dsCalls),
+                        neeCalls, per(neeCells, neeCalls), per(neeTaps, neeCalls), pct(neeHits, neeHits + neeMiss),
+                        pct(neeSkip, neeTaps),
+                        pct(dsCells + dsTaps, splitOps), pct(svCells + svTaps, splitOps), pct(neeCells + neeTaps, splitOps),
+                        splitOps, shadeOps, pct(splitOps, shadeOps),
+                        mLastGpuMsA > 0.0 ? double(mainOps) / mLastGpuMsA / 1000.0 : 0.0,
+                        shadeMs > 0.0 ? double(shadeOps) / shadeMs / 1000.0 : 0.0
+                    );
                 }
 
                 // What the projected-error LoD actually decided this frame:
@@ -2319,6 +2462,33 @@ void VolumePathTracer::renderUI(Gui::Widgets& widget)
                 group.var("Train 1-in-N", mRadTrainEvery, 1u, 64u);
                 group.tooltip("Training pixels run FULL paths (deposit, never consume), so the\ncache never learns from itself.", true);
                 group.var("Cache EMA", mRadEma, 0.001f, 1.f);
+                group.var("Amortize 1-in-N frames", mRadAmortPeriod, 0u, 32u);
+                group.tooltip(
+                    "0 = off: every frame tracks the residual and trains (today's\n"
+                    "unbiased estimator, byte-identical). N > 0 = only 1 frame in N\n"
+                    "does that; the other N-1 CONSUME the cache - the path dies at\n"
+                    "the cut with the cache's mean.\n\n"
+                    "Measured (gate log 164, 960x540): a consume frame is shade 1.53\n"
+                    "vs ship 2.14 ms (-28%), frame 3.34 vs 3.94 (-15%). At N=8 that\n"
+                    "amortizes to ~3.42 ms, about -13% of frame.\n\n"
+                    "CONSISTENT, NOT UNBIASED. Consume frames render C, biased by\n"
+                    "whatever the cache has wrong; correction frames measure the\n"
+                    "true residual and splat it back, so a static scene converges to\n"
+                    "ground truth. Do not call this mode unbiased.",
+                    true
+                );
+                group.var("Amort train 1-in-N", mRadAmortTrainEvery, 0u, 64u);
+                group.tooltip(
+                    "Train-every used ON a correction frame. 0 = keep 'Train 1-in-N',\n"
+                    "so the cache sees N x fewer samples per second and converges N x\n"
+                    "slower - cheapest, and the default.\n\n"
+                    "Set it to 'Train 1-in-N' / N to restore the original training\n"
+                    "THROUGHPUT by concentrating it. Not free: at N=8 with train 8\n"
+                    "that makes every pixel a training path on the correction frame\n"
+                    "(~470k bounces vs ship's 276k), which by the log-164 rates costs\n"
+                    "back most of the win (~-8% frame instead of -13%). Sweep it.",
+                    true
+                );
                 if (group.var("Cache res", mRadCacheRes, 8u, 512u))
                 {
                     mpRadAccum = nullptr; // Recreate next frame.
