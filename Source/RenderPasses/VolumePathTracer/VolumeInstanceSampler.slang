@@ -1569,6 +1569,30 @@ struct VolumeInstanceSampler
             // GridVolumeSampler.slang:571 (`return w;`, i.e. this preamble)
             // third in shadeMain at 513,710 of 9,096,776 samples = 5.6%.
             //
+            // MEASURED: MECHANISM CONFIRMED, FRAME UNMOVED. Kept anyway.
+            //
+            //   brickCache hit, off -> on, three viewpoints (log 200):
+            //     55.8 -> 65.0 | 61.2 -> 69.2 | 56.8 -> 65.8  (+8 to +9 pp)
+            //   with the lookup DENOMINATOR and the cell count identical to the
+            //   digit between arms (vp1: 65,135,787 lookups / 86,652,354 cells
+            //   in both). Same work, ~2M more cache hits per frame. So the
+            //   hoist does exactly what it was built to do.
+            //
+            //   Wall clock, interleaved off/on x3 rounds, SHIP config:
+            //     log 201  -0.62 ms   floor 2.56 ms
+            //     log 202  +0.15 ms   floor 3.68 ms
+            //     log 203  +0.50 ms   floor 4.69 ms
+            //   ("floor" = spread between rounds of the SAME config, i.e. this
+            //   machine's thermal drift.) Sign flips run to run and every gap
+            //   is 5-30x inside the floor. There is no frame-time effect to
+            //   find here at this rig's resolution.
+            //
+            // DO NOT re-derive this from the 5.6% sample figure and try again.
+            // Profiler self-samples say where cycles are ATTRIBUTED, not what
+            // would shorten the frame; on this kernel the two have come apart
+            // every time it was tested (see the null results on occupancy skip
+            // and on register narrowing in GridVolumeSampler.slang).
+            //
             // Measured motivation (log 185, shipping config, 2560x1351): this
             // bucket runs 5.8 segments and 19.0 DDA cells per pixel, so the
             // preamble was running 17.4 times per pixel against 19.0 loop
