@@ -330,10 +330,34 @@ RWTexture2D<float4> gWorkDebug;
 #define USE_TAU_CACHE 0
 #endif
 
+/** Whether the cache is APPLIED, as a define rather than a CB uniform.
+
+    This was gTauEnable, a runtime uniform, so the cache A/B could be flipped
+    without a recompile. That convenience cost occupancy every frame: keeping
+    both arms compiled keeps coarseOpticalDepth statically live inside main
+    (evalTargetLhat is called five times from the RIS candidate loop), and that
+    function carries the largest per-thread arrays in the codebase - an
+    IntervalList (3 x kMaxInstances), bounds[2 * kMaxInstances], and
+    ipos/idir/ri[kMaxInstances], ~508 B/thread at kMaxInstances = 9.
+
+    Register allocation is a static whole-kernel property, so those arrays are
+    charged to EVERY warp of main whether or not the branch is taken - and it
+    never is: [COST] reports coarseWalks 0.00/frame with the cache on. main's
+    top launch stall is CS Warp Launch Stalled Register Allocation at 24-26.5%
+    (analysis7), so the dead arm was paying the kernel's actual bottleneck.
+
+    Flipping this define now costs a recompile. That is the intended trade: the
+    A/B is still one toggle, it just rebuilds instead of quietly taxing every
+    frame in between.
+*/
+#ifndef TAU_CACHE_APPLY
+#define TAU_CACHE_APPLY 0
+#endif
+
 cbuffer TauCB
 {
     float3 gTauOrigin;    ///< World-space min corner of the cache grid.
-    uint   gTauEnable;    ///< Runtime A/B toggle (CB, not define: same-session A/B per measurement discipline).
+    uint   _tauPad3;      ///< Was gTauEnable; the apply switch is TAU_CACHE_APPLY (see above).
     float3 gTauCellSize;  ///< World size of one cache voxel.
     float  _tauPad0;
     float3 gTauInvExtent; ///< 1 / (gTauDim * gTauCellSize): world -> uvw.
@@ -461,29 +485,52 @@ void radSplat(const float3 pos, const float3 L)
     const uint idx = ((c.z * gRadDim.y + c.y) * gRadDim.x + c.x) * 4u;
     // Clamp keeps one firefly from saturating a cell's 32-bit sum; the cache
     // is a smooth control, outliers belong to the residual anyway.
-    // SIGNED. The deposited suffix is correct only IN EXPECTATION - the NEE
-    // post-cut share is a reservoir COUNT RATIO, not the exact split, so an
-    // individual path's suffix can come out negative even though the mean is
-    // positive. Clamping those to zero (which the unsigned accumulator used to
-    // force) discards only the negative tail, so E[stored] > E[true]: the cache
-    // reads high and every consuming path banks too much radiance. That is the
-    // image coming out LIGHTER, and it gets worse the more frames consume
-    // rather than correct.
     //
+    // SIGNED, but READ THE NEXT PARAGRAPH BEFORE CREDITING IT WITH ANYTHING.
+    // The original justification - "an individual path's suffix can come out
+    // negative because the post-cut NEE share is a reservoir COUNT RATIO, so
+    // clamping to zero makes the cache read high and the image come out
+    // LIGHTER" - is REFUTED (2026-07-22, log 187). The suffix cannot be
+    // negative. The algebra:
+    //
+    //   radCutRad is snapshotted INSIDE the bounce loop, while
+    //   `radiance += neeContrib` happens AFTER it, so
+    //       radiance_final - radCutRad = postCutScatter + neeContrib
+    //   and the caller then subtracts the pre-cut share:
+    //       suffix = (postCutScatter + neeContrib) - neeContrib * (1 - fPost)
+    //              =  postCutScatter + neeContrib * fPost
+    //   with fPost in [0,1] and both terms non-negative. The one subtraction
+    //   that could break this (radiance -= throughput * C.rgb) lives in the
+    //   CONSUME branch, which is mutually exclusive with the training branch
+    //   that sets radHasCut - a depositing path never reaches it.
+    //
+    // Measured to match: 45 frames, ~1.8M deposits, ZERO negatives. So the old
+    // one-sided clamp never fired, it never biased anything, and the image
+    // lightening ([LUMHIST] bin 0 ship 25.9% vs nocache 29.9%) is NOT this.
+    // Do not re-adopt that explanation; it costs a session.
+    //
+    // The signed accumulator STAYS because it is free and a symmetric bound is
+    // the more defensible one to hold, not because it fixed a measured bias.
     // Two's-complement addition is bit-identical for int and uint, so the
     // buffer stays RWStructuredBuffer<uint> and only the interpretation changes:
-    // deposit asuint(int(...)), resolve with asint(). Symmetric clamp keeps the
-    // firefly bound the old +4096 gave without reintroducing the one-sided bias.
+    // deposit asuint(int(...)), resolve with asint().
     const float3 Lc = clamp(L, -4096.f, 4096.f);
     InterlockedAdd(gRadAccum[idx + 0], asuint(int(Lc.r * kRadFxScale)));
     InterlockedAdd(gRadAccum[idx + 1], asuint(int(Lc.g * kRadFxScale)));
     InterlockedAdd(gRadAccum[idx + 2], asuint(int(Lc.b * kRadFxScale)));
     InterlockedAdd(gRadAccum[idx + 3], 1u);
 #if USE_WORK_STATS
-    // Proof the mechanism was live, not a story: slot 118 counts splats, 119
-    // counts those with any negative component. If 119 is ~0 the clamp was
-    // never firing and the lightening is something else - check before
-    // believing this fix.
+    // Slot 118 counts splats - still useful, it says the cache is being fed.
+    //
+    // Slot 119 was "deposits with a negative component", the probe for the
+    // bias hypothesis above. That question is now CLOSED and the answer is
+    // structural: it must read 0. Kept anyway, re-purposed as an INVARIANT
+    // GUARD rather than a measurement - it costs one predicated atomic on a
+    // path that runs ~40k times a frame, and it is the thing that would catch
+    // the suffix turning negative if someone later moves the radCutRad
+    // snapshot, adds a subtraction to a training path, or changes fPost. A
+    // NONZERO value here means the derivation above has been invalidated by an
+    // edit, not that the old bias theory was right.
     InterlockedAdd(gRisStats[118], 1u);
     if (any(L < 0.f)) InterlockedAdd(gRisStats[119], 1u);
 #endif
@@ -685,15 +732,14 @@ float evalTargetLhat(
     const float3 fp = HenyeyGreensteinPhaseFunction(gj).eval(wi, targetLight.dir);
     const float3 posJ = ray.origin + t * ray.dir;
     // Cached tau (one trilinear fetch) vs live DDA walk: see the TauCB note.
-    // Inside USE_TAU_CACHE both paths stay compiled and gTauEnable picks at
-    // runtime, so the A/B is same-session; the define only exists so a
-    // no-envmap scene never references an unbindable texture.
+    // The arm is chosen at COMPILE time so the unused one is eliminated
+    // outright - keeping both meant main paid coarseOpticalDepth's ~508 B of
+    // per-thread arrays for a branch [COST] shows is never taken.
+    // USE_TAU_CACHE is the "can it be built" gate (a no-envmap scene must
+    // never reference the unbindable texture); TAU_CACHE_APPLY is the switch.
     float tauShadow;
-#if USE_TAU_CACHE
-    if (gTauEnable != 0)
-        tauShadow = gTauTex.SampleLevel(gTauSmp, (posJ - gTauOrigin) * gTauInvExtent, 0.f);
-    else
-        tauShadow = volumeSampler.coarseOpticalDepth(Ray(posJ, targetLight.dir, 0.f, FLT_MAX));
+#if USE_TAU_CACHE && TAU_CACHE_APPLY
+    tauShadow = gTauTex.SampleLevel(gTauSmp, (posJ - gTauOrigin) * gTauInvExtent, 0.f);
 #else
     tauShadow = volumeSampler.coarseOpticalDepth(Ray(posJ, targetLight.dir, 0.f, FLT_MAX));
 #endif
@@ -895,14 +941,14 @@ void main(uint3 dispatchThreadId: SV_DispatchThreadID)
         // escape value couples into adaptive M and the RIS stream, so the
         // bias investigation gates it separately from the NEE walk.
         visSetTrRRSite(8u);
-#if USE_WORK_STATS
+#if USE_TRR_PROBE
         // [TRRPROBE2] Fresh coin telemetry for exactly this walk; later walks
         // in the frame may also fire coins but are never flushed.
         visResetTrRRCoinStats();
 #endif
         const float Tfull = volumeSampler.evalTransmittance(ray, sg);
         visSetTrRRSite(1u);
-#if USE_WORK_STATS
+#if USE_TRR_PROBE
         // [TRRPROBE2] Snapshot the armed walk's telemetry IMMEDIATELY, before
         // any other code can touch the statics. Run 127 logged surv > coins -
         // impossible per the increment logic - so the flush now uses these
@@ -914,7 +960,7 @@ void main(uint3 dispatchThreadId: SV_DispatchThreadID)
         const uint probeNegFull = visTrRRNegTr();
 #endif
 
-#if USE_WORK_STATS
+#if USE_TRR_PROBE
         // [TRRPROBE] Direct walk-level bias measurement (slots 46..53). The
         // sweep bisection pinned the -0.73% on this call site but could not
         // separate "the walk's E[T] moves under RR" from "a downstream

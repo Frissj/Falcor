@@ -70,6 +70,7 @@ const char kUseMergedTail[] = "useMergedTail";
 const char kTailRes[] = "tailRes";
 const char kTailGateVoxels[] = "tailGateVoxels";
 const char kLogWorkStats[] = "logWorkStats";
+const char kLogTrRRProbe[] = "logTrRRProbe";
 const char kLogRisStats[] = "logRisStats";
 const char kOutputSize[] = "outputSize";
 const char kFixedOutputSize[] = "fixedOutputSize";
@@ -84,6 +85,7 @@ const char kUseCompaction[] = "useCompaction";
 const char kUseWavefront[] = "useWavefront";
 const char kWavefrontRounds[] = "wavefrontRounds";
 const char kUseTauCache[] = "useTauCache";
+const char kTauCacheApply[] = "tauCacheApply";
 const char kTrRRThreshold[] = "trRRThreshold";
 const char kTrRRMode[] = "trRRMode";
 const char kSeedOffset[] = "seedOffset";
@@ -168,6 +170,8 @@ void VolumePathTracer::parseProperties(const Properties& props)
             mTailGateVoxels = value;
         else if (key == kLogWorkStats)
             mLogWorkStats = value;
+        else if (key == kLogTrRRProbe)
+            mLogTrRRProbe = value;
         else if (key == kLogRisStats)
             mLogRisStats = value;
         else if (key == kOutputSize)
@@ -196,6 +200,8 @@ void VolumePathTracer::parseProperties(const Properties& props)
             mWavefrontRounds = value;
         else if (key == kUseTauCache)
             mUseTauCache = value;
+        else if (key == kTauCacheApply)
+            mTauCacheApply = value;
         else if (key == kTrRRThreshold)
             mTrRRThreshold = std::clamp((float)value, 0.f, 0.5f);
         else if (key == kTrRRMode)
@@ -268,6 +274,7 @@ Properties VolumePathTracer::getProperties() const
     props[kTailRes] = mTailRes;
     props[kTailGateVoxels] = mTailGateVoxels;
     props[kLogWorkStats] = mLogWorkStats;
+    props[kLogTrRRProbe] = mLogTrRRProbe;
     props[kLogRisStats] = mLogRisStats;
     props[kOutputSize] = mOutputSizeSelection;
     if (mOutputSizeSelection == RenderPassHelpers::IOSize::Fixed)
@@ -283,6 +290,7 @@ Properties VolumePathTracer::getProperties() const
     props[kUseWavefront] = mUseWavefront;
     props[kWavefrontRounds] = mWavefrontRounds;
     props[kUseTauCache] = mUseTauCache;
+    props[kTauCacheApply] = mTauCacheApply;
     props[kTrRRThreshold] = mTrRRThreshold;
     props[kTrRRMode] = mTrRRMode;
     props[kSeedOffset] = mSeedOffset;
@@ -982,7 +990,6 @@ void VolumePathTracer::buildTauCache(RenderContext* pRenderContext)
             tcb["gTauCellSize"] = mTauCellSize;
             tcb["gTauInvExtent"] = mTauInvExtent;
             tcb["gTauDim"] = mTauDim;
-            tcb["gTauEnable"] = 0u; // Unused by the build kernels.
         }
     };
 
@@ -1035,6 +1042,16 @@ void VolumePathTracer::prepareProgram(RenderContext* pRenderContext)
     // Enables GridVolumeSampler's internal cell/tap counters - the marching
     // cost that a ~470 ms frame was measured to hide from every other counter.
     defines.add("GRID_VOLUME_SAMPLER_STATS", mLogWorkStats ? "1" : "0");
+    // [TRRPROBE] is NOT part of the work-stat instrumentation, despite having
+    // ridden USE_WORK_STATS. It compiles a second full evalTransmittance walk
+    // AND a coarseOpticalDepth into main, and coarseOpticalDepth carries the
+    // largest per-thread arrays in the codebase. Register allocation is static,
+    // so main paid that footprint on every warp merely for logWorkStats being
+    // on - i.e. the instrument was inflating the kernel it measures, on the
+    // kernel whose top launch stall is register allocation (24-26.5%).
+    // Its own switch now, default off: turn it on only to re-run the RR bias
+    // measurement, and do not trust frame timings taken while it is on.
+    defines.add("USE_TRR_PROBE", (mLogWorkStats && mLogTrRRProbe) ? "1" : "0");
     defines.add("USE_SHARED_CANDIDATE_SWEEP", mUseSharedCandidateSweep ? "1" : "0");
     defines.add("USE_FOOTPRINT_MIP", mFootprintMip ? "1" : "0");
     // HW-BVH brick backend + merged tail (UE ports; VNA_UE_SOURCE_LESSONS.md).
@@ -1066,8 +1083,16 @@ void VolumePathTracer::prepareProgram(RenderContext* pRenderContext)
     defines.add("USE_COMPACTION", compactionCompiled ? "1" : "0");
     // Sun-tau cache: compiled only when it can actually be built (env light
     // present), so a no-envmap scene never references an unbindable texture.
-    // The RUNTIME switch is gTauEnable in TauCB, not this define.
-    defines.add("USE_TAU_CACHE", (mUseRIS && mUseTauCache && mpEnvMapSampler) ? "1" : "0");
+    const bool tauCacheCompiled = mUseRIS && mUseTauCache && mpEnvMapSampler;
+    defines.add("USE_TAU_CACHE", tauCacheCompiled ? "1" : "0");
+    // APPLY is a define, not the old gTauEnable uniform: keeping the live-walk
+    // arm compiled kept coarseOpticalDepth's ~508 B/thread of arrays resident
+    // in main for a branch that never executed. See the TauCB note in the
+    // shader. mTauCacheApply now forces a rebuild (see renderUI).
+    // Safe to force the fetch: mpPassTauBuild exists under exactly the same
+    // condition as tauCacheCompiled, and execute() bakes the cache before the
+    // first main dispatch, so the texture is always built and bound by then.
+    defines.add("TAU_CACHE_APPLY", (tauCacheCompiled && mTauCacheApply) ? "1" : "0");
     // Radiance-cache control variate: fused shadeMain backend only (the
     // reference path in main stays untouched, and the wavefront backend is
     // measured-off anyway).
@@ -1156,10 +1181,19 @@ void VolumePathTracer::prepareProgram(RenderContext* pRenderContext)
         );
         mpRisStatsReadback = mpDevice->createBuffer(kRisStatSlots * sizeof(uint32_t), ResourceBindFlags::None, MemoryType::ReadBack);
     }
-    if (!mpGpuTimer)
-        mpGpuTimer = GpuTimer::create(mpDevice);
-    if (!mpGpuTimerA)
-        mpGpuTimerA = GpuTimer::create(mpDevice);
+    // GPU timer ring - see the note on kTimerRing. Four regions x kTimerRing
+    // slots, created once.
+    for (uint32_t i = 0; i < kTimerRing; ++i)
+    {
+        if (!mTimerPass[i])
+            mTimerPass[i] = GpuTimer::create(mpDevice);
+        if (!mTimerMain[i])
+            mTimerMain[i] = GpuTimer::create(mpDevice);
+        if (!mTimerShade[i])
+            mTimerShade[i] = GpuTimer::create(mpDevice);
+        if (!mTimerResolve[i])
+            mTimerResolve[i] = GpuTimer::create(mpDevice);
+    }
 
     // Bind resources that never change for the lifetime of the program.
     // Plain bindShaderData is still correct for the SCENE block: this pass
@@ -1521,11 +1555,10 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
                 v = mpReservoir[(mReservoirFrame + 1) & 1];
         }
 
-        // Sun-tau cache: baked tau grid + constants. gTauEnable is the
-        // runtime A/B switch; both paths stay compiled (measurement
-        // discipline: same-session toggle, no recompile).
+        // Sun-tau cache: baked tau grid + constants. Whether the cache is
+        // APPLIED is now the TAU_CACHE_APPLY define, not a CB uniform - see
+        // the TauCB note in the shader for why the runtime switch had to go.
         {
-            const bool tauUsable = mpTauCache != nullptr && mTauLastBuildFrame != kTauNeverBuilt;
             if (auto v = var.findMember("gTauTex"); v.isValid())
                 v = mpTauCache;
             if (auto v = var.findMember("gTauSmp"); v.isValid())
@@ -1536,7 +1569,6 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
                 tcb["gTauCellSize"] = mTauCellSize;
                 tcb["gTauInvExtent"] = mTauInvExtent;
                 tcb["gTauDim"] = mTauDim;
-                tcb["gTauEnable"] = (tauUsable && mTauCacheApply) ? 1u : 0u;
             }
         }
 
@@ -1646,24 +1678,51 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
     if (logThisFrame)
         pRenderContext->clearUAV(mpRisStats->getUAV().get(), uint4(0, 0, 0, 0));
 
+    // ---- [FRAME] wall clock, sampled EVERY frame ---------------------------
+    // Unconditional on purpose. This is the only number in the whole pass that
+    // corresponds to what a user sees, and it is the control that says whether
+    // the GPU time below is worth optimising at all: if the pass is 27 ms
+    // inside a 50 ms frame, halving it buys 23 ms of a 50 ms frame, not half
+    // the frame rate. Measuring it only on logged frames would sample exactly
+    // the frames that stall on GpuTimer::resolve, which is the one frame per
+    // interval guaranteed to be unrepresentative.
+    //
+    // Delta between successive arrivals at this line IS the frame period,
+    // wherever in execute() the line sits, as long as it is unconditional.
+    {
+        const auto now = std::chrono::high_resolution_clock::now();
+        if (mHaveLastFrameTp)
+        {
+            mWallAccumMs += std::chrono::duration<double, std::milli>(now - mLastFrameTp).count();
+            mWallAccumFrames++;
+        }
+        mLastFrameTp = now;
+        mHaveLastFrameTp = true;
+    }
+
     // Time the dispatches on the GPU. A CPU timer here would measure command
     // submission, not the work, and would report near-zero regardless of cost.
     // The timer brackets the WHOLE phase-B pipeline - fused: three dispatches;
     // wavefront: init + maxBounces rounds of (args, clear, bounce) - so gpuMs
     // stays the whole-pipeline number the log has always reported.
-    const bool timeThisFrame = mLogWorkStats && mpGpuTimer && logThisFrame;
+    // EVERY frame now, not just logged ones - that asymmetry against the wall
+    // clock was the defect the occSkip gate exposed (see kTimerRing).
+    const bool timeThisFrame = mLogWorkStats && mTimerPass[0];
     if (timeThisFrame)
-        mpGpuTimer->begin();
+    {
+        mTimerSlot = mFrameCount % kTimerRing;
+        mTimerPass[mTimerSlot]->begin();
+    }
 
     // Nested phase-A timer: [WORK] prints gpuMs split main/shade so the
     // main-vs-shadeMain attribution comes from the log, not from a stale
     // Nsight ratio. Independent timestamp pairs, so nesting is safe.
-    if (timeThisFrame && mpGpuTimerA)
-        mpGpuTimerA->begin();
+    if (timeThisFrame)
+        mTimerMain[mTimerSlot]->begin();
     bindFrame(mpPass->getRootVar());
     mpPass->execute(pRenderContext, uint3(targetDim, 1));
-    if (timeThisFrame && mpGpuTimerA)
-        mpGpuTimerA->end();
+    if (timeThisFrame)
+        mTimerMain[mTimerSlot]->end();
 
     if (compactionActive)
     {
@@ -1709,7 +1768,13 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
             bindFrame(shadeVar);
             if (sortActive)
                 shadeVar["gScatterQueue"] = mpScatterQueueSorted;
+            // shadeMain ALONE. [WORK]'s "shade" is (total - main), which also
+            // contains argsMain and the 64^3 radResolve; this separates them.
+            if (timeThisFrame)
+                mTimerShade[mTimerSlot]->begin();
             mpPassShade->executeIndirect(pRenderContext, mpDispatchArgs.get());
+            if (timeThisFrame)
+                mTimerShade[mTimerSlot]->end();
         }
         else
         {
@@ -1801,16 +1866,50 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
             // touches no cell - there is no EMA decay toward zero. Skipping the
             // dispatch would save a 64^3 no-op and add a way to get the skip
             // wrong; the trade is not worth it.
+            // 64^3 = 262144 threads, EVERY frame, on both training and consume
+            // frames (see the note above). It has always been inside [WORK]'s
+            // "shade" number without ever being named. Timed so its share is a
+            // measurement rather than an assumption.
+            if (timeThisFrame)
+                mTimerResolve[mTimerSlot]->begin();
             mpPassRadResolve->execute(pRenderContext, uint3(mRadDim));
+            if (timeThisFrame)
+                mTimerResolve[mTimerSlot]->end();
         }
     }
 
     if (timeThisFrame)
     {
-        mpGpuTimer->end();
-        mpGpuTimer->resolve();
-        if (mpGpuTimerA)
-            mpGpuTimerA->resolve();
+        mTimerPass[mTimerSlot]->end();
+        // ASSUMPTION, stated because it is silent if broken: the shade and
+        // radResolve timers are begun inside conditional branches
+        // (compactionActive / the rad-cache resources existing). Those
+        // conditions are fixed for the lifetime of a pass instance, so within
+        // one config a slot is either always written or never written.
+        // GpuTimer::resolve() no-ops on an untouched timer and getElapsedTime()
+        // then returns its previous value - harmless here, but if either branch
+        // ever becomes per-FRAME dynamic, those two buckets would carry stale
+        // numbers and would need a per-slot 'was written' flag.
+        // Resolve THIS frame's slot (queues the copy; does not block)...
+        mTimerPass[mTimerSlot]->resolve();
+        mTimerMain[mTimerSlot]->resolve();
+        mTimerShade[mTimerSlot]->resolve();
+        mTimerResolve[mTimerSlot]->resolve();
+        mTimerFilled++;
+
+        // ...and READ the oldest slot, kTimerRing-1 frames back. That copy
+        // landed long ago, so getElapsedTime()'s buffer map cannot stall. This
+        // is what makes per-frame timing affordable, and per-frame timing is
+        // what gives the GPU split the same ~64 samples the wall clock gets.
+        if (mTimerFilled >= kTimerRing)
+        {
+            const uint32_t old = (mTimerSlot + 1) % kTimerRing;
+            mAccPass += mTimerPass[old]->getElapsedTime();
+            mAccMain += mTimerMain[old]->getElapsedTime();
+            mAccShade += mTimerShade[old]->getElapsedTime();
+            mAccResolve += mTimerResolve[old]->getElapsedTime();
+            mAccFrames++;
+        }
     }
 
     if (logThisFrame)
@@ -1839,10 +1938,67 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
 
             if (mLogWorkStats)
             {
-                if (mpGpuTimer)
-                    mLastGpuMs = mpGpuTimer->getElapsedTime();
-                if (mpGpuTimerA)
-                    mLastGpuMsA = mpGpuTimerA->getElapsedTime();
+                // ALL timers refreshed together, BEFORE anything reads them.
+                // Mixing a fresh sub-timer with a stale total silently reports
+                // an 'other' bucket built from two different frames.
+                //
+                // mAccFrames can be 0 only in the first kTimerRing frames of a
+                // run, before the ring has filled; the previous averages stand
+                // until it has, rather than dividing by zero.
+                if (mAccFrames > 0)
+                {
+                    // INTERVAL AVERAGES, not single-frame samples. Same sample
+                    // count as the wall clock, so the two halves of [FRAME] are
+                    // finally comparable and a gate's drift guard is measuring
+                    // the machine rather than the instrument.
+                    const double n = double(mAccFrames);
+                    mLastGpuMs = mAccPass / n;
+                    mLastGpuMsA = mAccMain / n;
+                    mLastGpuMsShade = mAccShade / n;
+                    mLastGpuMsResolve = mAccResolve / n;
+                    mLastGpuSamples = mAccFrames;
+                    mAccPass = mAccMain = mAccShade = mAccResolve = 0.0;
+                    mAccFrames = 0;
+                }
+
+                // ---- [FRAME] the accounting that was missing ---------------
+                // Read this BEFORE any other line in the log. It answers the
+                // question that made every previous lever unfalsifiable: what
+                // fraction of the frame does this pass even own?
+                //
+                //   outside = wall - passGpu. It is NOT a GPU measurement; it
+                //   is everything this pass cannot see - AccumulatePass, tone
+                //   mapping, present, driver, CPU submission, and any GPU idle
+                //   waiting on them. A large 'outside' means optimising the
+                //   dispatches below cannot move FPS by much, no matter how
+                //   good the optimisation is, and that is a stop signal.
+                //
+                //   The sub-split names what [WORK]'s "shade" actually was:
+                //   main + args + shadeMain + radResolve. 'args' is inferred as
+                //   the remainder, so it also absorbs the queue-sort dispatches
+                //   when those are enabled.
+                if (mWallAccumFrames > 0)
+                {
+                    const double wallMs = mWallAccumMs / mWallAccumFrames;
+                    const double fps = wallMs > 0.0 ? 1000.0 / wallMs : 0.0;
+                    const double passMs = mLastGpuMs;
+                    const double outside = wallMs - passMs;
+                    const double argsMs =
+                        std::max(0.0, passMs - mLastGpuMsA - mLastGpuMsShade - mLastGpuMsResolve);
+                    logInfo(
+                        // Both sample counts are printed so the two halves can
+                        // never again be compared on unequal footing without it
+                        // being visible in the line itself.
+                        "[FRAME] frame {} | wall {:.2f} ms ({:.1f} FPS, n={}) | pass {:.2f} ms ({:.1f}%, n={}) "
+                        "| OUTSIDE PASS {:.2f} ms ({:.1f}%) | split: main {:.2f} shadeMain {:.2f} radResolve {:.2f} other {:.2f}",
+                        mFrameCount, wallMs, fps, mWallAccumFrames,
+                        passMs, wallMs > 0.0 ? 100.0 * passMs / wallMs : 0.0, mLastGpuSamples,
+                        outside, wallMs > 0.0 ? 100.0 * outside / wallMs : 0.0,
+                        mLastGpuMsA, mLastGpuMsShade, mLastGpuMsResolve, argsMs
+                    );
+                    mWallAccumMs = 0.0;
+                    mWallAccumFrames = 0;
+                }
 
                 // [DIVERGE] Why only ~23% of lane-slots retire useful work.
                 // laneUtil is computed the same way Nsight computes Active
@@ -2136,9 +2292,18 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
                         pl
                     );
                     logInfo(
-                        "[RADSPLAT] frame {} | deposits {} | negative {} ({:.1f}%)",
+                        // 'negative' is an INVARIANT GUARD, not a measurement.
+                        // The suffix is provably non-negative (see radSplat):
+                        // radCutRad is snapshotted before neeContrib is added,
+                        // so suffix = postCutScatter + neeContrib*fPost, both
+                        // terms >= 0. Confirmed over ~1.8M deposits. Anything
+                        // other than 0 here means an edit broke that
+                        // derivation - it does NOT revive the old
+                        // "cache reads high" theory, which is refuted.
+                        "[RADSPLAT] frame {} | deposits {} | negative {} ({:.1f}%){}",
                         mFrameCount, s[118], s[119],
-                        s[118] > 0 ? 100.0 * double(s[119]) / double(s[118]) : 0.0
+                        s[118] > 0 ? 100.0 * double(s[119]) / double(s[118]) : 0.0,
+                        s[119] > 0 ? "  *** INVARIANT BROKEN: suffix went negative, see radSplat ***" : ""
                     );
                     // [ENERGY] the useCompaction A/B. With compaction ON, main
                     // emits only the escape term and shade emits the scatter
@@ -2345,7 +2510,22 @@ void VolumePathTracer::renderUI(Gui::Widgets& widget)
     widget.var("Log interval (frames)", mRisStatsInterval, 1u, 600u);
     widget.tooltip("Frames between log lines. Each logged frame costs a full GPU sync:\nat interval 1 the stall alone was measured to turn a 24 ms pass into a\n77 ms frame. Keep this high unless single-frame counters are needed.", true);
     if (mLogWorkStats)
+    {
+        rebuild |= widget.checkbox("  [TRRPROBE] RR bias probe", mLogTrRRProbe);
+        widget.tooltip(
+            "Residual-RR walk-level bias measurement (RIS slots 46..70).\n\n"
+            "NOT free instrumentation, which is why it is no longer folded into\n"
+            "'Log work profile': it compiles a SECOND full evalTransmittance\n"
+            "walk and a coarseOpticalDepth into main. Register allocation is a\n"
+            "static whole-kernel property, so main pays their per-thread\n"
+            "footprint on every warp just for them being compiled - and main's\n"
+            "top launch stall is register allocation (24-26.5%, analysis7).\n\n"
+            "Frame timings taken with this ON measure a kernel the instrument\n"
+            "inflated. Use it to re-run the bias measurement, then turn it off.",
+            true
+        );
         widget.text("Last GPU ms: " + std::to_string(mLastGpuMs));
+    }
 
     if (auto group = widget.group("RIS (section 5, Stage A)", true))
     {
@@ -2733,14 +2913,24 @@ void VolumePathTracer::renderUI(Gui::Widgets& widget)
             "([LOOPOCC] 2026-07-20). UNBIASED: tau only shapes which candidate\n"
             "wins and the estimator divides the target back out, so cache\n"
             "coarseness costs selection variance, never the converged image.\n\n"
-            "This checkbox COMPILES the feature; A/B with the runtime toggle\n"
-            "below (no recompile, same-session per measurement discipline).",
+            "This checkbox COMPILES the feature (resources + bake passes);\n"
+            "'Apply' below selects which arm is compiled into main.",
             true
         );
         if (mUseTauCache)
         {
-            group.checkbox("Apply tau cache (A/B)", mTauCacheApply);
-            group.tooltip("Runtime switch (CB uniform). OFF = live DDA walk, same session.", true);
+            rebuild |= group.checkbox("Apply tau cache (A/B)", mTauCacheApply);
+            group.tooltip(
+                "OFF = live DDA walk. This REBUILDS (it is the TAU_CACHE_APPLY\n"
+                "define, not a CB uniform any more).\n\n"
+                "It used to be a runtime uniform so the A/B was same-session.\n"
+                "That cost occupancy every frame: keeping the walk arm compiled\n"
+                "kept coarseOpticalDepth - the largest per-thread arrays in the\n"
+                "codebase, ~508 B at 9 instances - statically live in main, for\n"
+                "a branch [COST] shows is never taken (coarseWalks 0.00). main's\n"
+                "top launch stall is register allocation at 24-26.5%.",
+                true
+            );
             if (group.var("Tau cache res", mTauCacheRes, 8u, 512u))
                 mTauLastBuildFrame = kTauNeverBuilt;
             group.tooltip("Longest-axis cell count. Changing it rebakes next frame.", true);

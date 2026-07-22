@@ -16,6 +16,7 @@
 #include "Rendering/Lights/EnvMapSampler.h"
 #include "Utils/Sampling/SampleGenerator.h"
 #include <array>
+#include <chrono>
 #include <vector>
 
 using namespace Falcor;
@@ -462,8 +463,14 @@ private:
     /// trilinear fetch of tau baked toward the dominant env direction.
     /// Unbiased: target-only, so any staleness/coarseness is variance.
     /// mUseTauCache compiles the feature (resources + build passes);
-    /// mTauCacheApply is the RUNTIME A/B switch (CB uniform, no recompile),
-    /// same discipline as mUseOccupancySkip.
+    /// mTauCacheApply selects WHICH ARM is compiled into main, via the
+    /// TAU_CACHE_APPLY define. It was a CB uniform (gTauEnable) so the A/B was
+    /// same-session; that kept both arms compiled, which kept
+    /// coarseOpticalDepth's ~508 B/thread of arrays statically live in main
+    /// for a branch [COST] shows is never taken (coarseWalks 0.00). Register
+    /// allocation is a static whole-kernel property and main's top launch
+    /// stall IS register allocation (24-26.5%), so the idle arm was taxing the
+    /// bottleneck. Flipping it now rebuilds - the intended trade.
     bool mUseTauCache = true;
     bool mTauCacheApply = true;
     /// Cache cells along the longest world axis (tail-bake convention).
@@ -497,7 +504,30 @@ private:
     // 42..45 = shadeMain divergence (bounce sum/max, marching-work sum/max),
     // 46..53 = [TRRPROBE] escape-walk E[T] with/without RR, 4 Tref bins x
     //          (RR sum, ref sum), x4096 fixed point.
-    static const uint32_t kRisStatSlots = 144; ///< 123..126 = [CVBAL] banked +thp*C / removed +(thp/p)*C / consumers / survivors; 127..131 = [CVEXIT] residual exit reason (warpRR, tailQ, escape, maxBounces, scatterFalse); 132..143 = [LUMHIST] 12 log2 luminance bins over the final image. 120..122 = [ENERGY] main-emitted luminance / shadeMain-emitted luminance / shaded entries, for the useCompaction A/B. 118..119 = radSplat deposits / deposits with a negative component (the cache-reads-high probe). 54..65 = [TRRPROBE2] coin telemetry (4 det-key bins x count/sumBefore/survives); 66..70 = [TRRPROBE2-CHK] self-checks + negative-Tr counts; 71 = brick-prefetch promotes; 72 = warp-RR kills; 73..76 = scatter-sort class histogram; 77..84 = [HOMOG] mean/majorant uniformity histogram (8 bins); 85..93 = [PATHLEN] shade path-length by radcache role (3 roles x count/sumBounces/stragglers>=16); 94..107 = [BOUNCECOST] shadeMain work split by op (94..99 sampleDistance cells/taps/hits/misses/skips/calls, 100..101 scatterAtVertex cells/taps, 102..107 deferred evalNEE cells/taps/hits/misses/skips/calls); 108..113 = [STEPOCC] stepToNextCollision DDA trip divergence (108/109 main sum/max, 112/113 shadeMain sum/max, 110/111 wave-mip lifts / summed lift levels across both) - the loop the wave-uniform mip lever targets, which neither [LOOPOCC] nor [SHADEOCC] could see; 114..117 = FREE (was [SUBHOMOG]; removed 2026-07-22 once the granularity question was answered and its per-cell texture fetch became a bandwidth cost at full res).
+    static const uint32_t kRisStatSlots = 144; ///< 123..126 = [CVBAL] banked +thp*C / removed +(thp/p)*C / consumers / survivors; 127..131 = [CVEXIT] residual exit reason (warpRR, tailQ, escape, maxBounces, scatterFalse); 132..143 = [LUMHIST] 12 log2 luminance bins over the final image. 120..122 = [ENERGY] main-emitted luminance / shadeMain-emitted luminance / shaded entries, for the useCompaction A/B. 118..119 = radSplat deposits / deposits with a negative component - 119 is an INVARIANT GUARD that must read 0 (the suffix is provably non-negative; the old "cache-reads-high" reading of it is REFUTED, see radSplat). 54..65 = [TRRPROBE2] coin telemetry (4 det-key bins x count/sumBefore/survives); 66..70 = [TRRPROBE2-CHK] self-checks + negative-Tr counts; 71 = brick-prefetch promotes; 72 = warp-RR kills; 73..76 = scatter-sort class histogram; 77..84 = [HOMOG] mean/majorant uniformity histogram (8 bins); 85..93 = [PATHLEN] shade path-length by radcache role (3 roles x count/sumBounces/stragglers>=16); 94..107 = [BOUNCECOST] shadeMain work split by op (94..99 sampleDistance cells/taps/hits/misses/skips/calls, 100..101 scatterAtVertex cells/taps, 102..107 deferred evalNEE cells/taps/hits/misses/skips/calls); 108..113 = [STEPOCC] stepToNextCollision DDA trip divergence (108/109 main sum/max, 112/113 shadeMain sum/max, 110/111 wave-mip lifts / summed lift levels across both) - the loop the wave-uniform mip lever targets, which neither [LOOPOCC] nor [SHADEOCC] could see; 114..117 = FREE (was [SUBHOMOG]; removed 2026-07-22 once the granularity question was answered and its per-cell texture fetch became a bandwidth cost at full res).
+    // ---- [FRAME] whole-frame accounting -------------------------------------
+    // WHY THIS EXISTS: every lever measured so far moved operation counts and
+    // none moved FPS, and the reason that was even possible is that nothing in
+    // this pass ever measured the FRAME. The GPU timers bracket this pass's own
+    // dispatches only - AccumulatePass, tone mapping, present, and all CPU time
+    // are outside it - so "gpuMs 26.8" could be the whole frame or a third of
+    // it, and we never knew which. Optimising a third of the frame by 5% moves
+    // nothing a user can see, which is exactly the symptom.
+    //
+    // mWallAccum* is sampled EVERY frame (not just logged frames) and averaged
+    // over the interval, so the reported FPS is steady-state rather than the
+    // one stalled frame where the GPU timers resolve. One stalled frame in
+    // risStatsInterval (64) is ~1.5% contamination - stated, not hidden.
+    std::chrono::high_resolution_clock::time_point mLastFrameTp{};
+    bool mHaveLastFrameTp = false;  ///< False until the first interval is complete.
+    double mWallAccumMs = 0.0;      ///< Summed wall-clock ms since the last log.
+    uint32_t mWallAccumFrames = 0;  ///< Frames in that sum.
+    /// Sub-dispatch GPU timers. "shade" in [WORK] was never shadeMain alone -
+    /// it is (total - main), i.e. argsMain + shadeMain + radResolve, and
+    /// radResolve is a 64^3 dispatch that runs EVERY frame and has never been
+    /// broken out. These split it so the attribution is measured, not assumed.
+    double mLastGpuMsShade = 0.0;
+    double mLastGpuMsResolve = 0.0;
     ref<Buffer> mpRisStats;         ///< Device-local counters (atomics).
     ref<Buffer> mpRisStatsReadback; ///< CPU-visible copy.
     bool mLogRisStats = false;      ///< Log the histogram while RIS is on.
@@ -514,10 +544,55 @@ private:
     /// the throttled readback sync above. Flip it (UI or script) to explain
     /// cost; leave it off to measure shipping fps.
     bool mLogWorkStats = false;
-    ref<GpuTimer> mpGpuTimer;
+    /// [TRRPROBE] residual-RR bias probe (RIS stat slots 46..70). Its own
+    /// switch because it is NOT free instrumentation: it compiles a second
+    /// full evalTransmittance walk AND a coarseOpticalDepth into main, and
+    /// register allocation is a static whole-kernel property, so main pays
+    /// their per-thread footprint on every warp just for being compiled -
+    /// on the kernel whose top launch stall IS register allocation.
+    /// It rode USE_WORK_STATS until 2026-07-22, which meant every [FRAME] /
+    /// [WORK] number ever logged was measured on a kernel the instrument had
+    /// fattened. Turn it on to re-run the bias measurement, and do not read
+    /// frame timings from a session where it was on.
+    bool mLogTrRRProbe = false;
+    // ---- GPU timer RING -----------------------------------------------------
+    // WHY A RING (2026-07-22, and this was a real defect, not a refinement):
+    // the first version of [FRAME] averaged the wall clock over all 64 frames of
+    // the log interval but sampled the GPU timers on the LOGGED FRAME ONLY. One
+    // frame of a 30 ms workload swings +-4 ms, so the two halves of the same log
+    // line had wildly different statistical footing. The occSkip gate exposed it
+    // exactly: 'pass' claimed +1.98 ms while 'wall' - the trustworthy number -
+    // said +0.02 ms, and the per-block spread (1.70/1.95 ms) buried the 0.79 ms
+    // effect being measured. Every single-frame GPU number this pass has ever
+    // printed carries that noise; gates were coming back INCONCLUSIVE because
+    // the instrument could not resolve them, not because the effects were absent.
+    //
+    // The fix: begin/end EVERY frame into slot (frame % kTimerRing), resolve it
+    // that frame, and only call getElapsedTime() on the slot kTimerRing-1 frames
+    // old. getElapsedTime() maps a staging buffer (see GpuTimer.cpp) and would
+    // block if read the same frame it was resolved; by the time the ring wraps
+    // the copy has long landed, so the read is free. Results accumulate and are
+    // averaged over the log interval, giving the GPU split the SAME footing as
+    // the wall clock - ~64 samples instead of 1, so the sd of the mean drops by
+    // about 8x.
+    //
+    // Cost: 8 timestamp writes + 4 resolveQuery + 4 small copies per frame,
+    // order tens of microseconds against a 30 ms frame. It is gated on
+    // mLogWorkStats, so shipping builds do no timing at all.
+    static const uint32_t kTimerRing = 8;
+    std::array<ref<GpuTimer>, kTimerRing> mTimerPass{};    ///< Whole pass.
+    std::array<ref<GpuTimer>, kTimerRing> mTimerMain{};    ///< Phase A (main dispatch).
+    std::array<ref<GpuTimer>, kTimerRing> mTimerShade{};   ///< shadeMain indirect dispatch.
+    std::array<ref<GpuTimer>, kTimerRing> mTimerResolve{}; ///< radResolve 64^3 dispatch.
+    uint32_t mTimerSlot = 0;      ///< Slot written this frame.
+    uint32_t mTimerFilled = 0;    ///< Frames timed so far; reads start once >= kTimerRing.
+    double mAccPass = 0.0, mAccMain = 0.0, mAccShade = 0.0, mAccResolve = 0.0;
+    uint32_t mAccFrames = 0;      ///< Samples in the accumulators.
+    /// Interval AVERAGES, refreshed at each log. Named mLast* for continuity
+    /// with the [WORK] line, but they are no longer single-frame samples.
     double mLastGpuMs = 0.0;
-    ref<GpuTimer> mpGpuTimerA; ///< Nested phase-A (main dispatch) timer; [WORK] prints the main/shade split.
     double mLastGpuMsA = 0.0;
+    uint32_t mLastGpuSamples = 0; ///< Samples behind those averages; printed in [FRAME] as n=.
 
     uint32_t mFrameCount = 0;
     bool mOptionsChanged = false;
