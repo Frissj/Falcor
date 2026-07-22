@@ -94,6 +94,8 @@ const char kRadWarpRRLanes[] = "radWarpRRLanes";
 const char kRadResidualTailQ[] = "radResidualTailQ";
 const char kRadTrainEvery[] = "radTrainEvery";
 const char kDistWeightK[] = "distWeightK";
+const char kUseWaveUniformMip[] = "useWaveUniformMip";
+const char kWaveMipLift[] = "waveMipLift";
 const char kRadAmortPeriod[] = "radAmortPeriod";
 const char kRadAmortTrainEvery[] = "radAmortTrainEvery";
 const char kRadEma[] = "radEma";
@@ -215,6 +217,10 @@ void VolumePathTracer::parseProperties(const Properties& props)
             mRadTrainEvery = std::max(1u, (uint32_t)value);
         else if (key == kDistWeightK)
             mDistWeightK = std::clamp((float)value, 0.f, 1.f);
+        else if (key == kUseWaveUniformMip)
+            mUseWaveUniformMip = value;
+        else if (key == kWaveMipLift)
+            mWaveMipLift = std::min((uint32_t)value, 3u);
         else if (key == kRadAmortPeriod)
             mRadAmortPeriod = (uint32_t)value;
         else if (key == kRadAmortTrainEvery)
@@ -284,6 +290,8 @@ Properties VolumePathTracer::getProperties() const
     props[kRadResidualTailQ] = mRadResidualTailQ;
     props[kRadTrainEvery] = mRadTrainEvery;
     props[kDistWeightK] = mDistWeightK;
+    props[kUseWaveUniformMip] = mUseWaveUniformMip;
+    props[kWaveMipLift] = mWaveMipLift;
     props[kRadAmortPeriod] = mRadAmortPeriod;
     props[kRadAmortTrainEvery] = mRadAmortTrainEvery;
     props[kRadEma] = mRadEma;
@@ -1035,6 +1043,14 @@ void VolumePathTracer::prepareProgram(RenderContext* pRenderContext)
     // or not a runtime flag reads it (run 137: gpuMs 26 -> 38 with identical
     // counters = register pressure). The checkbox rebuilds the program.
     defines.add("GVS_BRICK_PREFETCH", mUseBrickPrefetch ? "1" : "0");
+    // Wave-uniform majorant mip. COMPILE-TIME for the same reason as the
+    // prefetch above: at lift 0 the wave reduction still costs an instruction
+    // in the frame's hottest loop, so a runtime flag alone could never A/B its
+    // presence. Added unconditionally (0 or 1) rather than only when enabled -
+    // Slang does not propagate preprocessor defines across `import`, so
+    // VolumePathTracer.cs.slang needs the symbol defined by the host to gate
+    // vptSetWaveMipLift, exactly like GRID_VOLUME_SAMPLER_STATS.
+    defines.add("GVS_WAVE_UNIFORM_MIP", mUseWaveUniformMip ? "1" : "0");
     // Stream compaction: only meaningful on the RIS path (the reference path
     // stays a single fused kernel, byte-identical ground truth).
     const bool compactionCompiled = mUseRIS && mUseCompaction;
@@ -1455,6 +1471,10 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
         var["CB"]["gFootprintSpread"] = footprintSpread;
         var["CB"]["gOccSkipEnable"] = mUseOccupancySkip ? 1u : 0u;
         var["CB"]["gDistWeightK"] = mDistWeightK;
+        // Clamped to the mip range the DDA actually has (0..3, see
+        // increaseAccessorLevel). A lift larger than the range is not an error,
+        // just indistinguishable from 3; clamping keeps the logged value honest.
+        var["CB"]["gWaveMipLift"] = std::min(mWaveMipLift, 3u);
         var["CB"]["gPrevViewProj"] = mPrevViewProj;
         var["CB"]["gPrevCamPos"] = mPrevCamPos;
         var["CB"]["gTemporalEnable"] = (temporalActive && mPrevCamValid) ? 1u : 0u;
@@ -1870,6 +1890,32 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
                     "[LOOPOCC] frame {} | rqTraversal occ {:.3f} laneIters {} warpIters {} "
                     "| coarseDDA occ {:.3f} laneIters {} warpIters {}",
                     mFrameCount, rqOcc, s[38], s[39], ddaOcc, s[40], s[41]
+                );
+
+                // [STEPOCC]: the DDA inside stepToNextCollision, which is where
+                // the shipping distance sampler spends the 68.3% [BOUNCECOST]
+                // ds bucket and which neither probe above reaches - rqTraversal
+                // stops at the brick, coarseDDA is a different walk. Same
+                // sum/(max*32) identity, so these read directly against
+                // [SHADEOCC]'s march occ 0.301 and Nsight's 24.27% active
+                // threads per warp.
+                //
+                // lift% is the mechanism check, and it must be read FIRST: a
+                // warp whose lanes already agree on the mip has nothing to
+                // lift, so lift% near zero means the lever never fired and the
+                // occupancy numbers say nothing about whether it works. Reading
+                // a flat occ as "the idea fails" without checking this is the
+                // [SUBHOMOG] mistake in a new place.
+                const double stOccA = s[109] > 0 ? double(s[108]) / (double(s[109]) * 32.0) : 0.0;
+                const double stOccB = s[113] > 0 ? double(s[112]) / (double(s[113]) * 32.0) : 0.0;
+                const uint64_t stCells = uint64_t(s[108]) + uint64_t(s[112]);
+                const double liftPct = stCells > 0 ? 100.0 * double(s[110]) / double(stCells) : 0.0;
+                const double liftAvg = s[110] > 0 ? double(s[111]) / double(s[110]) : 0.0;
+                logInfo(
+                    "[STEPOCC] frame {} | lift {} | main occ {:.3f} laneIters {} warpIters {} "
+                    "| shade occ {:.3f} laneIters {} warpIters {} | lifted {:.1f}% of {} cells, avg +{:.2f} mip",
+                    mFrameCount, std::min(mWaveMipLift, 3u), stOccA, s[108], s[109], stOccB, s[112], s[113],
+                    liftPct, stCells, liftAvg
                 );
 
                 // shadeMain path-length divergence. Unlike main, every lane
@@ -2599,6 +2645,45 @@ void VolumePathTracer::renderUI(Gui::Widgets& widget)
             "[SHADEOCC] bounces occ / warpMaxSum and gpuMs.",
             true
         );
+        rebuild |= group.checkbox("Wave-uniform majorant mip", mUseWaveUniformMip);
+        group.tooltip(
+            "analysis7.yaml read PER RANGE ranks Active Threads Per Warp first\n"
+            "at 24.27% (4.12x ceiling, 73% frame gain) against 1.36x/25.6% for\n"
+            "the register limiter, with the SM issuing at 52.6% of peak and\n"
+            "long-scoreboard stalls at 1.5% - so the frame is not latency-\n"
+            "starved, it issues plenty and masks off 75.7% of its lanes.\n\n"
+            "Scheduling is already exhausted (wavefront and the sort above both\n"
+            "measured slower): they fix path LENGTH, and the residue is march-\n"
+            "length variance INSIDE one bounce - stepToNextCollision's DDA,\n"
+            "which costs its warp max(trips). This lifts each lane's mip toward\n"
+            "the coarsest its warp wants, so step size and trip count go\n"
+            "wave-uniform. Trades ALU loop trips for tex taps, and tex is not\n"
+            "even in the top-5 SOL list.\n\n"
+            "UNBIASED (a coarser majorant is still a bound) but NOT byte-\n"
+            "identical: cell count drives the sample stream. Gate on a converged\n"
+            "image comparison, like distWeightK - never on bit-identity.\n\n"
+            "COMPILE-TIME (rebuilds): at lift 0 the wave reduction still costs\n"
+            "an instruction in the hottest loop, so a runtime flag alone cannot\n"
+            "A/B its presence - the run-137 lesson.",
+            true
+        );
+        if (mUseWaveUniformMip)
+        {
+            group.var("Wave mip lift", mWaveMipLift, 0u, 3u);
+            group.tooltip(
+                "Levels a lane may be lifted above its own accessor level.\n"
+                "0 = per-lane mip = pre-lever behaviour; 3 = full WaveActiveMax.\n"
+                "Runtime uniform, no rebuild - sweep it inside ONE session.\n\n"
+                "Clamped rather than a bare max because the sign of the trade is\n"
+                "not predictable: over-coarsening a lane inside dense cloud makes\n"
+                "it collide immediately, pushing iterations out of this loop and\n"
+                "into the caller's retry loop - divergence moved, not removed.\n\n"
+                "Read [STEPOCC] before gpuMs, and read its lift fraction FIRST:\n"
+                "if the warp's lanes already agreed on the mip there was nothing\n"
+                "to lift, and a flat occupancy says nothing about the idea.",
+                true
+            );
+        }
 
         if (mUseBrickTlas)
         {

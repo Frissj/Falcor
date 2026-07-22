@@ -179,6 +179,25 @@ def render_graph_VNA():
         # kept compiled for A/B; do not re-enable without a new measurement
         # that contradicts this one.
         'useWavefront': False,
+        # Wave-uniform majorant mip (2026-07-22). The note above is the reason
+        # this exists: the divergence that survives compaction is INTRA-bounce
+        # marching cost, and analysis7.yaml read per range prices it at 4.12x
+        # (Active Threads Per Warp 24.27%, 73% frame gain) against 1.36x for
+        # the register limiter. Requeueing and sorting both failed because they
+        # reorder lanes; this instead makes the DDA step SIZE wave-uniform, so
+        # per-lane trip counts converge and the loop stops costing max(trips).
+        #
+        # OFF pending measurement. Unbiased at any lift (a coarser majorant is
+        # still a bound) but NOT byte-identical - cell count drives the sample
+        # stream - so promoting it needs a converged image comparison, not the
+        # bit-identity check compaction and the queue sort could use.
+        #
+        # Sweep: set useWaveUniformMip True to compile it in, then step
+        # waveMipLift 0..3 live. Read [STEPOCC] before gpuMs, and read its lift
+        # fraction FIRST - a warp whose lanes already agreed on the mip had
+        # nothing to lift, and a flat occupancy would say nothing about the idea.
+        'useWaveUniformMip': False,
+        'waveMipLift': 0,
         # Radiance-cache control variate (2026-07-20): the deep-bounce tail's
         # mean lives in a trained world-grid cache; paths past radCutBounce
         # only estimate the residual (L - C), so the aggressive kill rate that

@@ -41,6 +41,14 @@ cbuffer CB
     /// null collisions for weight variance. ESTIMATOR CHANGE - gate on an image
     /// comparison, not on gpuMs.
     float gDistWeightK;
+    /// Levels a lane may be lifted above its own DDA accessor level by its warp
+    /// (see gvsSetWaveMipLift / the WAVE-UNIFORM MAJORANT MIP note). 0 = per-lane
+    /// mip = pre-lever behaviour; 3 = full WaveActiveMax. Only read when the
+    /// program was compiled with GVS_WAVE_UNIFORM_MIP. ESTIMATOR-EQUIVALENT but
+    /// NOT byte-identical (the cell count drives the sample stream), so gate it
+    /// on a converged image comparison, and read [STEPOCC] - not gpuMs alone -
+    /// to tell whether the mechanism did what it is for.
+    uint gWaveMipLift;
     /// Stage B temporal reuse: previous frame's camera.
     float4x4 gPrevViewProj;
     float3 gPrevCamPos;
@@ -122,6 +130,48 @@ uint gvsTapsNow()
     return gGvsStatTaps;
 #else
     return 0;
+#endif
+}
+
+/** [STEPOCC] inputs: stepToNextCollision's per-lane DDA trip count, and how
+    much of it the warp actually managed to lift. The trip count is the quantity
+    the wave-uniform mip lever exists to equalize - Nsight's 24.27% active
+    threads per warp is the whole-range consequence, this is the loop that owns
+    it, and lifts/cells says whether the lever had anything to bite on.
+*/
+uint gvsStepItersNow()
+{
+#if GRID_VOLUME_SAMPLER_STATS
+    return gGvsStatStepIters;
+#else
+    return 0;
+#endif
+}
+uint gvsMipLiftsNow()
+{
+#if GRID_VOLUME_SAMPLER_STATS
+    return gGvsStatMipLifts;
+#else
+    return 0;
+#endif
+}
+uint gvsMipLiftSumNow()
+{
+#if GRID_VOLUME_SAMPLER_STATS
+    return gGvsStatMipLiftSum;
+#else
+    return 0;
+#endif
+}
+
+/** Push the wave-mip lift into the sampler. A wrapper rather than a direct call
+    at each entry: gvsSetWaveMipLift only exists when the lever is compiled in,
+    and five entry points should not carry five copies of the same #if.
+*/
+void vptSetWaveMipLift(const uint lift)
+{
+#if GVS_WAVE_UNIFORM_MIP
+    gvsSetWaveMipLift(lift);
 #endif
 }
 uint gvsHomogBinNow(uint k)
@@ -782,6 +832,7 @@ void main(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
     gvsSetOccSkipEnable(gOccSkipEnable);
     gvsSetDistWeightK(gDistWeightK);
+    vptSetWaveMipLift(gWaveMipLift);
     const uint2 pixel = dispatchThreadId.xy;
     if (any(pixel >= gFrameDim))
         return;
@@ -1658,6 +1709,24 @@ void main(uint3 dispatchThreadId: SV_DispatchThreadID)
         const uint ddaSum = WaveActiveSum(volumeSampler.statDdaIters);
         const uint ddaMax = WaveActiveMax(volumeSampler.statDdaIters);
 
+        // [STEPOCC] (slots 108-111, freed by [SUBHOMOG]'s removal). Neither
+        // probe above sees the loop the wave-uniform mip lever targets:
+        // rqTraversal is the RayQuery walk over bricks, coarseDDA is
+        // coarseOpticalDepth's own march, and both stop at the door of
+        // stepToNextCollision - which is where the shipping distance sampler
+        // (sampleDistanceRQ -> sampleDistanceDeltaTrackingLocalDDA) spends the
+        // 68.3% ds bucket. Same sum/(max*32) identity as the other two, so the
+        // number is directly comparable to march occ 0.301 / bounces occ 0.223.
+        //
+        // liftSum/lifts is the mechanism check that [SUBHOMOG] and run 137 both
+        // taught: a warp whose lanes already agree on the mip has nothing to
+        // lift, so without it "the lever did nothing" and "the lever never
+        // fired" are the same log line.
+        const uint stSum = WaveActiveSum(gvsStepItersNow());
+        const uint stMax = WaveActiveMax(gvsStepItersNow());
+        const uint mlCount = WaveActiveSum(gvsMipLiftsNow());
+        const uint mlSum = WaveActiveSum(gvsMipLiftSumNow());
+
         if (WaveIsFirstLane())
         {
             if (dvSum > 0) InterlockedAdd(gRisStats[31], dvSum);
@@ -1684,6 +1753,11 @@ void main(uint3 dispatchThreadId: SV_DispatchThreadID)
             if (rqMax > 0) InterlockedAdd(gRisStats[39], rqMax);
             if (ddaSum > 0) InterlockedAdd(gRisStats[40], ddaSum);
             if (ddaMax > 0) InterlockedAdd(gRisStats[41], ddaMax);
+
+            if (stSum > 0) InterlockedAdd(gRisStats[108], stSum);
+            if (stMax > 0) InterlockedAdd(gRisStats[109], stMax);
+            if (mlCount > 0) InterlockedAdd(gRisStats[110], mlCount);
+            if (mlSum > 0) InterlockedAdd(gRisStats[111], mlSum);
 
             if (hg0 > 0) InterlockedAdd(gRisStats[77], hg0);
             if (hg1 > 0) InterlockedAdd(gRisStats[78], hg1);
@@ -1746,6 +1820,7 @@ void shadeMain(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
     gvsSetOccSkipEnable(gOccSkipEnable);
     gvsSetDistWeightK(gDistWeightK);
+    vptSetWaveMipLift(gWaveMipLift);
     const uint queueIdx = dispatchThreadId.x;
     if (queueIdx >= gScatterCount[0])
         return;
@@ -2193,6 +2268,19 @@ void shadeMain(uint3 dispatchThreadId: SV_DispatchThreadID)
         const uint swSum = WaveActiveSum(swWork);
         const uint swMax = WaveActiveMax(swWork);
 
+        // ---- [STEPOCC] phase B (slots 112/113, + shared lift counters) ----
+        // swWork above is cells+taps: bounce COST, mixed units. This is the raw
+        // TRIP COUNT of stepToNextCollision's DDA, which is the loop the
+        // wave-uniform mip lever actually equalizes, and it is measured here
+        // because that is where the 68.3% ds bucket runs - reading it only in
+        // main would price the lever on phase A, which does a fraction of the
+        // marching. Separate slots from main's so the two phases stay legible
+        // instead of averaging into one uninterpretable number.
+        const uint stbSum = WaveActiveSum(gvsStepItersNow());
+        const uint stbMax = WaveActiveMax(gvsStepItersNow());
+        const uint mlbCount = WaveActiveSum(gvsMipLiftsNow());
+        const uint mlbSum = WaveActiveSum(gvsMipLiftSumNow());
+
         // ---- [BOUNCECOST] flush (slots 94..107) ----
         // Wave-reduced up here with every lane active (the h9/h11 lesson above),
         // atomics below. The three regions partition this kernel's marching
@@ -2230,6 +2318,11 @@ void shadeMain(uint3 dispatchThreadId: SV_DispatchThreadID)
             if (q11 > 0) InterlockedAdd(gRisStats[105], q11);
             if (q12 > 0) InterlockedAdd(gRisStats[106], q12);
             if (q13 > 0) InterlockedAdd(gRisStats[107], q13);
+
+            if (stbSum > 0) InterlockedAdd(gRisStats[112], stbSum);
+            if (stbMax > 0) InterlockedAdd(gRisStats[113], stbMax);
+            if (mlbCount > 0) InterlockedAdd(gRisStats[110], mlbCount);
+            if (mlbSum > 0) InterlockedAdd(gRisStats[111], mlbSum);
         }
 
         if (WaveIsFirstLane())
@@ -2476,6 +2569,7 @@ void shadeInitMain(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
     gvsSetOccSkipEnable(gOccSkipEnable);
     gvsSetDistWeightK(gDistWeightK);
+    vptSetWaveMipLift(gWaveMipLift);
     const uint queueIdx = dispatchThreadId.x;
     if (queueIdx >= gScatterCount[0])
         return;
@@ -2530,6 +2624,7 @@ void bounceMain(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
     gvsSetOccSkipEnable(gOccSkipEnable);
     gvsSetDistWeightK(gDistWeightK);
+    vptSetWaveMipLift(gWaveMipLift);
     const uint i = dispatchThreadId.x;
     if (i >= gPathCountIn[0])
         return;
@@ -2614,6 +2709,7 @@ void bounceTailMain(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
     gvsSetOccSkipEnable(gOccSkipEnable);
     gvsSetDistWeightK(gDistWeightK);
+    vptSetWaveMipLift(gWaveMipLift);
     const uint i = dispatchThreadId.x;
     if (i >= gPathCountIn[0])
         return;

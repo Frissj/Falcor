@@ -192,7 +192,129 @@ static uint gGvsStatBrickHits = 0;   ///< Taps served from the cached brick.
 static uint gGvsStatBrickMisses = 0; ///< Taps that had to re-chase the indirection.
 static uint gGvsStatTapSkips = 0;    ///< Taps answered from the occupancy mask, atlasTex never read.
 static uint gGvsStatBrickPromotes = 0; ///< Misses answered by the prefetch entry - register moves, loads already in flight.
+/// stepToNextCollision's while (t < tFar) trip count for THIS lane. Declared
+/// unconditionally (not under GVS_WAVE_UNIFORM_MIP) so [STEPOCC] reads the same
+/// quantity in the baseline build and the lever build - an occupancy number is
+/// only worth having if the A and the B are the same measurement.
+static uint gGvsStatStepIters = 0;
+static uint gGvsStatMipLifts = 0;    ///< Cells whose mip the warp actually raised above this lane's own level.
+static uint gGvsStatMipLiftSum = 0;  ///< Sum of (lifted - own) over those cells - the average lift, not just its frequency.
 #endif
+
+// ---------------------------------------------------------------------------
+// WAVE-UNIFORM MAJORANT MIP (lever: Active Threads Per Warp).
+//
+// WHY: analysis7.yaml, read PER RANGE, puts "Active Threads Per Warp" at 24.27%
+// with a 4.12x range-speedup ceiling and 73% frame gain - three times the
+// register-count rule (1.36x / 25.6%) and fifty times long scoreboard. The SM
+// issues at 52.6% of peak while long-scoreboard stalls sit at 1.5% and L2 hits
+// 92%, so the frame is NOT latency-starved: it issues plenty of instructions,
+// and 75.7% of the lane slots inside them are masked off. That is also the
+// answer to the question five levers failed to answer - they all removed TAPS,
+// work on the tex/lsu pipes, which do not even reach the top-5 SOL list, from
+// lanes that were already idle. Op counts were never what the warp was paying.
+//
+// Both scheduling routes are already closed and measured: per-bounce requeueing
+// (mUseWavefront) and the work-class queue sort (mUseScatterSort) each fixed
+// path-LENGTH divergence and each came back slower. The wavefront note names
+// the residue exactly - "single-bounce cost variance (3 vs 40 bricks marched)
+// is most of the 0.383 work-occupancy gap". That residue is THIS loop. The
+// while (t < tFar) DDA below costs its warp max(trips), not sum(trips), and
+// reordering which lanes share a warp cannot change any single lane's trips.
+//
+// WHAT THIS DOES: the mip sets the DDA step size, and it is currently a purely
+// per-lane quantity (the accessor climbs kDDAMipUpSpeed per empty cell, drops
+// kDDAMipDownSpeed on a collision). So one lane grinding at mip 0 while its 31
+// neighbours coast at mip 3 makes the entire warp pay the mip-0 trip count.
+// Taking the COARSEST level any active lane wants makes the step size
+// wave-uniform, so trip counts converge by construction - no queues, no
+// barriers, no per-path state round-trip, which is what sank the wavefront
+// backend. It trades serialized loop iterations on the ALU pipe (top SOL at
+// 43%) for null collisions on tex/lsu (idle).
+//
+// UNBIASED - keep this true when editing. Delta tracking is unbiased for ANY
+// majorant that bounds sigma over the cell it steps. A mip-m majorant is a max
+// over a superset of the mip-0 cell, so coarsening only ever makes the bound
+// looser, never invalid; that is precisely why the existing adaptive climb is
+// already allowed to move the level at will. Lifting a lane's mip therefore
+// introduces no bias regardless of what the other lanes are doing.
+//
+// The subtler half: the mip a lane uses now depends on OTHER lanes' RNG (their
+// accessor levels, and whether they are still active in the loop). Conditional
+// on every other lane's sample stream, this lane's majorant is still a fixed
+// function of its own position along its own ray, so its estimate is unbiased;
+// averaging over the other lanes' streams preserves that by the tower property.
+// The argument rests on lanes having INDEPENDENT sample streams - which they
+// do, since each is seeded by pixel - so do not introduce cross-lane sample
+// sharing above this without revisiting it.
+//
+// NOT byte-identical, unlike compaction or the queue sort. Changing the mip
+// changes how many cells the walk steps, which changes how many sampleNext1D
+// draws it consumes, so the sample stream diverges from the reference. Same
+// class as distWeightK: gate on a converged IMAGE comparison, never on
+// bit-identity, and never on gpuMs alone.
+//
+// A LIFT CLAMP rather than a bare WaveActiveMax, because the trade has a sign
+// that cannot be predicted from here. Over-coarsening a lane that sits inside
+// dense cloud makes tauToGo run out almost immediately, which pushes iterations
+// out of this inner loop and into the caller's while(1) retry loop - divergence
+// moved rather than removed. gGvsWaveMipLift sweeps 0 (current behaviour)
+// through 3 (full wave max) live, so the balance point gets measured instead of
+// assumed. [STEPOCC] is the metric that decides it; gpuMs alone cannot, because
+// this lever is supposed to trade one pipe's work for another's.
+//
+// COMPILE-TIME gate on top of the runtime lift: at lift 0 the wave reduction
+// still costs an instruction in the hottest loop in the frame, and this file's
+// own run-137 lesson is that a runtime flag cannot A/B something that costs
+// whether or not it is read. GVS_WAVE_UNIFORM_MIP 0 compiles all of it out, so
+// every other user of this module - and every ship build - stays unchanged.
+// ---------------------------------------------------------------------------
+#ifndef GVS_WAVE_UNIFORM_MIP
+#define GVS_WAVE_UNIFORM_MIP 0
+#endif
+#if GVS_WAVE_UNIFORM_MIP
+/** Maximum number of levels a lane may be lifted above its own accessor level
+    by its warp. 0 = per-lane mip = the pre-lever behaviour (and the estimator
+    is byte-identical there, since the clamp collapses before any wave op runs);
+    3 = full WaveActiveMax. A per-thread static set from the pass CB, matching
+    gGvsOccSkipEnable / gGvsDistWeightK - module-scope uniforms do not get a
+    valid binding in this codebase (see the note on gGvsOccSkipEnable).
+*/
+static uint gGvsWaveMipLift = 0u;
+void gvsSetWaveMipLift(const uint lift)
+{
+    gGvsWaveMipLift = lift;
+}
+
+/** Wave-uniform lift of one DDA cell's mip.
+
+    Returns >= ownMip ALWAYS, and that is what makes this safe under any
+    reconvergence behaviour the compiler chooses: HLSL wave ops see only the
+    currently-active lanes, but however those lanes happen to be packed, THIS
+    lane is one of them, so the max can never come back below its own level and
+    can never turn a bounding majorant into a non-bounding one. A smaller-than-
+    expected active mask costs opportunity, never correctness.
+*/
+int gvsWaveLiftMip(const int ownMip)
+{
+    if (gGvsWaveMipLift == 0u) return ownMip;
+    const int lifted = min(WaveActiveMax(ownMip), ownMip + int(gGvsWaveMipLift));
+#if GRID_VOLUME_SAMPLER_STATS
+    // Did the mechanism actually fire? Without this a null result is
+    // uninterpretable: a warp whose lanes already agree on the mip has nothing
+    // to lift, and "no effect" would be indistinguishable from "no
+    // opportunity". Registers only, no memory traffic, and stats-gated, so the
+    // [SUBHOMOG] failure (a settled diagnostic still spending bandwidth in the
+    // hot loop) cannot repeat here.
+    if (lifted > ownMip)
+    {
+        gGvsStatMipLifts++;
+        gGvsStatMipLiftSum += uint(lifted - ownMip);
+    }
+#endif
+    return lifted;
+}
+#endif // GVS_WAVE_UNIFORM_MIP
 
 /** Invalidate the brick cache. MUST be called at the start of every walk, before
     any tap, because the cache is only valid for a single Grid (see above).
@@ -602,8 +724,31 @@ struct GridVolumeSampler
         while (t < tFar)
         {
             gvsStatCell();
-            // Core DDA step.
-            const int mip = round(getAccessorLevel(accessor));
+#if GRID_VOLUME_SAMPLER_STATS
+            // [STEPOCC] denominator. gGvsStatCells cannot serve here: gvsStatCell
+            // is also called by the tail DDA in VolumeInstanceSampler, so its
+            // total mixes two different loops and the sum/max occupancy identity
+            // (which holds per loop) would not apply to it.
+            gGvsStatStepIters++;
+#endif
+            // Core DDA step. The level the accessor asks for is per-lane; the
+            // level actually stepped may be lifted to keep the warp's step size
+            // uniform (see the WAVE-UNIFORM MAJORANT MIP note above). Coarser is
+            // always a valid bound, so this moves cost only.
+            //
+            // MEASUREMENT HAZARD, since three things below are gated on mip == 0:
+            // the weighted-tracking mean, the [HOMOG] histogram, and the brick
+            // prefetch. Lifting the mip makes all three fire LESS OFTEN, so under
+            // a nonzero lift [HOMOG] thins out and the brick-cache hit rate moves
+            // for reasons that have nothing to do with those features. Compare
+            // them across lift settings only against a matched cell count, never
+            // as raw totals.
+            const int ownMip = int(round(getAccessorLevel(accessor)));
+#if GVS_WAVE_UNIFORM_MIP
+            const int mip = gvsWaveLiftMip(ownMip);
+#else
+            const int mip = ownMip;
+#endif
             const float3 pos = ipos + idir * t;
             const float tExit = stepDDA(ipos, ri, pos, mip);
             logVolumeLookup();

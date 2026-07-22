@@ -144,6 +144,35 @@ private:
     /// record; do not reopen without a design that prefetches only when the
     /// segment is likely to continue (the waste, not the idea, is what lost).
     bool mUseBrickPrefetch = false;
+    /// Wave-uniform majorant mip (2026-07-22). analysis7.yaml read PER RANGE
+    /// ranks "Active Threads Per Warp" 24.27% first by a wide margin - 4.12x
+    /// range-speedup ceiling, 73% frame gain, against 1.36x/25.6% for the
+    /// register limiter it was previously blamed on - while the SM issues at
+    /// 52.6% of peak with long-scoreboard stalls at 1.5%. So the frame is not
+    /// latency-starved; it issues plenty and masks off 75.7% of the lanes. Both
+    /// scheduling answers are already measured-off (mUseWavefront,
+    /// mUseScatterSort) because they fix path LENGTH, and the residue is
+    /// per-bounce march-length variance inside stepToNextCollision's DDA - a
+    /// loop that costs its warp max(trips). This lifts each lane's mip toward
+    /// the coarsest its warp wants, so step size and therefore trip count go
+    /// wave-uniform.
+    ///
+    /// UNBIASED (a coarser majorant is still a bound - the same reason the
+    /// existing adaptive climb is legal) but NOT byte-identical: cell count
+    /// drives the sample stream. Gate on a converged image comparison.
+    ///
+    /// Two knobs on purpose, matching mUseTauCache/mTauCacheApply and
+    /// mUseBrickPrefetch's run-137 lesson: the compile flag decides whether the
+    /// wave reduction exists in the hottest loop at all, the runtime lift
+    /// sweeps the trade live within one session (cross-session gpuMs on this
+    /// machine drifts ~25% with identical work counters).
+    bool mUseWaveUniformMip = false;
+    /// Levels a lane may be lifted above its own accessor level. 0 = per-lane
+    /// mip = pre-lever behaviour even with the feature compiled in; 3 = full
+    /// WaveActiveMax. Read [STEPOCC], not gpuMs alone - the lever deliberately
+    /// trades ALU trips for tex taps, so a wash in gpuMs with occupancy up is a
+    /// different result from a wash with occupancy flat.
+    uint32_t mWaveMipLift = 0;
     /// Pixels one acceleration-structure cell may span before the next coarser
     /// mip is selected (1 = cell ~ pixel, the Nanite balance point).
     float mMipPixelThreshold = 1.f;
@@ -445,7 +474,7 @@ private:
     // 42..45 = shadeMain divergence (bounce sum/max, marching-work sum/max),
     // 46..53 = [TRRPROBE] escape-walk E[T] with/without RR, 4 Tref bins x
     //          (RR sum, ref sum), x4096 fixed point.
-    static const uint32_t kRisStatSlots = 144; ///< 123..126 = [CVBAL] banked +thp*C / removed +(thp/p)*C / consumers / survivors; 127..131 = [CVEXIT] residual exit reason (warpRR, tailQ, escape, maxBounces, scatterFalse); 132..143 = [LUMHIST] 12 log2 luminance bins over the final image. 120..122 = [ENERGY] main-emitted luminance / shadeMain-emitted luminance / shaded entries, for the useCompaction A/B. 118..119 = radSplat deposits / deposits with a negative component (the cache-reads-high probe). 54..65 = [TRRPROBE2] coin telemetry (4 det-key bins x count/sumBefore/survives); 66..70 = [TRRPROBE2-CHK] self-checks + negative-Tr counts; 71 = brick-prefetch promotes; 72 = warp-RR kills; 73..76 = scatter-sort class histogram; 77..84 = [HOMOG] mean/majorant uniformity histogram (8 bins); 85..93 = [PATHLEN] shade path-length by radcache role (3 roles x count/sumBounces/stragglers>=16); 94..107 = [BOUNCECOST] shadeMain work split by op (94..99 sampleDistance cells/taps/hits/misses/skips/calls, 100..101 scatterAtVertex cells/taps, 102..107 deferred evalNEE cells/taps/hits/misses/skips/calls); 108..117 = FREE (was [SUBHOMOG]; removed 2026-07-22 once the granularity question was answered and its per-cell texture fetch became a bandwidth cost at full res).
+    static const uint32_t kRisStatSlots = 144; ///< 123..126 = [CVBAL] banked +thp*C / removed +(thp/p)*C / consumers / survivors; 127..131 = [CVEXIT] residual exit reason (warpRR, tailQ, escape, maxBounces, scatterFalse); 132..143 = [LUMHIST] 12 log2 luminance bins over the final image. 120..122 = [ENERGY] main-emitted luminance / shadeMain-emitted luminance / shaded entries, for the useCompaction A/B. 118..119 = radSplat deposits / deposits with a negative component (the cache-reads-high probe). 54..65 = [TRRPROBE2] coin telemetry (4 det-key bins x count/sumBefore/survives); 66..70 = [TRRPROBE2-CHK] self-checks + negative-Tr counts; 71 = brick-prefetch promotes; 72 = warp-RR kills; 73..76 = scatter-sort class histogram; 77..84 = [HOMOG] mean/majorant uniformity histogram (8 bins); 85..93 = [PATHLEN] shade path-length by radcache role (3 roles x count/sumBounces/stragglers>=16); 94..107 = [BOUNCECOST] shadeMain work split by op (94..99 sampleDistance cells/taps/hits/misses/skips/calls, 100..101 scatterAtVertex cells/taps, 102..107 deferred evalNEE cells/taps/hits/misses/skips/calls); 108..113 = [STEPOCC] stepToNextCollision DDA trip divergence (108/109 main sum/max, 112/113 shadeMain sum/max, 110/111 wave-mip lifts / summed lift levels across both) - the loop the wave-uniform mip lever targets, which neither [LOOPOCC] nor [SHADEOCC] could see; 114..117 = FREE (was [SUBHOMOG]; removed 2026-07-22 once the granularity question was answered and its per-cell texture fetch became a bandwidth cost at full res).
     ref<Buffer> mpRisStats;         ///< Device-local counters (atomics).
     ref<Buffer> mpRisStatsReadback; ///< CPU-visible copy.
     bool mLogRisStats = false;      ///< Log the histogram while RIS is on.
