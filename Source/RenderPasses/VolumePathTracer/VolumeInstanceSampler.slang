@@ -56,6 +56,15 @@ import Rendering.Volumes.GridVolumeSamplerParams;
 #define USE_FOOTPRINT_MIP 0
 #endif
 
+// Shared per-brick walk setup in evalEscapeAndCandidatesRQ (see WalkSetup in
+// GridVolumeSampler.slang). ON by default because it is pure instruction
+// removal with a bit-identical result; the toggle exists so the win can be
+// A/B'd inside one session against the original call signatures, which are
+// still compiled and still correct.
+#ifndef GVS_SHARED_WALK_SETUP
+#define GVS_SHARED_WALK_SETUP 1
+#endif
+
 // ---- VNA section 3: merged coarse tail (UE Nanite Assemblies lesson) --------
 // Above the fine structure, the union of ALL instances is baked into ONE
 // world-space grid of conservative summed majorants + approximate summed means.
@@ -1452,14 +1461,49 @@ struct VolumeInstanceSampler
             statSegments++;
             const GridVolume gridVolume = gScene.getGridVolume(info.gridVolumeIdx);
 
+            // ONE walk setup for this brick, shared by the escape term and all
+            // nProc candidate processes below. They differ only in their [t0,t1]
+            // window - the grid, the ray, and therefore the index-space
+            // transform and slab reciprocal are identical across all of them, so
+            // computing them per walk was 1 + nProc copies of the same answer.
+            //
+            // Measured motivation (log 185, shipping config, 2560x1351): this
+            // bucket runs 5.8 segments and 19.0 DDA cells per pixel, so the
+            // preamble was running 17.4 times per pixel against 19.0 loop
+            // iterations. It also flushed the brick cache on every walk, which
+            // forced a guaranteed miss at the start of each candidate process on
+            // a brick the previous process had just finished reading.
+            //
+            // Correctness: the grid is fixed for this whole iteration (it comes
+            // from info.gridVolumeIdx), which is exactly the condition the brick
+            // cache's single-grid rule requires. The next brick builds a fresh
+            // setup and resets the cache again.
+            // A/B TOGGLE, and it has to be compile-time: the whole point is to
+            // remove instructions, and a runtime flag that selects between two
+            // preambles keeps both alive in the register allocation - the run-137
+            // lesson that killed the runtime version of the brick prefetch. OFF
+            // compiles the ORIGINAL call signatures, whose wrappers still build a
+            // setup per walk, so it is the pre-change code exactly. Flip it and
+            // rebuild within one session; cross-session gpuMs on this machine
+            // drifts ~25% with identical counters, which is larger than this
+            // effect is likely to be.
+#if GVS_SHARED_WALK_SETUP
+            const GridVolumeSampler::WalkSetup walk = gvs.beginWalk(gridVolume, ray.origin, ray.dir);
+#endif
+
             // Escape term: identical per-brick factor to evalTransmittanceRQ.
             // Tr hitting zero stops the tracker but NOT the traversal - the
             // candidate processes still need the remaining bricks.
             if (Tr > 0.f)
             {
                 if (GridVolumeSampler::kTransmittanceEstimator == TransmittanceEstimator::ResidualRatioTrackingLocalMajorant)
+#if GVS_SHARED_WALK_SETUP
+                    Tr *= gvs.evalTransmittanceResidualRatioTrackingLocalDDA(walk, gridVolume, tt, sg,
+                        selectResidualMip(gridVolume, ray.dir, tt.x));
+#else
                     Tr *= gvs.evalTransmittanceResidualRatioTrackingLocalDDA(gridVolume, ray.origin, ray.dir, tt, sg,
                         selectResidualMip(gridVolume, ray.dir, tt.x));
+#endif
                 else
                     Tr *= gvs.evalTransmittanceRatioTrackingLocalDDA(gridVolume, ray.origin, ray.dir, tt, sg);
             }
@@ -1478,12 +1522,18 @@ struct VolumeInstanceSampler
 
             // Candidates: identical per-brick min construction to
             // sampleCandidatesRQ, clamped per process instead of committed.
+            // All nProc processes share `walk` - only the [t0,t1] window differs.
             for (uint j = 0; j < nProc; ++j)
             {
                 if (tt.x >= bestT[j]) continue;
                 GridVolumeSampler::DistanceSample gds;
+#if GVS_SHARED_WALK_SETUP
+                if (gvs.sampleDistanceDeltaTrackingLocalDDA(walk, gridVolume, float2(tt.x, min(tt.y, bestT[j])), sg, gds) &&
+                    gds.t < bestT[j])
+#else
                 if (gvs.sampleDistanceDeltaTrackingLocalDDA(gridVolume, ray.origin, ray.dir, float2(tt.x, min(tt.y, bestT[j])), sg, gds) &&
                     gds.t < bestT[j])
+#endif
                 {
                     bestT[j] = gds.t;
                     bestInst[j] = info.gridVolumeIdx;

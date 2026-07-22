@@ -63,6 +63,7 @@ const char kTemporalMCap[] = "temporalMCap";
 const char kUseBrickTlas[] = "useBrickTlas";
 const char kUseOccupancySkip[] = "useOccupancySkip";
 const char kUseBrickPrefetch[] = "useBrickPrefetch";
+const char kUseSharedWalkSetup[] = "useSharedWalkSetup";
 const char kUseScatterSort[] = "useScatterSort";
 const char kMipPixelThreshold[] = "mipPixelThreshold";
 const char kUseMergedTail[] = "useMergedTail";
@@ -153,6 +154,8 @@ void VolumePathTracer::parseProperties(const Properties& props)
             mUseOccupancySkip = value;
         else if (key == kUseBrickPrefetch)
             mUseBrickPrefetch = value;
+        else if (key == kUseSharedWalkSetup)
+            mUseSharedWalkSetup = value;
         else if (key == kUseScatterSort)
             mUseScatterSort = value;
         else if (key == kMipPixelThreshold)
@@ -258,6 +261,7 @@ Properties VolumePathTracer::getProperties() const
     props[kUseBrickTlas] = mUseBrickTlas;
     props[kUseOccupancySkip] = mUseOccupancySkip;
     props[kUseBrickPrefetch] = mUseBrickPrefetch;
+    props[kUseSharedWalkSetup] = mUseSharedWalkSetup;
     props[kUseScatterSort] = mUseScatterSort;
     props[kMipPixelThreshold] = mMipPixelThreshold;
     props[kUseMergedTail] = mUseMergedTail;
@@ -1043,6 +1047,11 @@ void VolumePathTracer::prepareProgram(RenderContext* pRenderContext)
     // or not a runtime flag reads it (run 137: gpuMs 26 -> 38 with identical
     // counters = register pressure). The checkbox rebuilds the program.
     defines.add("GVS_BRICK_PREFETCH", mUseBrickPrefetch ? "1" : "0");
+    // Shared per-brick walk setup. Compile-time for the same reason as the
+    // prefetch above - a runtime selector between two preambles keeps both
+    // alive in the register allocation, which is what run 137 measured. OFF
+    // compiles the original per-walk call signatures, so it is a true A/B.
+    defines.add("GVS_SHARED_WALK_SETUP", mUseSharedWalkSetup ? "1" : "0");
     // Wave-uniform majorant mip. COMPILE-TIME for the same reason as the
     // prefetch above: at lift 0 the wave reduction still costs an instruction
     // in the frame's hottest loop, so a runtime flag alone could never A/B its
@@ -2616,6 +2625,24 @@ void VolumePathTracer::renderUI(Gui::Widgets& widget)
             "Flip it WITHIN one session and compare [COST]. Cross-session gpuMs\n"
             "here has twice drifted ~25% with identical work counters, which is\n"
             "bigger than the effect being measured.",
+            true
+        );
+        rebuild |= group.checkbox("Shared walk setup", mUseSharedWalkSetup);
+        group.tooltip(
+            "Every DDA walk opened with the same preamble - getGrid, brick-cache\n"
+            "reset, two 4x4 mat-vecs to index space, a reciprocal - and the fused\n"
+            "sweep ran it 1 + risCandidates times per brick on the SAME grid and\n"
+            "the SAME ray. Measured at 2560x1351: 5.8 segments and 19.0 DDA cells\n"
+            "per pixel, so the setup ran 17.4 times per pixel against 19.0 loop\n"
+            "iterations. It also flushed the brick cache per walk, forcing a miss\n"
+            "at the start of each candidate process on a brick the previous one\n"
+            "had just read.\n\n"
+            "BIT-IDENTICAL: same random numbers in the same order, same carried\n"
+            "values. Toggling this must not change the image at all - only gpuMs\n"
+            "and the brickCache hit rate in [COST].\n\n"
+            "COMPILE-TIME (rebuilds): a runtime selector between two preambles\n"
+            "keeps both alive in the register allocation, which is what run 137\n"
+            "measured. OFF compiles the original per-walk call signatures.",
             true
         );
         rebuild |= group.checkbox("Brick prefetch", mUseBrickPrefetch);

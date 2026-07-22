@@ -512,6 +512,65 @@ struct GridVolumeSampler
     void decreaseAccessorLevel(inout DensityAccessor a) { }
 #endif
 
+    /** Per-(grid, ray) walk state, hoisted out of the individual walks.
+
+        WHY: every DDA walk in this file opened with the same six lines - fetch
+        the Grid, reset the brick cache, transform the ray to index space (two
+        4x4 mat-vecs), reciprocate the direction. That is fine when a walk is
+        long. It is not fine here, because it isn't.
+
+        MEASURED (log 185, 2560x1351, shipping config): the candidate-generation
+        bucket runs 5.8 segments/pixel and 19.0 cells/pixel, and
+        evalEscapeAndCandidatesRQ does 1 transmittance walk + nProc = 2 distance
+        walks per segment. That is 17.4 preambles per pixel to service 19.0 loop
+        iterations - the SETUP runs almost as often as the body it sets up, and
+        all three walks on a segment share the same gridVolume and the same ray,
+        so two thirds of it is recomputation of identical values.
+
+        This is the direction this kernel wants. The note in coarseOpticalDepth
+        records the opposite trade being tried - 81 floats of live state removed
+        by recomputing them - and it cost 25% frame time. On an SM-bound kernel
+        ALU is the scarce resource and registers are the cheap one, so paying a
+        few registers to hold ipos/idir/ri across three walks is the trade that
+        experiment says wins.
+
+        NOT an estimator change. Nothing here touches the sample stream: the
+        walks consume the same random numbers in the same order, and the values
+        carried are bit-identical to the ones each walk used to compute for
+        itself. Converged images must be BIT-identical, which is a far stronger
+        gate than the statistical one the wave-mip lever needed.
+    */
+    struct WalkSetup
+    {
+        Grid densityGrid;
+        float3 ipos;   ///< Ray origin in index space.
+        float3 idir;   ///< Ray direction in index space (non-normalized).
+        float3 ri;     ///< 1/idir, the DDA's per-axis slab reciprocal.
+    };
+
+    /** Open a walk on one (gridVolume, ray) pair.
+
+        CACHE RESET LIVES HERE, and that placement is the correctness contract:
+        the brick cache holds an atlas pointer valid for ONE Grid, so it must be
+        invalidated whenever the grid changes and may NOT be reused across
+        instances. Resetting per SETUP rather than per WALK is therefore still
+        correct - a setup is exactly the point where the grid is chosen - and it
+        is what lets the cache survive across the transmittance walk and the
+        nProc distance walks that share a segment, instead of being thrown away
+        twice per segment. Callers must build a fresh setup before switching
+        grids; every caller that reuses one is reusing it within a single
+        segment, where the grid is fixed by construction.
+    */
+    WalkSetup beginWalk(const GridVolume gridVolume, const float3 rayOrigin, const float3 rayDir)
+    {
+        WalkSetup w;
+        gScene.getGrid(gridVolume.getDensityGrid(), w.densityGrid);
+        gvsBrickCacheReset();
+        transformRayToIndexSpace(gridVolume, w.densityGrid, rayOrigin, rayDir, w.ipos, w.idir);
+        w.ri = 1.f / w.idir;
+        return w;
+    }
+
     struct DistanceSample
     {
         float t;    ///< Sampled distance.
@@ -896,19 +955,22 @@ struct GridVolumeSampler
 
     float evalTransmittanceResidualRatioTrackingLocalDDA<S : ISampleGenerator>(const GridVolume gridVolume, const float3 rayOrigin, const float3 rayDir, const float2 nearFar, inout S sg, const int residualMip)
     {
-        // Setup access to density grid.
-        Grid densityGrid;
-        gScene.getGrid(gridVolume.getDensityGrid(), densityGrid);
-        // The brick cache holds an atlas pointer valid for THIS grid only. Reset
-        // at every walk entry so a brick cached during the previous instance's
-        // walk can never be reused against a different grid's atlas - that would
-        // be a silently wrong density, not a crash. See gvsBrickCacheReset.
-        gvsBrickCacheReset();
-        DensityAccessor densityAccessor = createAccessor(densityGrid);
+        return evalTransmittanceResidualRatioTrackingLocalDDA(beginWalk(gridVolume, rayOrigin, rayDir), gridVolume, nearFar, sg, residualMip);
+    }
 
-        float3 ipos, idir;
-        transformRayToIndexSpace(gridVolume, densityGrid, rayOrigin, rayDir, ipos, idir);
-        const float3 ri = 1.f / idir;
+    /** As above, on a WalkSetup the caller already built (see WalkSetup). Use
+        this when several walks share one (grid, ray) segment; the wrapper above
+        is the single-walk case and stays byte-identical to what it replaced.
+    */
+    float evalTransmittanceResidualRatioTrackingLocalDDA<S : ISampleGenerator>(const WalkSetup w, const GridVolume gridVolume, const float2 nearFar, inout S sg, const int residualMip)
+    {
+        // Aliases, so the loop below is textually unchanged from the version
+        // that computed these itself. They are SSA copies, not extra state.
+        const Grid densityGrid = w.densityGrid;
+        const float3 ipos = w.ipos;
+        const float3 idir = w.idir;
+        const float3 ri = w.ri;
+        DensityAccessor densityAccessor = createAccessor(densityGrid);
         const float scale = gridVolume.data.densityScale;
 
         float tauC = 0.f; ///< Accumulated analytic control optical depth: T_c = exp(-tauC).
@@ -1029,24 +1091,30 @@ struct GridVolumeSampler
 
     bool sampleDistanceDeltaTrackingLocalDDA<S : ISampleGenerator>(const GridVolume gridVolume, const float3 rayOrigin, const float3 rayDir, const float2 nearFar, inout S sg, out DistanceSample ds)
     {
+        return sampleDistanceDeltaTrackingLocalDDA(beginWalk(gridVolume, rayOrigin, rayDir), gridVolume, nearFar, sg, ds);
+    }
+
+    /** As above, on a WalkSetup the caller already built (see WalkSetup).
+
+        This is the overload that matters: evalEscapeAndCandidatesRQ calls it
+        nProc times per brick with the same grid and ray, and every one of those
+        calls used to redo the getGrid, the two mat-vecs, the reciprocal, and a
+        brick-cache flush that guaranteed the second process missed on its first
+        tap.
+    */
+    bool sampleDistanceDeltaTrackingLocalDDA<S : ISampleGenerator>(const WalkSetup w, const GridVolume gridVolume, const float2 nearFar, inout S sg, out DistanceSample ds)
+    {
         ds = {};
         ds.thp = 1.f;
 
-        // Setup access to density grid.
-        Grid densityGrid;
-        gScene.getGrid(gridVolume.getDensityGrid(), densityGrid);
-        // The brick cache holds an atlas pointer valid for THIS grid only. Reset
-        // at every walk entry so a brick cached during the previous instance's
-        // walk can never be reused against a different grid's atlas - that would
-        // be a silently wrong density, not a crash. See gvsBrickCacheReset.
-        gvsBrickCacheReset();
+        // Aliases, so the loop below is textually unchanged from the version
+        // that computed these itself. They are SSA copies, not extra state.
+        const Grid densityGrid = w.densityGrid;
+        const float3 ipos = w.ipos;
+        const float3 idir = w.idir;
+        const float3 ri = w.ri;
         DensityAccessor densityAccessor = createAccessor(densityGrid);
 
-        float3 ipos, idir;
-        transformRayToIndexSpace(gridVolume, densityGrid, rayOrigin, rayDir, ipos, idir);
-
-        // Init DDA.
-        const float3 ri = 1.f / idir;
         float t = nearFar.x;
         while (1)
         {

@@ -144,6 +144,29 @@ private:
     /// record; do not reopen without a design that prefetches only when the
     /// segment is likely to continue (the waste, not the idea, is what lost).
     bool mUseBrickPrefetch = false;
+    /// Shared per-brick walk setup in evalEscapeAndCandidatesRQ (2026-07-22).
+    /// Every DDA walk opened with the same preamble - getGrid, brick-cache
+    /// reset, two 4x4 mat-vecs to index space, a reciprocal - and the fused
+    /// sweep ran it 1 + risCandidates times per brick on the SAME grid and the
+    /// SAME ray. Measured (log 185, 2560x1351): 5.8 segments and 19.0 DDA cells
+    /// per pixel in the candGen bucket, i.e. 17.4 preambles per pixel against
+    /// 19.0 loop iterations - the setup ran about as often as the body it set
+    /// up. It also flushed the brick cache per walk, forcing a guaranteed miss
+    /// at the start of each candidate process on a brick the previous process
+    /// had just read.
+    ///
+    /// Why this direction: the coarseOpticalDepth note records the opposite
+    /// trade - 81 floats of live state removed by recomputing them - costing
+    /// 25% frame time. On an SM-bound kernel ALU is scarce and registers are
+    /// cheap, so paying registers to hold ipos/idir/ri across three walks is
+    /// the side of that trade which won.
+    ///
+    /// BIT-IDENTICAL, not merely unbiased: the walks consume the same random
+    /// numbers in the same order and the carried values equal the ones each
+    /// walk used to recompute. The gate is a bit-compare, which is far stronger
+    /// than the statistical image test an estimator change would need. ON by
+    /// default; the toggle exists only so the win can be A/B'd in one session.
+    bool mUseSharedWalkSetup = true;
     /// Wave-uniform majorant mip (2026-07-22). analysis7.yaml read PER RANGE
     /// ranks "Active Threads Per Warp" 24.27% first by a wide margin - 4.12x
     /// range-speedup ceiling, 73% frame gain, against 1.36x/25.6% for the
