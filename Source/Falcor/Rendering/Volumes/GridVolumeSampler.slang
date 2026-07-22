@@ -202,6 +202,46 @@ static uint gGvsStatMipLiftSum = 0;  ///< Sum of (lifted - own) over those cells
 #endif
 
 // ---------------------------------------------------------------------------
+// LEVER LEDGER, 2026-07-22. Five levers measured in one session, all null on
+// frame time. Recorded here so the next person does not re-derive them from the
+// same profiler numbers that suggested them the first time.
+//
+//   lever                        mechanism confirmed?      frame effect
+//   ---------------------------  ------------------------  ----------------
+//   occupancy skip (atlas reads) yes, 19.7M taps/frame     0.02 ms first
+//                                skipped                   measured, ~0.5-1.4
+//                                                          ms on the fixed
+//                                                          instrument, always
+//                                                          inside the floor
+//   dead-path compile-out        yes, coarseOpticalDepth   none
+//   (TAU_CACHE_APPLY,            and a 2nd evalTransmit-
+//    USE_TRR_PROBE)              tance walk left main
+//   per-instance walk setup      yes, brickCache hit       none (-0.62/+0.15/
+//   (VolumeInstanceSampler)      +8 to +9 pp, identical    +0.50 ms over three
+//                                lookups and cells         runs, floors 2.6-4.7)
+//   register narrowing           NO - 125 -> 123 regs,     none
+//   (this file)                  compiler had already
+//                                stripped the fields
+//
+// THE PATTERN, which is worth more than any single row: every one of these was
+// chosen because a profiler ranked it expensive - 5.6% of self-samples, 54% of
+// taps, the register high-water mark - and removing it changed nothing. On this
+// kernel "where the cycles are attributed" and "what would make the frame
+// shorter" have come apart every single time they were tested.
+//
+// MEASUREMENT TRAPS THAT PRODUCED FALSE ANSWERS BEFORE THEY WERE FIXED:
+//   - This machine drifts ~22% in gpuMs over ~3000 frames at BYTE-IDENTICAL
+//     work, and recovers ~25% instantly after an idle pause. Any A-then-B
+//     comparison charges B for the heat A produced. Interleave, and take the
+//     spread between rounds of the SAME config as the floor.
+//   - The retrain ramp after updatePass is ~600 frames. Shorter warm-ups
+//     measure the ramp.
+//   - The renderer is NOT bit-reproducible run to run (~1 ULP of half float on
+//     volume pixels), so a bit-identity gate cannot pass. Use a same-config
+//     control arm as the noise floor instead.
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
 // WAVE-UNIFORM MAJORANT MIP (lever: Active Threads Per Warp).
 //
 // WHY: analysis7.yaml, read PER RANGE, puts "Active Threads Per Warp" at 24.27%
@@ -700,7 +740,7 @@ struct GridVolumeSampler
         }
     }
 
-    float lookupDensityIndex(const GridVolume gridVolume, const float3 ipos, const float3 u, const Grid densityGrid, inout DensityAccessor densityAccessor)
+    float lookupDensityIndex(const float densityScale, const float3 ipos, const float3 u, const Grid densityGrid, inout DensityAccessor densityAccessor)
     {
         logVolumeLookup();
         gvsStatTap();
@@ -708,9 +748,9 @@ struct GridVolumeSampler
         // Brick-coherent path: see gvsLookupStochasticCached. Valid only because
         // every walk resets the cache before its first tap, so densityGrid is
         // fixed for the cache's lifetime.
-        return gridVolume.data.densityScale * gvsLookupStochasticCached(densityGrid, ipos, u);
+        return densityScale * gvsLookupStochasticCached(densityGrid, ipos, u);
 #else
-        return gridVolume.data.densityScale * densityGrid.lookupStochasticIndex(ipos, u, densityAccessor);
+        return densityScale * densityGrid.lookupStochasticIndex(ipos, u, densityAccessor);
 #endif
     }
 
@@ -726,6 +766,7 @@ struct GridVolumeSampler
 
     float evalTransmittanceDeltaTracking<S : ISampleGenerator>(const GridVolume gridVolume, const float3 rayOrigin, const float3 rayDir, const float2 nearFar, inout S sg)
     {
+        const float densityScale = gridVolume.data.densityScale;
         // Setup access to density grid.
         Grid densityGrid;
         gScene.getGrid(gridVolume.getDensityGrid(), densityGrid);
@@ -751,7 +792,7 @@ struct GridVolumeSampler
             {
                 return 1.f;
             }
-            const float d = lookupDensityIndex(gridVolume, ipos + t * idir, sampleNext3D(sg), densityGrid, densityAccessor);
+            const float d = lookupDensityIndex(densityScale, ipos + t * idir, sampleNext3D(sg), densityGrid, densityAccessor);
 
             // Russian roulette.
             if (sampleNext1D(sg) < d * invMajorant) return 0.f;
@@ -761,6 +802,7 @@ struct GridVolumeSampler
 
     float evalTransmittanceRatioTracking<S : ISampleGenerator>(const GridVolume gridVolume, const float3 rayOrigin, const float3 rayDir, const float2 nearFar, inout S sg)
     {
+        const float densityScale = gridVolume.data.densityScale;
         // Setup access to density grid.
         Grid densityGrid;
         gScene.getGrid(gridVolume.getDensityGrid(), densityGrid);
@@ -786,7 +828,7 @@ struct GridVolumeSampler
             {
                 return Tr;
             }
-            const float d = lookupDensityIndex(gridVolume, ipos + t * idir, sampleNext3D(sg), densityGrid, densityAccessor);
+            const float d = lookupDensityIndex(densityScale, ipos + t * idir, sampleNext3D(sg), densityGrid, densityAccessor);
 
             // The 'max' guards against non-bounding majorants which can happen due to density interpolation in NanoVDB.
             // They are rare but can lead to fireflies, and the max prevents them at the cost of (imperceptible) bias.
@@ -809,7 +851,14 @@ struct GridVolumeSampler
         taught to weight cannot silently inherit a non-bounding majorant and
         turn into a biased estimator.
     */
-    bool stepToNextCollision(const GridVolume gridVolume, const Grid densityGrid, const float3 ipos, const float3 idir, const float3 ri,
+    /** Takes densityScale, not the GridVolume, because that is the only field
+        it reads. This was a REGISTER experiment and it did not work: live
+        registers here stayed at exactly 108 either way (see the refutation
+        block in sampleDistanceDeltaTrackingLocalDDA). Kept because passing one
+        float instead of a ~48-scalar struct is clearer, not because it is
+        faster - it is not, measurably.
+    */
+    bool stepToNextCollision(const float densityScale, const Grid densityGrid, const float3 ipos, const float3 idir, const float3 ri,
                              float tauToGo, inout float t, const float tFar, bool adaptive, out float majorant, inout DensityAccessor accessor,
                              const float weightK)
     {
@@ -848,7 +897,7 @@ struct GridVolumeSampler
             // Shares the brick cache and prefetches the indirection pointer for
             // the taps that follow in this cell. Same float3 -> int3 implicit
             // truncation as the direct call it replaces.
-            majorant = gridVolume.data.densityScale * gvsLookupMajorantCached(densityGrid, pos, mip);
+            majorant = densityScale * gvsLookupMajorantCached(densityGrid, pos, mip);
             // Weighted delta tracking: soften the free-flight majorant toward
             // the cell MEAN. [HOMOG] measured mean/majorant < 0.125 in 67% of
             // traversed cells, so the true majorant makes the mean free flight
@@ -865,7 +914,7 @@ struct GridVolumeSampler
             // This is deliberately NOT a bound any more. Correctness now rests
             // entirely on the caller's weight; see the header note.
             if (weightK < 1.f && mip == 0)
-                majorant = max(lerp(gridVolume.data.densityScale * gGvsBrickMean, majorant, weightK), 1e-8f);
+                majorant = max(lerp(densityScale * gGvsBrickMean, majorant, weightK), 1e-8f);
 #if GRID_VOLUME_SAMPLER_STATS
             // [HOMOG] gauge: bin sigma_mean/sigma_majorant for THIS traversed
             // cell. At mip 0 the fetch above just populated gGvsBrickRange.x
@@ -918,6 +967,7 @@ struct GridVolumeSampler
 
     float evalTransmittanceRatioTrackingLocalDDA<S : ISampleGenerator>(const GridVolume gridVolume, const float3 rayOrigin, const float3 rayDir, const float2 nearFar, inout S sg)
     {
+        const float densityScale = gridVolume.data.densityScale;
         // Setup access to density grid.
         Grid densityGrid;
         gScene.getGrid(gridVolume.getDensityGrid(), densityGrid);
@@ -940,8 +990,8 @@ struct GridVolumeSampler
             // weightK 1: this ratio tracker's weight is (1 - d/majorant) and it
             // has no compensation for a non-bounding majorant, so it must keep
             // the true bound.
-            if (!stepToNextCollision(gridVolume, densityGrid, ipos, idir, ri, tauToGo, t, nearFar.y, true, majorant, densityAccessor, 1.f)) return Tr;
-            const float d = lookupDensityIndex(gridVolume, ipos + t * idir, sampleNext3D(sg), densityGrid, densityAccessor);
+            if (!stepToNextCollision(densityScale, densityGrid, ipos, idir, ri, tauToGo, t, nearFar.y, true, majorant, densityAccessor, 1.f)) return Tr;
+            const float d = lookupDensityIndex(densityScale, ipos + t * idir, sampleNext3D(sg), densityGrid, densityAccessor);
             Tr *= max(0.f, 1.f - d / majorant);
             // Russian roulette.
             if (Tr < 0.1f)
@@ -998,6 +1048,7 @@ struct GridVolumeSampler
     */
     float evalTransmittanceResidualRatioTrackingLocalDDA<S : ISampleGenerator>(const WalkSetup w, const GridVolume gridVolume, const float2 nearFar, inout S sg, const int residualMip)
     {
+        const float densityScale = gridVolume.data.densityScale;
         // Aliases, so the loop below is textually unchanged from the version
         // that computed these itself. They are SSA copies, not extra state.
         const Grid densityGrid = w.densityGrid;
@@ -1005,7 +1056,7 @@ struct GridVolumeSampler
         const float3 idir = w.idir;
         const float3 ri = w.ri;
         DensityAccessor densityAccessor = createAccessor(densityGrid);
-        const float scale = gridVolume.data.densityScale;
+        const float scale = densityScale;
 
         float tauC = 0.f; ///< Accumulated analytic control optical depth: T_c = exp(-tauC).
         float Tr = 1.f;   ///< Stochastic residual transmittance.
@@ -1063,7 +1114,7 @@ struct GridVolumeSampler
                 {
                     tt -= log(1.f - sampleNext1D(sg)) * invSigmaRbar;
                     if (tt >= tExit) break;
-                    const float d = lookupDensityIndex(gridVolume, ipos + tt * idir, sampleNext3D(sg), densityGrid, densityAccessor);
+                    const float d = lookupDensityIndex(densityScale, ipos + tt * idir, sampleNext3D(sg), densityGrid, densityAccessor);
                     // (d - sigmaC) / sigmaRbar is in [-1, 1] by the bound above,
                     // so the factor is in [0, 2]: Tr may legitimately exceed 1
                     // where the control overshoots (negative residual). That is
@@ -1088,6 +1139,7 @@ struct GridVolumeSampler
 
     bool sampleDistanceDeltaTracking<S : ISampleGenerator>(const GridVolume gridVolume, const float3 rayOrigin, const float3 rayDir, const float2 nearFar, inout S sg, out DistanceSample ds)
     {
+        const float densityScale = gridVolume.data.densityScale;
         ds = {};
 
         // Setup access to density grid.
@@ -1109,7 +1161,7 @@ struct GridVolumeSampler
         while (t < nearFar.y)
         {
             t -= log(1.f - sampleNext1D(sg)) * invMajorant;
-            const float d = lookupDensityIndex(gridVolume, ipos + t * idir, sampleNext3D(sg), densityGrid, densityAccessor);
+            const float d = lookupDensityIndex(densityScale, ipos + t * idir, sampleNext3D(sg), densityGrid, densityAccessor);
 
             // Scatter on real collision.
             if (sampleNext1D(sg) < d * invMajorant)
@@ -1149,11 +1201,57 @@ struct GridVolumeSampler
         const float3 ri = w.ri;
         DensityAccessor densityAccessor = createAccessor(densityGrid);
 
+        // The only two fields this walk reads, extracted before the loop so the
+        // GridVolume dies here rather than staying live across it. Harmless and
+        // arguably clearer, but see below: it did NOT do what it was written
+        // for, and the direction it belongs to is closed.
+        //
+        // ================= REGISTER / OCCUPANCY DIRECTION: REFUTED ==========
+        // 2026-07-22. The theory was that this function's register footprint
+        // caps occupancy, so narrowing it would raise resident warps and hide
+        // the latency the SM idles on. Every link in that chain was measured.
+        //
+        // THE SETUP (Nsight, Bottom-Up "Live Registers"): this function was the
+        // register high-water mark of the whole shader at 125 live registers.
+        // 65536 registers/SM / 125 = 16.4 warps; measured CS warp occupancy was
+        // 14.8 of 48 slots, warp launch register-limited 23.7% of cycles, SM
+        // throughput 47% with 57.7% of warp slots unallocated. Textbook
+        // occupancy-limited signature.
+        //
+        // THE CHANGE: stepToNextCollision and lookupDensityIndex took the whole
+        // GridVolume by value to read ONE float (densityScale); albedo was read
+        // after the loop, pinning the struct live across it. GridVolumeData
+        // carries two float4x4s - 32 floats of matrices provably unreachable
+        // from an index-space walk - plus bounds and flags, ~48 scalars. Both
+        // callees now take a float; both fields are hoisted here.
+        //
+        // THE RESULT: nothing.
+        //     sampleDistanceDeltaTrackingLocalDDA   125 -> 123 registers
+        //     stepToNextCollision                   108 -> 108
+        //     CS warp occupancy                     14.8 -> 15.3 warps
+        //     wall clock                            +0.50 ms (log 203),
+        //                                           floor 4.69 ms
+        // Slang had ALREADY eliminated the unused struct fields. The 125 is the
+        // DDA's genuine working set - ipos/idir/ri, the Grid handles, the brick
+        // cache globals, accessor, RNG state, t/majorant - not passenger data.
+        // main 95 -> 67 and evalEscapeAndCandidatesRQ 111 -> 89 did drop, but
+        // occupancy is set by the WORST function, so those buy nothing.
+        //
+        // DO NOT re-run this experiment by narrowing more signatures. The
+        // source-level argument ("48 scalars passed to read one float") was
+        // about the source text, not about what the compiler emits, and the
+        // compiler was already right. If occupancy is attacked again it has to
+        // be by shrinking the real working set - which means restructuring the
+        // walk, not tidying parameter lists.
+        // ===================================================================
+        const float densityScale = gridVolume.data.densityScale;
+        const float3 albedo = gridVolume.data.albedo;
+
         float t = nearFar.x;
         while (1)
         {
             float tauToGo = -log(1.f - sampleNext1D(sg)), majorant;
-            if (!stepToNextCollision(gridVolume, densityGrid, ipos, idir, ri, tauToGo, t, nearFar.y, true, majorant, densityAccessor, gGvsDistWeightK)) return false;
+            if (!stepToNextCollision(densityScale, densityGrid, ipos, idir, ri, tauToGo, t, nearFar.y, true, majorant, densityAccessor, gGvsDistWeightK)) return false;
 
             // WEIGHTED delta tracking (Galtier et al. 2013; Novak et al. 2018
             // STAR 5). The general form draws a real collision with an arbitrary
@@ -1181,12 +1279,12 @@ struct GridVolumeSampler
             // bounded per event by majorant/sigmaBar_w (~8x at weightK 0). This
             // trades tap count for variance, so it must be gated on an image
             // comparison, not on the frame timer.
-            const float d = lookupDensityIndex(gridVolume, ipos + t * idir, sampleNext3D(sg), densityGrid, densityAccessor);
+            const float d = lookupDensityIndex(densityScale, ipos + t * idir, sampleNext3D(sg), densityGrid, densityAccessor);
             if (sampleNext1D(sg) * majorant < d)
             {
                 // Real collision, terminate.
                 ds.t = t;
-                ds.thp = gridVolume.data.albedo * max(1.f, d / majorant);
+                ds.thp = albedo * max(1.f, d / majorant);
                 return true;
             }
             // Null collision, continue with new sample.
