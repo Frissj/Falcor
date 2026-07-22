@@ -71,21 +71,6 @@ import GridVolumeSamplerParams;
 static uint gGvsStatCells = 0; ///< Majorant DDA cells stepped (range-tex fetch + stepDDA). The non-DDA estimators only tap, so their cost shows up entirely in taps.
 static uint gGvsStatTaps = 0;  ///< Real density taps (stochastic atlas fetches) - the memory-bound operation.
 static uint gGvsHomogBins[8] = { 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u }; ///< [HOMOG] histogram of sigma_mean/sigma_majorant over mip-0 majorant-DDA cells - the homogenization gauge (right-loaded = uniform interior, collapsible to an analytic segment).
-// [SUBHOMOG] the same ratio for the 4^3 SUB-CELL the walk entered, binned over
-// the IDENTICAL traversed-cell population as gGvsHomogBins so the two lines are
-// a paired comparison, not two surveys. gGvsSubMajSum/gGvsBrickMajSum are the
-// number the decision actually turns on: every tracking estimator costs
-// integral(sigma_bar ds), so sum(subMaj)/sum(brickMaj) over traversed cells IS
-// the predicted change in collisions if the DDA descended to 4^3.
-static uint gGvsSubHomogBins[8] = { 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u };
-// LENGTH-WEIGHTED, deliberately: the cost is integral(sigma_bar ds), so a cell
-// clipped at a corner must count less than one crossed end to end. Summing bare
-// majorants would let thin grazing cells vote as loudly as full traversals and
-// the ratio would not predict collisions at all. Accumulated in float (exact
-// per lane) and quantised once at flush - the printed raw sums make any
-// saturation visible rather than silent.
-static float gGvsBrickMajSum = 0.f; ///< sum(dt * brickMajorant) over traversed mip-0 cells.
-static float gGvsSubMajSum = 0.f;   ///< sum(dt * subMajorant) over the same cells.
 #endif
 void gvsStatCell()
 {
@@ -188,6 +173,19 @@ static uint gGvsOccSkipEnable = 1u;
 void gvsSetOccSkipEnable(const uint enable)
 {
     gGvsOccSkipEnable = enable;
+}
+
+/** Weighted delta-tracking majorant softening for the DISTANCE sampler.
+    1 = true majorant = the exact analog estimator, byte-identical. Below 1 the
+    free flight uses lerp(cellMean, cellMajorant, k), which is not a bound, and
+    sampleDistanceDeltaTrackingLocalDDA pays for it with a per-collision weight.
+    Only that one estimator reads this; every other walk passes weightK
+    explicitly, so nothing can inherit it by accident.
+*/
+static float gGvsDistWeightK = 1.f;
+void gvsSetDistWeightK(const float k)
+{
+    gGvsDistWeightK = k;
 }
 #if GRID_VOLUME_SAMPLER_STATS
 static uint gGvsStatBrickHits = 0;   ///< Taps served from the cached brick.
@@ -587,8 +585,18 @@ struct GridVolumeSampler
         return Tr;
     }
 
+    /** \param[in] weightK Free-flight majorant softening for WEIGHTED delta
+        tracking. 1 = use the true cell majorant, i.e. every existing behaviour
+        byte-identical. Below 1 the free flight is driven by
+        sigmaBar_w = lerp(mean, majorant, weightK), which is NOT a bound - the
+        caller MUST compensate (see sampleDistanceDeltaTrackingLocalDDA). Passed
+        explicitly rather than read from a global so a caller that has not been
+        taught to weight cannot silently inherit a non-bounding majorant and
+        turn into a biased estimator.
+    */
     bool stepToNextCollision(const GridVolume gridVolume, const Grid densityGrid, const float3 ipos, const float3 idir, const float3 ri,
-                             float tauToGo, inout float t, const float tFar, bool adaptive, out float majorant, inout DensityAccessor accessor)
+                             float tauToGo, inout float t, const float tFar, bool adaptive, out float majorant, inout DensityAccessor accessor,
+                             const float weightK)
     {
         // Warning: Changing the mip level based on 'tauToGo' below could potentially introduce bias, although it would not seem to be visible in practice.
         while (t < tFar)
@@ -603,6 +611,23 @@ struct GridVolumeSampler
             // the taps that follow in this cell. Same float3 -> int3 implicit
             // truncation as the direct call it replaces.
             majorant = gridVolume.data.densityScale * gvsLookupMajorantCached(densityGrid, pos, mip);
+            // Weighted delta tracking: soften the free-flight majorant toward
+            // the cell MEAN. [HOMOG] measured mean/majorant < 0.125 in 67% of
+            // traversed cells, so the true majorant makes the mean free flight
+            // ~8x shorter than the medium warrants and ~7 of every 8 proposed
+            // collisions are null. Sampling against a smaller sigmaBar lengthens
+            // the flight and removes those proposals outright - it attacks the
+            // tap count, which is the measured cost, rather than the cell count.
+            //
+            // The mean is FREE here: gvsLookupMajorantCached just ran
+            // gvsBrickEnsure for this brick, so gGvsBrickMean is the same texel
+            // already resident. Only mip 0 caches it, so coarser mips fall back
+            // to the true majorant - still exact, just unweighted.
+            //
+            // This is deliberately NOT a bound any more. Correctness now rests
+            // entirely on the caller's weight; see the header note.
+            if (weightK < 1.f && mip == 0)
+                majorant = max(lerp(gridVolume.data.densityScale * gGvsBrickMean, majorant, weightK), 1e-8f);
 #if GRID_VOLUME_SAMPLER_STATS
             // [HOMOG] gauge: bin sigma_mean/sigma_majorant for THIS traversed
             // cell. At mip 0 the fetch above just populated gGvsBrickRange.x
@@ -617,34 +642,16 @@ struct GridVolumeSampler
                 const float hratio = saturate(gGvsBrickMean / gGvsBrickRange.x);
                 gGvsHomogBins[min(uint(hratio * 8.f), 7u)]++;
 
-                // [SUBHOMOG] paired sample: the 4^3 sub-cell this walk just
-                // entered, from the SAME cell visit. One extra texel fetch per
-                // mip-0 cell, gated on GRID_VOLUME_SAMPLER_STATS, so the
-                // shipping build pays nothing.
-                //
-                // Read the two lines together:
-                //  - if [SUBHOMOG] shifts RIGHT of [HOMOG], density is coherent
-                //    below brick scale and a finer DDA level is the fix for
-                //    BOTH shade buckets (delta tracking admits no control
-                //    variate, so this is its only lever);
-                //  - if the two histograms sit on top of each other, the medium
-                //    is fractal past the 1-voxel dilation halo, no majorant
-                //    scheme can tighten, and the finer-granularity fix is dead
-                //    before a line of traversal code is written.
-                const float3 sub = densityGrid.lookupIndexSubRangeMeanTex(int3(pos));
-                if (sub.x > 0.f)
-                {
-                    const float sratio = saturate(sub.z / sub.x);
-                    gGvsSubHomogBins[min(uint(sratio * 8.f), 7u)]++;
-                }
-                // Length-weighted majorant integrals over this cell. tExit is
-                // already known here and t is not yet advanced, so dt costs
-                // nothing; clamp to tFar so the final partial cell does not
-                // over-count. densityScale cancels in the ratio, so raw texel
-                // values are used on both sides - they must stay consistent.
-                const float hdt = max(min(tExit, tFar) - t, 0.f);
-                gGvsBrickMajSum += hdt * gGvsBrickRange.x;
-                gGvsSubMajSum += hdt * sub.x;
+                // [SUBHOMOG] REMOVED (2026-07-22). It answered its question -
+                // majRatio 0.607 at 4^3, against a break-even of 4.0 on the
+                // measured cell/tap exchange rate, so finer granularity loses -
+                // and then became a cost in its own right: an uncached
+                // subRangeTex.Load() on EVERY mip-0 DDA cell, ~80M per frame at
+                // 2560x1351, into a 15 MB texture that does not stay in L2.
+                // Harmless at 960x540 where the frame was latency-bound; not
+                // harmless once VRAM throughput hit 88% of peak. A diagnostic
+                // whose question is settled does not get to keep spending
+                // bandwidth. See the handoff for the numbers it produced.
             }
 #endif
             // Speculative next-brick prefetch (see gvsBrickPrefetch). The next
@@ -692,7 +699,10 @@ struct GridVolumeSampler
         while (1)
         {
             float tauToGo = -log(1.f - sampleNext1D(sg)), majorant;
-            if (!stepToNextCollision(gridVolume, densityGrid, ipos, idir, ri, tauToGo, t, nearFar.y, true, majorant, densityAccessor)) return Tr;
+            // weightK 1: this ratio tracker's weight is (1 - d/majorant) and it
+            // has no compensation for a non-bounding majorant, so it must keep
+            // the true bound.
+            if (!stepToNextCollision(gridVolume, densityGrid, ipos, idir, ri, tauToGo, t, nearFar.y, true, majorant, densityAccessor, 1.f)) return Tr;
             const float d = lookupDensityIndex(gridVolume, ipos + t * idir, sampleNext3D(sg), densityGrid, densityAccessor);
             Tr *= max(0.f, 1.f - d / majorant);
             // Russian roulette.
@@ -896,13 +906,40 @@ struct GridVolumeSampler
         while (1)
         {
             float tauToGo = -log(1.f - sampleNext1D(sg)), majorant;
-            if (!stepToNextCollision(gridVolume, densityGrid, ipos, idir, ri, tauToGo, t, nearFar.y, true, majorant, densityAccessor)) return false;
-            // Classify collision as real or null.
-            if (sampleNext1D(sg) * majorant < lookupDensityIndex(gridVolume, ipos + t * idir, sampleNext3D(sg), densityGrid, densityAccessor))
+            if (!stepToNextCollision(gridVolume, densityGrid, ipos, idir, ri, tauToGo, t, nearFar.y, true, majorant, densityAccessor, gGvsDistWeightK)) return false;
+
+            // WEIGHTED delta tracking (Galtier et al. 2013; Novak et al. 2018
+            // STAR 5). The general form draws a real collision with an arbitrary
+            // probability Pc and carries
+            //     real: w *= d / (sigmaBar * Pc)
+            //     null: w *= (sigmaBar - d) / (sigmaBar * (1 - Pc))
+            // which is unbiased for ANY Pc in (0,1] and ANY sigmaBar > 0 - the
+            // majorant does not have to bound the medium.
+            //
+            // Choosing Pc = min(d / sigmaBar, 1) collapses this to something
+            // almost free:
+            //   d <= sigmaBar : Pc = d/sigmaBar, and BOTH weights are exactly 1
+            //                   - identical to the analog tracker, including the
+            //                   comparison below, which is the same test.
+            //   d >  sigmaBar : Pc = 1, so the collision is always real and the
+            //                   weight is d/sigmaBar > 1. The null branch has
+            //                   probability zero and never runs.
+            // So there is no running weight to carry: null collisions are always
+            // weight 1, and a single factor max(1, d/sigmaBar) lands on the real
+            // collision. With gGvsDistWeightK == 1, sigmaBar is the true majorant,
+            // d <= sigmaBar always, the factor is 1, and this is byte-identical
+            // to the estimator it replaces.
+            //
+            // COST OF BEING WRONG-SIDED: that factor compounds across bounces,
+            // bounded per event by majorant/sigmaBar_w (~8x at weightK 0). This
+            // trades tap count for variance, so it must be gated on an image
+            // comparison, not on the frame timer.
+            const float d = lookupDensityIndex(gridVolume, ipos + t * idir, sampleNext3D(sg), densityGrid, densityAccessor);
+            if (sampleNext1D(sg) * majorant < d)
             {
                 // Real collision, terminate.
                 ds.t = t;
-                ds.thp = gridVolume.data.albedo;
+                ds.thp = gridVolume.data.albedo * max(1.f, d / majorant);
                 return true;
             }
             // Null collision, continue with new sample.

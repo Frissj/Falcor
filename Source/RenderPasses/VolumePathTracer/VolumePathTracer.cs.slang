@@ -1,4 +1,4 @@
-/***************************************************************************
+﻿/***************************************************************************
  # Reference volumetric path tracer for NanoVDB grid volumes.
  #
  # Brute-force, unbiased-by-construction: null-collision distance sampling
@@ -35,6 +35,12 @@ cbuffer CB
     /// (2*tan(fovY/2)/resY * user scale). 0 = footprint-driven residual mip off.
     float gFootprintSpread;
     uint gOccSkipEnable;    ///< 6.3 occupancy tap skip on/off. Pushed into the sampler per thread.
+    /// Weighted delta-tracking knob for the distance sampler (see
+    /// gvsSetDistWeightK). 1 = exact analog tracking, byte-identical to before.
+    /// Lower softens the free-flight majorant toward the cell mean, trading
+    /// null collisions for weight variance. ESTIMATOR CHANGE - gate on an image
+    /// comparison, not on gpuMs.
+    float gDistWeightK;
     /// Stage B temporal reuse: previous frame's camera.
     float4x4 gPrevViewProj;
     float3 gPrevCamPos;
@@ -125,45 +131,6 @@ uint gvsHomogBinNow(uint k)
 #else
     return 0;
 #endif
-}
-/** [SUBHOMOG] counterparts, binned at the SAME cell visits as gvsHomogBinNow so
-    the two histograms are a paired comparison. See the binning site in
-    GridVolumeSampler::stepToNextCollision for how to read them.
-*/
-uint gvsSubHomogBinNow(uint k)
-{
-#if GRID_VOLUME_SAMPLER_STATS
-    return gGvsSubHomogBins[k];
-#else
-    return 0;
-#endif
-}
-float gvsBrickMajSumNow()
-{
-#if GRID_VOLUME_SAMPLER_STATS
-    return gGvsBrickMajSum;
-#else
-    return 0.f;
-#endif
-}
-float gvsSubMajSumNow()
-{
-#if GRID_VOLUME_SAMPLER_STATS
-    return gGvsSubMajSum;
-#else
-    return 0.f;
-#endif
-}
-/** Quantise a length-weighted majorant integral for the uint stat slots.
-    x16 is chosen from the budget, not taste: ~12M traversed cells at a
-    majorant-weighted dtau of a few units each puts the frame total near 1e8,
-    so x16 leaves an order of magnitude of headroom under uint32 while keeping
-    far more precision than the ratio needs. Quantising per WAVE (not per lane)
-    keeps the rounding error at <1/16 per wave against a sum of ~1e8.
-*/
-uint gvsQuantMajSum(float v)
-{
-    return uint(clamp(v, 0.f, 2.6e8f) * 16.f + 0.5f);
 }
 /** Brick-cache coherence. The whole value of the brick-coherent tap path rests
     on consecutive taps landing in the same 8^3 brick; hits/(hits+misses) is that
@@ -422,6 +389,18 @@ SamplerState gRadSmp;                 ///< Linear clamp.
 
 static const float kRadFxScale = 1024.f; ///< Fixed-point scale for the atomic sums.
 
+/** Log2 luminance bin for [LUMHIST]. Bin 0 collects lum < 2^-6 AND zero AND
+    NaN (the !(lum > 0) test catches NaN, which a `lum <= 0` test would not);
+    bin 11 collects everything above 2^5. Log spacing on purpose: the washout
+    being chased moves mass in the DARK end, where linear bins have no
+    resolution.
+*/
+uint lumBin(const float lum)
+{
+    if (!(lum > 0.f)) return 0u;
+    return uint(clamp(6.f + log2(lum), 0.f, 11.f));
+}
+
 /** Deposit one suffix sample at a world position (training paths, at death). */
 void radSplat(const float3 pos, const float3 L)
 {
@@ -432,11 +411,32 @@ void radSplat(const float3 pos, const float3 L)
     const uint idx = ((c.z * gRadDim.y + c.y) * gRadDim.x + c.x) * 4u;
     // Clamp keeps one firefly from saturating a cell's 32-bit sum; the cache
     // is a smooth control, outliers belong to the residual anyway.
-    const float3 Lc = clamp(L, 0.f, 4096.f);
-    InterlockedAdd(gRadAccum[idx + 0], uint(Lc.r * kRadFxScale));
-    InterlockedAdd(gRadAccum[idx + 1], uint(Lc.g * kRadFxScale));
-    InterlockedAdd(gRadAccum[idx + 2], uint(Lc.b * kRadFxScale));
+    // SIGNED. The deposited suffix is correct only IN EXPECTATION - the NEE
+    // post-cut share is a reservoir COUNT RATIO, not the exact split, so an
+    // individual path's suffix can come out negative even though the mean is
+    // positive. Clamping those to zero (which the unsigned accumulator used to
+    // force) discards only the negative tail, so E[stored] > E[true]: the cache
+    // reads high and every consuming path banks too much radiance. That is the
+    // image coming out LIGHTER, and it gets worse the more frames consume
+    // rather than correct.
+    //
+    // Two's-complement addition is bit-identical for int and uint, so the
+    // buffer stays RWStructuredBuffer<uint> and only the interpretation changes:
+    // deposit asuint(int(...)), resolve with asint(). Symmetric clamp keeps the
+    // firefly bound the old +4096 gave without reintroducing the one-sided bias.
+    const float3 Lc = clamp(L, -4096.f, 4096.f);
+    InterlockedAdd(gRadAccum[idx + 0], asuint(int(Lc.r * kRadFxScale)));
+    InterlockedAdd(gRadAccum[idx + 1], asuint(int(Lc.g * kRadFxScale)));
+    InterlockedAdd(gRadAccum[idx + 2], asuint(int(Lc.b * kRadFxScale)));
     InterlockedAdd(gRadAccum[idx + 3], 1u);
+#if USE_WORK_STATS
+    // Proof the mechanism was live, not a story: slot 118 counts splats, 119
+    // counts those with any negative component. If 119 is ~0 the clamp was
+    // never firing and the lightening is something else - check before
+    // believing this fix.
+    InterlockedAdd(gRisStats[118], 1u);
+    if (any(L < 0.f)) InterlockedAdd(gRisStats[119], 1u);
+#endif
 }
 
 /** Training-path selector. Hash, not stripes: neighbours in a wave must not
@@ -781,6 +781,7 @@ bool scatterAtVertex<S : ISampleGenerator>(
 void main(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
     gvsSetOccSkipEnable(gOccSkipEnable);
+    gvsSetDistWeightK(gDistWeightK);
     const uint2 pixel = dispatchThreadId.xy;
     if (any(pixel >= gFrameDim))
         return;
@@ -1484,6 +1485,33 @@ void main(uint3 dispatchThreadId: SV_DispatchThreadID)
     }
 
     gOutputColor[pixel] = float4(radiance, 1.f);
+#if USE_WORK_STATS
+    // [ENERGY] slot 120: total luminance main emits. Under compaction this is
+    // the ESCAPE/background term only (the scatter branch was skipped and the
+    // vertex queued); with compaction off it is the whole frame. Slot 121 is
+    // shadeMain's scatter term. Flip useCompaction and compare:
+    //   main differs   -> the bug is in main's compaction branch, not shadeMain
+    //   main matches,
+    //   total differs  -> the extra energy is in shadeMain
+    // Fixed point x256; ~518k pixels at O(1) radiance is ~1e8, well inside u32.
+    // clamp to 64, NOT saturate: the whole point is to measure a brightness
+    // LIFT, and saturate() clips at 1.0 per pixel, which would hide exactly the
+    // signal being looked for. 64 is far above any real pixel here but still
+    // bounds a firefly, and 518k pixels x 64 x 256 stays inside u32 unless
+    // every pixel saturates - which the printed raw sum would make obvious.
+    InterlockedAdd(gRisStats[120], uint(clamp(dot(radiance, float3(0.2126f, 0.7152f, 0.0722f)), 0.f, 64.f) * 256.f + 0.5f));
+
+    // [LUMHIST] main bins ONLY the pixels shadeMain will never see - the ones
+    // that were not queued. A queued pixel's value is not final here (shade
+    // still has to add its scatter term), so binning it now would put every
+    // scattering pixel in a too-dark bin and manufacture the very shift being
+    // measured. Between the two sites every pixel is binned exactly once, so
+    // the bins sum to the pixel count - check that before reading the shape.
+#if USE_COMPACTION
+    if (risExit != kRisExitContributed)
+#endif
+        InterlockedAdd(gRisStats[132 + lumBin(dot(radiance, float3(0.2126f, 0.7152f, 0.0722f)))], 1u);
+#endif
 
     // Demodulated outputs. Lin is derived by subtraction rather than being
     // accumulated separately in the loop: the primary-escape contribution is
@@ -1578,17 +1606,6 @@ void main(uint3 dispatchThreadId: SV_DispatchThreadID)
         const uint hg5 = WaveActiveSum(gvsHomogBinNow(5));
         const uint hg6 = WaveActiveSum(gvsHomogBinNow(6));
         const uint hg7 = WaveActiveSum(gvsHomogBinNow(7));
-        // [SUBHOMOG] paired flush - same kernel, same cell visits as hg0..hg7.
-        const uint sg0 = WaveActiveSum(gvsSubHomogBinNow(0));
-        const uint sg1 = WaveActiveSum(gvsSubHomogBinNow(1));
-        const uint sg2 = WaveActiveSum(gvsSubHomogBinNow(2));
-        const uint sg3 = WaveActiveSum(gvsSubHomogBinNow(3));
-        const uint sg4 = WaveActiveSum(gvsSubHomogBinNow(4));
-        const uint sg5 = WaveActiveSum(gvsSubHomogBinNow(5));
-        const uint sg6 = WaveActiveSum(gvsSubHomogBinNow(6));
-        const uint sg7 = WaveActiveSum(gvsSubHomogBinNow(7));
-        const uint sgB = gvsQuantMajSum(WaveActiveSum(gvsBrickMajSumNow()));
-        const uint sgS = gvsQuantMajSum(WaveActiveSum(gvsSubMajSumNow()));
 
         // ---- DIVERGENCE PROBE (slots 31-35) ----
         // Nsight's largest rule on this pass is Active Threads Per Warp: only
@@ -1677,17 +1694,6 @@ void main(uint3 dispatchThreadId: SV_DispatchThreadID)
             if (hg6 > 0) InterlockedAdd(gRisStats[83], hg6);
             if (hg7 > 0) InterlockedAdd(gRisStats[84], hg7);
 
-            if (sg0 > 0) InterlockedAdd(gRisStats[108], sg0);
-            if (sg1 > 0) InterlockedAdd(gRisStats[109], sg1);
-            if (sg2 > 0) InterlockedAdd(gRisStats[110], sg2);
-            if (sg3 > 0) InterlockedAdd(gRisStats[111], sg3);
-            if (sg4 > 0) InterlockedAdd(gRisStats[112], sg4);
-            if (sg5 > 0) InterlockedAdd(gRisStats[113], sg5);
-            if (sg6 > 0) InterlockedAdd(gRisStats[114], sg6);
-            if (sg7 > 0) InterlockedAdd(gRisStats[115], sg7);
-            if (sgB > 0) InterlockedAdd(gRisStats[116], sgB);
-            if (sgS > 0) InterlockedAdd(gRisStats[117], sgS);
-
             if (a > 0) InterlockedAdd(gRisStats[9], a);
             if (a2 > 0) InterlockedAdd(gRisStats[29], a2);
             if (b > 0) InterlockedAdd(gRisStats[10], b);
@@ -1739,6 +1745,7 @@ void main(uint3 dispatchThreadId: SV_DispatchThreadID)
 void shadeMain(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
     gvsSetOccSkipEnable(gOccSkipEnable);
+    gvsSetDistWeightK(gDistWeightK);
     const uint queueIdx = dispatchThreadId.x;
     if (queueIdx >= gScatterCount[0])
         return;
@@ -1782,6 +1789,15 @@ void shadeMain(uint3 dispatchThreadId: SV_DispatchThreadID)
     // Mark/diff on the running per-lane counters, exactly the pattern the fused
     // main uses for its escapeT/candGen split - register subtracts only, no
     // atomics in the loop.
+    // [CVEXIT] How a RESIDUAL path ended. The subtraction of (thp/p)*C happens
+    // ONCE, at the cut; the S that is supposed to pay it back accrues over the
+    // bounces that follow. Any exit that is not itself unbiased leaves the
+    // subtraction standing against a truncated S. 0 = still running / never
+    // residual, 1 warp-RR, 2 tailQ, 3 escaped, 4 hit kMaxBounces, 5
+    // scatterAtVertex returned false (its own roulette/absorption).
+    // kMaxBounces is the one to watch: it is a hard cut with no compensation
+    // at all, and residual paths run mean ~9 bounces with a 12% tail past 16.
+    uint residExit = 0u;
     uint bcDsCells = 0, bcDsTaps = 0, bcDsHits = 0, bcDsMiss = 0, bcDsSkip = 0, bcDsCalls = 0;
     uint bcSvCells = 0, bcSvTaps = 0;
     uint bcNeeCells = 0, bcNeeTaps = 0, bcNeeHits = 0, bcNeeMiss = 0, bcNeeSkip = 0, bcNeeCalls = 0;
@@ -1865,6 +1881,7 @@ void shadeMain(uint3 dispatchThreadId: SV_DispatchThreadID)
                 {
 #if USE_WORK_STATS
                     InterlockedAdd(gRisStats[72], 1u); // Per-lane, wave-free (runs 127/128 lesson).
+                    residExit = 1u;
 #endif
                     break;
                 }
@@ -1891,7 +1908,12 @@ void shadeMain(uint3 dispatchThreadId: SV_DispatchThreadID)
             hc = jenkinsHash(hc ^ asuint(ray.dir.z));
             const float coin = (hc >> 8) * 0x1p-24f;
             if (coin >= p)
+            {
+#if USE_WORK_STATS
+                residExit = 2u;
+#endif
                 break;
+            }
             // Shared cumulative-compensation cap with warp-RR (radRRComp): per-
             // bounce RR compounds (1/p each survival), so bound the survivor's
             // throughput at 4x - past that, stop rouletting rather than mint a
@@ -1920,6 +1942,9 @@ void shadeMain(uint3 dispatchThreadId: SV_DispatchThreadID)
         if (!scattered)
         {
             radiance += throughput * evalEnvironment(ray.dir);
+#if USE_WORK_STATS
+            residExit = 3u;
+#endif
             break;
         }
 
@@ -1929,7 +1954,12 @@ void shadeMain(uint3 dispatchThreadId: SV_DispatchThreadID)
         const float3 wiB = -ray.dir;
 
         if (bounce >= kMaxBounces)
+        {
+#if USE_WORK_STATS
+            residExit = 4u;
+#endif
             break;
+        }
 
 #if USE_RAD_CACHE
         // The cut vertex. Both roles trigger BEFORE the vertex is processed,
@@ -1952,6 +1982,20 @@ void shadeMain(uint3 dispatchThreadId: SV_DispatchThreadID)
                 {
                     // L = C + (S - C): bank the cache's mean...
                     radiance += throughput * C.rgb;
+#if USE_WORK_STATS
+                    // [CVBAL] The control variate's whole correctness claim is
+                    // that these two terms cancel in expectation:
+                    //   banked  = thp * C            (every consumer, always)
+                    //   removed = (thp/p) * C        (survivors only, prob p)
+                    // E[removed] = p * (thp/p) * C = thp * C = E[banked], so
+                    // sum(banked) - sum(removed) must converge to ZERO. If it
+                    // does not, the cache path is adding energy that no residual
+                    // ever takes back - which is exactly the +2.66% over nocache.
+                    // Luminance only; the bias is achromatic to first order and
+                    // one channel keeps the slot count sane.
+                    InterlockedAdd(gRisStats[123], uint(clamp(dot(throughput * C.rgb, float3(0.2126f, 0.7152f, 0.0722f)), 0.f, 64.f) * 256.f + 0.5f));
+                    InterlockedAdd(gRisStats[125], 1u);
+#endif
                     // ...and on a CONSUME frame stop right here. The path takes
                     // the cache's mean and dies: L = C, no residual. This is
                     // the biased leg of the amortization - correction frames
@@ -1971,6 +2015,10 @@ void shadeMain(uint3 dispatchThreadId: SV_DispatchThreadID)
                         break;
                     throughput /= gRadResidualSurvival;
                     radiance -= throughput * C.rgb;
+#if USE_WORK_STATS
+                    InterlockedAdd(gRisStats[124], uint(clamp(dot(throughput * C.rgb, float3(0.2126f, 0.7152f, 0.0722f)), 0.f, 64.f) * 256.f + 0.5f));
+                    InterlockedAdd(gRisStats[126], 1u);
+#endif
                     radIsResidual = true; // Eligible for the warp-aware roulette above from the next bounce on.
                 }
             }
@@ -1988,7 +2036,12 @@ void shadeMain(uint3 dispatchThreadId: SV_DispatchThreadID)
         bcSvTaps += gvsTapsNow() - bcSv1T;
 #endif
         if (!bcVertexAlive)
+        {
+#if USE_WORK_STATS
+            residExit = 5u;
+#endif
             break;
+        }
 
         bounce++;
     }
@@ -2036,7 +2089,10 @@ void shadeMain(uint3 dispatchThreadId: SV_DispatchThreadID)
             radCutThp.y > 1e-6f ? suffix.y / radCutThp.y : 0.f,
             radCutThp.z > 1e-6f ? suffix.z / radCutThp.z : 0.f
         );
-        radSplat(radCutPos, max(Ls, float3(0.f)));
+        // No max(Ls, 0) here any more - see radSplat. Clamping the negative
+        // tail of an expectation-correct estimate is what made the cache read
+        // high; the accumulator is signed now and can take it.
+        radSplat(radCutPos, Ls);
     }
 #endif
 
@@ -2045,6 +2101,28 @@ void shadeMain(uint3 dispatchThreadId: SV_DispatchThreadID)
     gOutputColor[pixel] += float4(radiance, 0.f);
     if (is_valid(gOutputLin))
         gOutputLin[pixel] += float4(radiance, 0.f);
+
+#if USE_WORK_STATS
+    // [ENERGY] slot 121: the scatter term shadeMain adds on top of main's
+    // escape term. Same fixed point as slot 120. Slot 122 counts the shaded
+    // entries, so 121/122 is energy per path - if the TOTAL is high but
+    // per-path is not, the queue is being shaded more times than main enqueued;
+    // if per-path is high, the estimator itself differs from the fused one.
+    InterlockedAdd(gRisStats[121], uint(clamp(dot(radiance, float3(0.2126f, 0.7152f, 0.0722f)), 0.f, 64.f) * 256.f + 0.5f));
+    InterlockedAdd(gRisStats[122], 1u);
+
+    // [CVEXIT] how this residual path ended (0 = was never residual).
+    if (residExit != 0u) InterlockedAdd(gRisStats[126 + residExit], 1u);
+
+    // [LUMHIST] Final per-pixel luminance, binned. THIS is the statistic the
+    // washout needs and [ENERGY] could not give: a total cannot see mass moving
+    // from dark bins to mid bins, which is what a coarse C consumed raw does -
+    // it lifts dark interiors and pulls down bright rims for almost no change
+    // in sum. gOutputColor was just written above, so read it back for the
+    // FULL pixel value (main's escape term + this scatter term); one queue
+    // entry per pixel means this lane is the only writer.
+    InterlockedAdd(gRisStats[132 + lumBin(dot(gOutputColor[pixel].rgb, float3(0.2126f, 0.7152f, 0.0722f)))], 1u);
+#endif
 
 #if USE_TEMPORAL_REUSE
     // Feed the scatter-sort predictor: this path's MEASURED bounce count,
@@ -2397,6 +2475,7 @@ void emitShadeStats(inout VolumeInstanceSampler volumeSampler)
 void shadeInitMain(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
     gvsSetOccSkipEnable(gOccSkipEnable);
+    gvsSetDistWeightK(gDistWeightK);
     const uint queueIdx = dispatchThreadId.x;
     if (queueIdx >= gScatterCount[0])
         return;
@@ -2450,6 +2529,7 @@ void shadeInitMain(uint3 dispatchThreadId: SV_DispatchThreadID)
 void bounceMain(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
     gvsSetOccSkipEnable(gOccSkipEnable);
+    gvsSetDistWeightK(gDistWeightK);
     const uint i = dispatchThreadId.x;
     if (i >= gPathCountIn[0])
         return;
@@ -2533,6 +2613,7 @@ void bounceArgsMain()
 void bounceTailMain(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
     gvsSetOccSkipEnable(gOccSkipEnable);
+    gvsSetDistWeightK(gDistWeightK);
     const uint i = dispatchThreadId.x;
     if (i >= gPathCountIn[0])
         return;
@@ -2638,7 +2719,14 @@ void radResolveMain(uint3 tid: SV_DispatchThreadID)
     const uint4 a = uint4(gRadAccum[idx + 0], gRadAccum[idx + 1], gRadAccum[idx + 2], gRadAccum[idx + 3]);
     if (a.w > 0u)
     {
-        const float3 mean = float3(a.xyz) / (kRadFxScale * float(a.w));
+        // asint: the sums are SIGNED fixed point (see radSplat). Reading them as
+        // uint made a negative sum decode as ~4.29e9 instead of a small negative
+        // number, so this reinterpret is required by the deposit change, not
+        // cosmetic. The mean itself may legitimately be slightly negative in a
+        // cell whose samples happened to skew that way; the consumer's
+        // confidence gate and the EMA handle it, and forcing it positive here
+        // would just reintroduce the bias one level down.
+        const float3 mean = float3(int3(asint(a.x), asint(a.y), asint(a.z))) / (kRadFxScale * float(a.w));
         float4 v = gRadResolveUav[tid];
         v.rgb = lerp(v.rgb, mean, gRadEma);
         v.a = lerp(v.a, 1.f, gRadEma);

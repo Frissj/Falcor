@@ -1,4 +1,4 @@
-/***************************************************************************
+﻿/***************************************************************************
  # Reference volumetric path tracer for NanoVDB grid volumes.
  **************************************************************************/
 #include "VolumePathTracer.h"
@@ -93,6 +93,7 @@ const char kRadResidualSurvival[] = "radResidualSurvival";
 const char kRadWarpRRLanes[] = "radWarpRRLanes";
 const char kRadResidualTailQ[] = "radResidualTailQ";
 const char kRadTrainEvery[] = "radTrainEvery";
+const char kDistWeightK[] = "distWeightK";
 const char kRadAmortPeriod[] = "radAmortPeriod";
 const char kRadAmortTrainEvery[] = "radAmortTrainEvery";
 const char kRadEma[] = "radEma";
@@ -212,6 +213,8 @@ void VolumePathTracer::parseProperties(const Properties& props)
             mRadResidualTailQ = std::clamp((float)value, 0.f, 0.9f);
         else if (key == kRadTrainEvery)
             mRadTrainEvery = std::max(1u, (uint32_t)value);
+        else if (key == kDistWeightK)
+            mDistWeightK = std::clamp((float)value, 0.f, 1.f);
         else if (key == kRadAmortPeriod)
             mRadAmortPeriod = (uint32_t)value;
         else if (key == kRadAmortTrainEvery)
@@ -280,6 +283,7 @@ Properties VolumePathTracer::getProperties() const
     props[kRadWarpRRLanes] = mRadWarpRRLanes;
     props[kRadResidualTailQ] = mRadResidualTailQ;
     props[kRadTrainEvery] = mRadTrainEvery;
+    props[kDistWeightK] = mDistWeightK;
     props[kRadAmortPeriod] = mRadAmortPeriod;
     props[kRadAmortTrainEvery] = mRadAmortTrainEvery;
     props[kRadEma] = mRadEma;
@@ -1450,6 +1454,7 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
         var["CB"]["gFrameDim"] = targetDim;
         var["CB"]["gFootprintSpread"] = footprintSpread;
         var["CB"]["gOccSkipEnable"] = mUseOccupancySkip ? 1u : 0u;
+        var["CB"]["gDistWeightK"] = mDistWeightK;
         var["CB"]["gPrevViewProj"] = mPrevViewProj;
         var["CB"]["gPrevCamPos"] = mPrevCamPos;
         var["CB"]["gTemporalEnable"] = (temporalActive && mPrevCamValid) ? 1u : 0u;
@@ -2035,63 +2040,6 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
                         100.0 * double(hb[6]) / hd, 100.0 * double(hb[7]) / hd,
                         homogenizable, nearConst
                     );
-
-                    // [SUBHOMOG] The granularity gate. Same histogram, same
-                    // traversed cells, but the ratio is taken over the 4^3
-                    // SUB-CELL the walk entered instead of the 8^3 brick.
-                    //
-                    // WHY THIS DECIDES SOMETHING: every unbiased tracking
-                    // estimator costs integral(sigma_bar ds). Delta tracking
-                    // (sampleDistance, the 68% [BOUNCECOST] bucket) admits no
-                    // control variate at all - distance sampling must be exact
-                    // - so tightening the majorant is its ONLY lever. Residual
-                    // ratio tracking (the NEE walk) already runs the correct
-                    // mean-control form, and [HOMOG]'s mean/maj ~ 0.125 is
-                    // exactly why it only removes ~12% of collisions:
-                    // sigma_r_bar = max(maj - mean, mean - min) ~ 0.875 * maj.
-                    // Both buckets therefore reduce to one question.
-                    //
-                    // 'majRatio' is the answer, and it is the number to read
-                    // FIRST - the histograms only explain it. It is
-                    // sum(subMaj)/sum(brickMaj) over the same cells, i.e. the
-                    // predicted change in collisions if the DDA descended to
-                    // 4^3. Near 1.00 = the medium is fractal past the 1-voxel
-                    // dilation halo, no majorant scheme can tighten, and the
-                    // finer-granularity fix is dead. Well below 1 = it is the
-                    // whole ballgame and pays on both buckets at once.
-                    //
-                    // Cost side of the same trade: 4^3 cells are half as wide,
-                    // so a ray crosses ~2x as many, i.e. ~2x the range fetches
-                    // bought for majRatio of the atlas taps. Range fetches hit
-                    // the brick cache (~60%); taps are the dependent two-hop
-                    // atlas chase this pass is latency-bound on. The memory
-                    // price is on the [SUBRANGE] line at load time.
-                    {
-                        uint64_t sb[8];
-                        uint64_t sbTotal = 0;
-                        for (int k = 0; k < 8; ++k) { sb[k] = s[108 + k]; sbTotal += sb[k]; }
-                        const double sd = sbTotal > 0 ? double(sbTotal) : 1.0;
-                        // x16 fixed point (gvsQuantMajSum). These are integral
-                        // sigma_bar ds in index-space units, length-weighted -
-                        // print them raw so a saturated slot is visible instead
-                        // of quietly deflating majRatio.
-                        const double brickMaj = double(s[116]) / 16.0;
-                        const double subMaj = double(s[117]) / 16.0;
-                        const double majRatio = brickMaj > 0.0 ? subMaj / brickMaj : 0.0;
-                        logInfo(
-                            "[SUBHOMOG] frame {} | subCells {} | ratio(mean/maj) hist %: "
-                            "[.00-.125] {:.1f} [.125-.25] {:.1f} [.25-.375] {:.1f} [.375-.50] {:.1f} "
-                            "[.50-.625] {:.1f} [.625-.75] {:.1f} [.75-.875] {:.1f} [.875-1.0] {:.1f} "
-                            "| homogenizable(>=0.75) {:.1f}% | majRatio sub/brick {:.3f} (sums {:.1f}/{:.1f})",
-                            mFrameCount, sbTotal,
-                            100.0 * double(sb[0]) / sd, 100.0 * double(sb[1]) / sd,
-                            100.0 * double(sb[2]) / sd, 100.0 * double(sb[3]) / sd,
-                            100.0 * double(sb[4]) / sd, 100.0 * double(sb[5]) / sd,
-                            100.0 * double(sb[6]) / sd, 100.0 * double(sb[7]) / sd,
-                            100.0 * double(sb[6] + sb[7]) / sd,
-                            majRatio, subMaj, brickMaj
-                        );
-                    }
                 }
 
                 // [PATHLEN] Shade path length split by radcache role. The role
@@ -2132,6 +2080,87 @@ void VolumePathTracer::execute(RenderContext* pRenderContext, const RenderData& 
                         mRadAmortPeriod == 0 ? "amort-off" : (radIsCorrectionFrame() ? "CORRECTION" : "consume"),
                         pl
                     );
+                    logInfo(
+                        "[RADSPLAT] frame {} | deposits {} | negative {} ({:.1f}%)",
+                        mFrameCount, s[118], s[119],
+                        s[118] > 0 ? 100.0 * double(s[119]) / double(s[118]) : 0.0
+                    );
+                    // [ENERGY] the useCompaction A/B. With compaction ON, main
+                    // emits only the escape term and shade emits the scatter
+                    // term; with it OFF, main emits everything and shade is 0.
+                    // 'total' is what lands on screen either way, so it is the
+                    // number that must match between the two configs.
+                    {
+                        const double mainL = double(s[120]) / 256.0;
+                        const double shadeL = double(s[121]) / 256.0;
+                        logInfo(
+                            "[ENERGY] frame {} | compaction {} | main {:.1f} + shade {:.1f} = total {:.1f} "
+                            "| shaded entries {} | per-entry {:.4f}",
+                            mFrameCount, mUseCompaction ? "ON" : "off",
+                            mainL, shadeL, mainL + shadeL, s[122],
+                            s[122] > 0 ? shadeL / double(s[122]) : 0.0
+                        );
+                    }
+
+                    // [CVBAL] The control variate's correctness in one line.
+                    // banked = sum(thp*C) over every consumer; removed =
+                    // sum((thp/p)*C) over survivors only. E[removed] == E[banked]
+                    // by construction, so 'net' must converge to 0. A positive
+                    // net is un-taken-back energy and IS the +2.66% over nocache.
+                    // survival% should sit at radResidualSurvival; if it does
+                    // not, the coin is wrong and nothing else here means much.
+                    {
+                        const double banked = double(s[123]) / 256.0;
+                        const double removed = double(s[124]) / 256.0;
+                        const double net = banked - removed;
+                        logInfo(
+                            "[CVBAL] frame {} | banked {:.1f} - removed {:.1f} = net {:+.1f} ({:+.2f}% of banked) "
+                            "| consumers {} survivors {} ({:.1f}%, expect {:.1f}%)",
+                            mFrameCount, banked, removed, net,
+                            banked > 0.0 ? 100.0 * net / banked : 0.0,
+                            s[125], s[126],
+                            s[125] > 0 ? 100.0 * double(s[126]) / double(s[125]) : 0.0,
+                            100.0 * mRadResidualSurvival
+                        );
+
+                        // [CVEXIT] where residual paths died. The (thp/p)*C
+                        // subtraction is paid once at the cut; S accrues after.
+                        // maxBounces is a hard truncation with NO compensation,
+                        // so a large share there means the residual is being cut
+                        // short while its debt stands - the sign of that error
+                        // is a systematic lift.
+                        const uint64_t exTot = (uint64_t)s[127] + s[128] + s[129] + s[130] + s[131];
+                        const double ed = exTot > 0 ? double(exTot) : 1.0;
+                        logInfo(
+                            "[CVEXIT] frame {} | residual exits {} | warpRR {:.1f}% tailQ {:.1f}% escape {:.1f}% "
+                            "maxBounces {:.1f}% scatterFalse {:.1f}%",
+                            mFrameCount, exTot,
+                            100.0 * s[127] / ed, 100.0 * s[128] / ed, 100.0 * s[129] / ed,
+                            100.0 * s[130] / ed, 100.0 * s[131] / ed
+                        );
+                    }
+
+                    // [LUMHIST] The statistic [ENERGY] could not provide. Bins
+                    // are log2: bin k covers luminance [2^(k-6), 2^(k-5)), bin 0
+                    // also holds zero/NaN, bin 11 everything above 32. Compare
+                    // amort on vs off: a WASHOUT moves mass out of the dark bins
+                    // into the middle while the total barely changes, which is
+                    // invisible to a sum. 'binned' must equal the pixel count -
+                    // if it does not, a pixel was binned twice or not at all and
+                    // the shape is meaningless.
+                    {
+                        uint64_t lb[12];
+                        uint64_t lbTotal = 0;
+                        for (int k = 0; k < 12; ++k) { lb[k] = s[132 + k]; lbTotal += lb[k]; }
+                        const double ld = lbTotal > 0 ? double(lbTotal) : 1.0;
+                        std::string hist;
+                        for (int k = 0; k < 12; ++k)
+                            hist += fmt::format("{:.1f}{}", 100.0 * double(lb[k]) / ld, k < 11 ? " " : "");
+                        logInfo(
+                            "[LUMHIST] frame {} | binned {} of {} px | log2 bins %: {}",
+                            mFrameCount, lbTotal, pixels, hist
+                        );
+                    }
                 }
 
                 // [BOUNCECOST] Where ONE BOUNCE's work goes (HANDOFF_10 7.1).
@@ -2462,6 +2491,22 @@ void VolumePathTracer::renderUI(Gui::Widgets& widget)
                 group.var("Train 1-in-N", mRadTrainEvery, 1u, 64u);
                 group.tooltip("Training pixels run FULL paths (deposit, never consume), so the\ncache never learns from itself.", true);
                 group.var("Cache EMA", mRadEma, 0.001f, 1.f);
+                group.var("Dist weight K", mDistWeightK, 0.f, 1.f);
+                group.tooltip(
+                    "Weighted delta tracking for the distance sampler.\n"
+                    "1.0 = off: true majorant, exact analog tracking, byte-identical.\n"
+                    "Lower drives the free flight with lerp(cellMean, cellMajorant, K),\n"
+                    "which is NOT a bound - collisions past it carry weight sigma/sigmaBar.\n\n"
+                    "WHY: [HOMOG] measured mean/majorant < 0.125 in 67% of traversed\n"
+                    "cells, so ~7 of every 8 proposed collisions are null. A softer\n"
+                    "sigmaBar lengthens the free flight and deletes those proposals.\n"
+                    "This attacks TAPS (the measured cost) not cells, which is why it\n"
+                    "is worth trying where the 4^3 granularity fix lost.\n\n"
+                    "Unbiased at any K (Galtier 2013), but the weight compounds across\n"
+                    "bounces, bounded per event by majorant/sigmaBar_w (~8x at K=0).\n"
+                    "GATE ON AN IMAGE COMPARISON against K=1, never on gpuMs alone.",
+                    true
+                );
                 group.var("Amortize 1-in-N frames", mRadAmortPeriod, 0u, 32u);
                 group.tooltip(
                     "0 = off: every frame tracks the residual and trains (today's\n"

@@ -41,7 +41,7 @@ from falcor import *
 try:
     _RENDER_RES
 except NameError:
-    _RENDER_RES = (960, 540)
+    _RENDER_RES = None
 
 if _RENDER_RES is None:
     _LOWRES = {'outputSize': 'Default'}   # full window res
@@ -62,20 +62,40 @@ except NameError:
 # residual and trains, i.e. today's unbiased estimator byte-identical. N > 0 runs
 # 1 correction frame in N and CONSUMES the cache on the rest.
 #
-# Measured ceiling (VNA_CacheAmortGate, log 164, 960x540): a consume frame is
-# shade 1.53 vs ship 2.14 ms (-28%), frame 3.34 vs 3.94 (-15%); N=8 amortizes to
-# ~3.42 ms, about -13% of frame. Same run also showed the radcache as currently
-# configured buys only 8.6% over having no cache at all (2.396 -> 2.191) - the
-# residual eats roughly three quarters of the cache's value.
+# MEASURED ON THIS CODE PATH (VNA_CacheAmortGate, log 167, 960x540, 2 rounds
+# agreeing to 0.024 ms against config gaps ~20x that):
+#   nocache  shade 2.767  gpuMs 4.786
+#   ship     shade 2.286  gpuMs 4.080
+#   amort8   shade 1.725  gpuMs 3.626   -24.5% shade, -11.1% frame
+#   floor    shade 1.625  gpuMs 3.444   (ceiling - amort8 sits nearly on it)
+# An earlier interactive session appeared to show consume frames SLOWER; that
+# run was uncontrolled (frame 29k, free camera) and is superseded by the gate.
 #
 # CONSISTENT, NOT UNBIASED: consume frames render the cache's mean C, biased by
 # whatever the cache has wrong; correction frames measure the residual and splat
-# it back, so a static scene converges to ground truth. Leave at 0 until the
-# image is checked against a full-res unbiased reference - the timing is proven,
-# the quality is not.
+# it back, so a static scene converges to ground truth. THE TIMING IS PROVEN,
+# THE IMAGE IS NOT - nothing here has been compared against an unbiased
+# reference, and the failure mode to watch for is a periodic brightness ripple
+# at the amortization period, which no counter will show. Set back to 0 to get
+# the old estimator byte-identical.
+# Weighted delta tracking for the distance sampler. 1.0 = off (exact analog
+# tracking, byte-identical). Below 1 the free-flight majorant is softened toward
+# the cell mean, so fewer collisions are proposed and survivors carry a weight
+# max(1, sigma/sigmaBar). Unbiased at any K (Galtier et al. 2013), but the weight
+# compounds across bounces - bounded per event by majorant/sigmaBar_w, ~8x at 0.
+# Aimed at the 68% [BOUNCECOST] ds bucket. Gate with VNA_DistWeightGate.py and
+# judge on the IMAGE, not gpuMs: every K below 1 is faster and noisier.
+try:
+    _DIST_WEIGHT_K
+except NameError:
+    _DIST_WEIGHT_K = 1.0
+
 try:
     _AMORT_PERIOD
 except NameError:
+    # DIAGNOSTIC STATE (2026-07-21): 0 while isolating the "image comes out
+    # light" report. Restore to 8 once the cause is found - the timing win is
+    # real (log 167: 3.63 vs 4.08 ms), only the image is in question.
     _AMORT_PERIOD = 0
 
 def render_graph_VNA():
@@ -184,6 +204,16 @@ def render_graph_VNA():
         'trRRMode': 31,
         'useRadCache': True,
         'radCacheRes': 64,
+        # DIAGNOSTIC STATE (2026-07-21), step 2. Step 1 (radCutBounce 0) made
+        # the lightening go away, so it is the cache path, not compaction.
+        # Cache back ON with _AMORT_PERIOD still 0, which splits the two
+        # remaining explanations:
+        #   light RETURNS -> the cache path is biased even WITH the residual
+        #                    correcting it every frame. A real estimator bug.
+        #   light STAYS AWAY -> the cache is fine when corrected; amortization
+        #                    is the cause, because consume frames render the
+        #                    coarse C raw. Then the fix is not "fix the cache"
+        #                    but "C is too coarse to consume uncorrected".
         'radCutBounce': 3,
         'radResidualSurvival': 0.25,
         # Lever-1 warp-aware residual roulette: REDESIGNED (HANDOFF_9 5 - all
@@ -199,6 +229,7 @@ def render_graph_VNA():
         # a ship frame does today. Compensating it (radTrainEvery/N) restores
         # training throughput and costs back most of the win - sweep, do not
         # assume.
+        'distWeightK': _DIST_WEIGHT_K,
         'radAmortPeriod': _AMORT_PERIOD,
         'radAmortTrainEvery': 0,
         # Section 4: HW-BVH brick TLAS (UE HeterogeneousVolumes port) with

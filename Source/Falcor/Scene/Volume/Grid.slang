@@ -59,10 +59,6 @@ struct Grid
     // The .xy mips are a max/min pyramid, the .z mip is a MEAN pyramid - they
     // are different quantities; do not conflate them.
     Texture3D<float4> rangeMeanTex;
-    // Same triple at 4^3 sub-cell granularity, single mip (see BrickedGrid.h).
-    // Measurement-only today: read by the [SUBHOMOG] histogram, never by the
-    // traversal, so nothing about the image depends on it.
-    Texture3D<float4> subRangeTex;
     Texture3D<uint4> indirectionTex;
     Texture3D<float> atlasTex;
 
@@ -332,18 +328,6 @@ struct Grid
     {
         index >>= (3 + mip);
         return rangeMeanTex.Load(int4(index, mip)).xyz;
-    }
-
-    /** Lookup the (majorant, minorant, mean) triple of the 4^3 SUB-CELL holding
-        this voxel index. Shift is 2, not 3: sub-cells are half a brick wide.
-        Measurement path only - see subRangeTex.
-        \param[in] index Fractional voxel index.
-        \return Returns (max, min, mean) over the sub-cell's region.
-    */
-    float3 lookupIndexSubRangeMeanTex(int3 index)
-    {
-        index >>= 2;
-        return subRangeTex.Load(int4(index, 0)).xyz;
     }
 
     /** Lookup the local MEAN density on a given mipmap level.

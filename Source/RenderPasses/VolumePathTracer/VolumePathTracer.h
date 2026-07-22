@@ -324,6 +324,16 @@ private:
     /// Measured ceiling (gate log 164, 960x540): a consume frame is shade 1.53
     /// vs ship 2.14 ms (-28%), frame 3.34 vs 3.94 (-15%); at N=8 that amortizes
     /// to ~3.42 ms (-13%). CONSISTENT, not unbiased - see gRadCorrectionFrame.
+    /// Weighted delta tracking for the DISTANCE sampler (Galtier et al. 2013;
+    /// Novak et al. 2018 STAR 5). 1 = off, the exact analog estimator,
+    /// byte-identical. Below 1 the free-flight majorant is softened toward the
+    /// cell mean, so fewer collisions are proposed and the survivors carry a
+    /// weight max(1, sigma/sigmaBar_w). Attacks the tap count - the measured
+    /// cost - rather than the cell count, which is why it is worth trying where
+    /// the 4^3 granularity fix was not.
+    /// Aimed at the 68% [BOUNCECOST] ds bucket. Trades taps for variance, so
+    /// gate it on an image comparison against weightK 1, never on gpuMs alone.
+    float mDistWeightK = 1.f;
     uint32_t mRadAmortPeriod = 0;
     /// Train-every to use ON a correction frame. 0 = keep mRadTrainEvery, so
     /// the cache sees N x fewer training samples per second and converges N x
@@ -435,7 +445,7 @@ private:
     // 42..45 = shadeMain divergence (bounce sum/max, marching-work sum/max),
     // 46..53 = [TRRPROBE] escape-walk E[T] with/without RR, 4 Tref bins x
     //          (RR sum, ref sum), x4096 fixed point.
-    static const uint32_t kRisStatSlots = 118; ///< 54..65 = [TRRPROBE2] coin telemetry (4 det-key bins x count/sumBefore/survives); 66..70 = [TRRPROBE2-CHK] self-checks + negative-Tr counts; 71 = brick-prefetch promotes; 72 = warp-RR kills; 73..76 = scatter-sort class histogram; 77..84 = [HOMOG] mean/majorant uniformity histogram (8 bins); 85..93 = [PATHLEN] shade path-length by radcache role (3 roles x count/sumBounces/stragglers>=16); 94..107 = [BOUNCECOST] shadeMain work split by op (94..99 sampleDistance cells/taps/hits/misses/skips/calls, 100..101 scatterAtVertex cells/taps, 102..107 deferred evalNEE cells/taps/hits/misses/skips/calls); 108..117 = [SUBHOMOG] 4^3 sub-cell uniformity histogram (8 bins) + brick/sub majorant sums (x256 fixed point), paired with [HOMOG] over the same traversed cells.
+    static const uint32_t kRisStatSlots = 144; ///< 123..126 = [CVBAL] banked +thp*C / removed +(thp/p)*C / consumers / survivors; 127..131 = [CVEXIT] residual exit reason (warpRR, tailQ, escape, maxBounces, scatterFalse); 132..143 = [LUMHIST] 12 log2 luminance bins over the final image. 120..122 = [ENERGY] main-emitted luminance / shadeMain-emitted luminance / shaded entries, for the useCompaction A/B. 118..119 = radSplat deposits / deposits with a negative component (the cache-reads-high probe). 54..65 = [TRRPROBE2] coin telemetry (4 det-key bins x count/sumBefore/survives); 66..70 = [TRRPROBE2-CHK] self-checks + negative-Tr counts; 71 = brick-prefetch promotes; 72 = warp-RR kills; 73..76 = scatter-sort class histogram; 77..84 = [HOMOG] mean/majorant uniformity histogram (8 bins); 85..93 = [PATHLEN] shade path-length by radcache role (3 roles x count/sumBounces/stragglers>=16); 94..107 = [BOUNCECOST] shadeMain work split by op (94..99 sampleDistance cells/taps/hits/misses/skips/calls, 100..101 scatterAtVertex cells/taps, 102..107 deferred evalNEE cells/taps/hits/misses/skips/calls); 108..117 = FREE (was [SUBHOMOG]; removed 2026-07-22 once the granularity question was answered and its per-cell texture fetch became a bandwidth cost at full res).
     ref<Buffer> mpRisStats;         ///< Device-local counters (atomics).
     ref<Buffer> mpRisStatsReadback; ///< CPU-visible copy.
     bool mLogRisStats = false;      ///< Log the histogram while RIS is on.

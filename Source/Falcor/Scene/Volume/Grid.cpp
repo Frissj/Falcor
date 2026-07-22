@@ -128,12 +128,6 @@ namespace Falcor
     {
         var["buf"] = mpBuffer;
         var["rangeMeanTex"] = mBrickedGrid.rangeMean;
-        // subRangeTex is referenced ONLY from the [SUBHOMOG] binning site, which
-        // compiles out with GRID_VOLUME_SAMPLER_STATS. Slang then strips it from
-        // the reflection, so an unconditional bind would fail in exactly the
-        // shipping build. Every other texture here is used on all paths.
-        if (auto v = var.findMember("subRangeTex"); v.isValid())
-            v = mBrickedGrid.subRange;
         var["indirectionTex"] = mBrickedGrid.indirection;
         var["occupancyTex"] = mBrickedGrid.occupancy;
         var["atlasTex"] = mBrickedGrid.atlas;
@@ -172,7 +166,6 @@ namespace Falcor
     {
         const uint64_t nvdb = mpBuffer ? mpBuffer->getSize() : (uint64_t)0;
         const uint64_t bricks = (mBrickedGrid.rangeMean ? mBrickedGrid.rangeMean->getTextureSizeInBytes() : (uint64_t)0) +
-            (mBrickedGrid.subRange ? mBrickedGrid.subRange->getTextureSizeInBytes() : (uint64_t)0) +
             (mBrickedGrid.indirection ? mBrickedGrid.indirection->getTextureSizeInBytes() : (uint64_t)0) +
             (mBrickedGrid.atlas ? mBrickedGrid.atlas->getTextureSizeInBytes() : (uint64_t)0);
         return nvdb + bricks;

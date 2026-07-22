@@ -49,14 +49,6 @@ namespace Falcor
         ref<Texture> indirection;
         ref<Texture> atlas;
 
-        // [SUBHOMOG] gate: the same (majorant, minorant, mean) triple at 4^3
-        // sub-cell granularity, mip-0 dims x2 per axis, single mip. Built to
-        // answer one question before any finer-granularity traversal is
-        // written - does the majorant actually tighten below brick scale, or
-        // is the medium fractal all the way down? Read ONLY by the [SUBHOMOG]
-        // histogram today; the traversal still uses rangeMean.
-        ref<Texture> subRange;
-
         // Per-brick occupancy bitmask, R32Uint, mip-0 brick dims. Bit t is set
         // if BC4 tile t (4x4x1 voxels, t = (vx>>2) | ((vy>>2)<<1) | (vz<<2))
         // can decode to anything other than exactly 0. A clear bit lets the
