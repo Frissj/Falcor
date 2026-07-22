@@ -571,6 +571,40 @@ struct GridVolumeSampler
         return w;
     }
 
+    /** Rebuild a setup from index-space state a caller already holds.
+
+        WHY THIS EXISTS AND WHY CALLERS MAY NOT JUST CACHE A WalkSetup:
+        WalkSetup contains a Grid, and Grid holds five RESOURCE handles (four
+        Texture3D plus a StructuredBuffer). Carrying one in a mutable local that
+        is conditionally reassigned inside a loop asks the compiler for a phi
+        node over opaque handles, which DXIL cannot represent - Slang has to
+        legalize it and instead crashed outright (slang.dll, 0xc0000005, log
+        198, 2026-07-22). Every WalkSetup must therefore stay `const`,
+        block-scoped and initialised at its declaration, exactly as beginWalk's
+        callers already use it.
+
+        So a caller that wants to amortise the setup across loop iterations
+        caches only the PLAIN state - ipos/idir/ri, nine floats, no handles -
+        and calls this once per iteration to re-attach the handle. That is a
+        buffer load, which the pre-change code did per iteration anyway; what it
+        avoids is the two 4x4 mat-vecs, the reciprocal, and the brick-cache
+        reset, which is the whole cost the amortisation targets.
+
+        NO CACHE RESET HERE, deliberately: resuming means the grid has not
+        changed, which is precisely the condition under which the brick cache's
+        single-grid rule (see beginWalk) permits keeping it. Callers must call
+        beginWalk, not this, whenever the grid changes.
+    */
+    WalkSetup resumeWalk(const GridVolume gridVolume, const float3 ipos, const float3 idir, const float3 ri)
+    {
+        WalkSetup w;
+        gScene.getGrid(gridVolume.getDensityGrid(), w.densityGrid);
+        w.ipos = ipos;
+        w.idir = idir;
+        w.ri = ri;
+        return w;
+    }
+
     struct DistanceSample
     {
         float t;    ///< Sampled distance.

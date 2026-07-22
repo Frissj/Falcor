@@ -1177,6 +1177,33 @@ struct VolumeInstanceSampler
 
         RayQuery<RAY_FLAG_NONE> q;
         q.TraceRayInline(gBrickTlas, RAY_FLAG_NONE, 0xff, rd);
+#if GVS_SHARED_WALK_SETUP
+        // PER-RAY walk setup, not per-brick. beginWalk is a pure function of
+        // (gridVolume, ray): getGrid, two 4x4 mat-vecs and a reciprocal, none
+        // of which depend on the brick. Calling the convenience overload inside
+        // this loop rebuilt all of it for every candidate - measured as the 3rd
+        // hottest line in shadeMain (GridVolumeSampler.slang:571 `return w;`,
+        // 513,710 of 9,096,776 samples = 5.6%) against 5.8 segments/pixel.
+        //
+        // Rebuilt only when the INSTANCE changes, which is also the brick
+        // cache's correctness contract (see beginWalk's note): the cache holds
+        // an atlas pointer valid for one Grid, so it must be invalidated when
+        // the grid changes - and may be kept when it does not. Resetting less
+        // often is strictly more cache reuse, so [COST] brickCache hit should
+        // RISE; that is the confirmation signal, not the frame timer.
+        //
+        // Strictly >= the old behaviour: worst case (every candidate a
+        // different instance) is one setup per candidate, which is what the
+        // convenience overload did unconditionally.
+        //
+        // ONLY PLAIN STATE IS CARRIED. Caching the WalkSetup itself crashed the
+        // compiler - it holds a Grid, i.e. resource handles, and a mutable
+        // loop-carried local of that type is a phi over opaque handles that
+        // DXIL cannot represent (slang.dll 0xc0000005, log 198). See
+        // GridVolumeSampler::resumeWalk.
+        uint walkGridIdx = 0xffffffffu;
+        float3 walkIpos = float3(0.f), walkIdir = float3(0.f), walkRi = float3(0.f);
+#endif
         while (q.Proceed())
         {
             if (q.CandidateType() != CANDIDATE_PROCEDURAL_PRIMITIVE) continue;
@@ -1189,11 +1216,28 @@ struct VolumeInstanceSampler
 
             statSegments++;
             const GridVolume gridVolume = gScene.getGridVolume(info.gridVolumeIdx);
+#if GVS_SHARED_WALK_SETUP
+            if (info.gridVolumeIdx != walkGridIdx)
+            {
+                const GridVolumeSampler::WalkSetup w0 = gvs.beginWalk(gridVolume, ray.origin, ray.dir);
+                walkIpos = w0.ipos;
+                walkIdir = w0.idir;
+                walkRi = w0.ri;
+                walkGridIdx = info.gridVolumeIdx;
+            }
+            const GridVolumeSampler::WalkSetup walk = gvs.resumeWalk(gridVolume, walkIpos, walkIdir, walkRi);
+            if (GridVolumeSampler::kTransmittanceEstimator == TransmittanceEstimator::ResidualRatioTrackingLocalMajorant)
+                Tr *= gvs.evalTransmittanceResidualRatioTrackingLocalDDA(walk, gridVolume, tt, sg,
+                    selectResidualMip(gridVolume, ray.dir, tt.x));
+            else
+                Tr *= gvs.evalTransmittanceRatioTrackingLocalDDA(gridVolume, ray.origin, ray.dir, tt, sg);
+#else
             if (GridVolumeSampler::kTransmittanceEstimator == TransmittanceEstimator::ResidualRatioTrackingLocalMajorant)
                 Tr *= gvs.evalTransmittanceResidualRatioTrackingLocalDDA(gridVolume, ray.origin, ray.dir, tt, sg,
                     selectResidualMip(gridVolume, ray.dir, tt.x));
             else
                 Tr *= gvs.evalTransmittanceRatioTrackingLocalDDA(gridVolume, ray.origin, ray.dir, tt, sg);
+#endif
 
             // [TRRPROBE2] A residual factor outside [0,2] flips Tr negative
             // (jittered density lookup escaped the node's stored min/max).
@@ -1285,6 +1329,14 @@ struct VolumeInstanceSampler
 
         RayQuery<RAY_FLAG_NONE> q;
         q.TraceRayInline(gBrickTlas, RAY_FLAG_NONE, 0xff, rd);
+#if GVS_SHARED_WALK_SETUP
+        // Per-RAY walk setup - see the note in evalTransmittanceRQ. This is the
+        // hotter of the two call sites: VolumeInstanceSampler.slang:1301 alone
+        // carried 431,495 samples, and the beginWalk it hid carried 513,710.
+        // Only plain state crosses iterations - see resumeWalk.
+        uint walkGridIdx = 0xffffffffu;
+        float3 walkIpos = float3(0.f), walkIdir = float3(0.f), walkRi = float3(0.f);
+#endif
         while (q.Proceed())
         {
             if (q.CandidateType() != CANDIDATE_PROCEDURAL_PRIMITIVE) continue;
@@ -1298,7 +1350,20 @@ struct VolumeInstanceSampler
             statSegments++;
             const GridVolume gridVolume = gScene.getGridVolume(info.gridVolumeIdx);
             GridVolumeSampler::DistanceSample gds;
+#if GVS_SHARED_WALK_SETUP
+            if (info.gridVolumeIdx != walkGridIdx)
+            {
+                const GridVolumeSampler::WalkSetup w0 = gvs.beginWalk(gridVolume, ray.origin, ray.dir);
+                walkIpos = w0.ipos;
+                walkIdir = w0.idir;
+                walkRi = w0.ri;
+                walkGridIdx = info.gridVolumeIdx;
+            }
+            const GridVolumeSampler::WalkSetup walk = gvs.resumeWalk(gridVolume, walkIpos, walkIdir, walkRi);
+            if (gvs.sampleDistanceDeltaTrackingLocalDDA(walk, gridVolume, tt, sg, gds) && gds.t < bestT)
+#else
             if (gvs.sampleDistanceDeltaTrackingLocalDDA(gridVolume, ray.origin, ray.dir, tt, sg, gds) && gds.t < bestT)
+#endif
             {
                 bestT = gds.t;
                 ds.t = gds.t;
@@ -1345,6 +1410,11 @@ struct VolumeInstanceSampler
 
         RayQuery<RAY_FLAG_NONE> q;
         q.TraceRayInline(gBrickTlas, RAY_FLAG_NONE, 0xff, rd);
+#if GVS_SHARED_WALK_SETUP
+        // Only plain state crosses iterations - see resumeWalk.
+        uint walkGridIdx = 0xffffffffu;
+        float3 walkIpos = float3(0.f), walkIdir = float3(0.f), walkRi = float3(0.f);
+#endif
         while (q.Proceed())
         {
             if (q.CandidateType() != CANDIDATE_PROCEDURAL_PRIMITIVE) continue;
@@ -1361,12 +1431,31 @@ struct VolumeInstanceSampler
             statSegments++;
             const GridVolume gridVolume = gScene.getGridVolume(info.gridVolumeIdx);
 
+#if GVS_SHARED_WALK_SETUP
+            // Per-RAY setup, shared across bricks AND across the nProc walks on
+            // each brick - the convenience overload rebuilt it nProc times per
+            // brick. Same argument as evalTransmittanceRQ.
+            if (info.gridVolumeIdx != walkGridIdx)
+            {
+                const GridVolumeSampler::WalkSetup w0 = gvs.beginWalk(gridVolume, ray.origin, ray.dir);
+                walkIpos = w0.ipos;
+                walkIdir = w0.idir;
+                walkRi = w0.ri;
+                walkGridIdx = info.gridVolumeIdx;
+            }
+            const GridVolumeSampler::WalkSetup walk = gvs.resumeWalk(gridVolume, walkIpos, walkIdir, walkRi);
+#endif
             for (uint j = 0; j < nProc; ++j)
             {
                 if (tt.x >= bestT[j]) continue;
                 GridVolumeSampler::DistanceSample gds;
+#if GVS_SHARED_WALK_SETUP
+                if (gvs.sampleDistanceDeltaTrackingLocalDDA(walk, gridVolume, float2(tt.x, min(tt.y, bestT[j])), sg, gds) &&
+                    gds.t < bestT[j])
+#else
                 if (gvs.sampleDistanceDeltaTrackingLocalDDA(gridVolume, ray.origin, ray.dir, float2(tt.x, min(tt.y, bestT[j])), sg, gds) &&
                     gds.t < bestT[j])
+#endif
                 {
                     bestT[j] = gds.t;
                     bestInst[j] = info.gridVolumeIdx;
@@ -1447,6 +1536,11 @@ struct VolumeInstanceSampler
 
         RayQuery<RAY_FLAG_NONE> q;
         q.TraceRayInline(gBrickTlas, RAY_FLAG_NONE, 0xff, rd);
+#if GVS_SHARED_WALK_SETUP
+        // Only plain state crosses iterations - see resumeWalk.
+        uint walkGridIdx = 0xffffffffu;
+        float3 walkIpos = float3(0.f), walkIdir = float3(0.f), walkRi = float3(0.f);
+#endif
         while (q.Proceed())
         {
             statRqIters++; // SIMD-occupancy probe: traversal iterations per lane.
@@ -1461,11 +1555,19 @@ struct VolumeInstanceSampler
             statSegments++;
             const GridVolume gridVolume = gScene.getGridVolume(info.gridVolumeIdx);
 
-            // ONE walk setup for this brick, shared by the escape term and all
-            // nProc candidate processes below. They differ only in their [t0,t1]
-            // window - the grid, the ray, and therefore the index-space
-            // transform and slab reciprocal are identical across all of them, so
-            // computing them per walk was 1 + nProc copies of the same answer.
+            // ONE walk setup per INSTANCE, shared by the escape term, all nProc
+            // candidate processes, AND every subsequent brick of the same
+            // instance. They differ only in their [t0,t1] window - the grid, the
+            // ray, and therefore the index-space transform and slab reciprocal
+            // are identical across all of them, so computing them per walk was
+            // 1 + nProc copies of the same answer.
+            //
+            // WIDENED FROM PER-BRICK TO PER-INSTANCE (2026-07-22): beginWalk is
+            // a pure function of (gridVolume, ray) and the brick index appears
+            // nowhere in it, so rebuilding on a new brick of the SAME instance
+            // recomputed a value that could not have changed. Nsight put
+            // GridVolumeSampler.slang:571 (`return w;`, i.e. this preamble)
+            // third in shadeMain at 513,710 of 9,096,776 samples = 5.6%.
             //
             // Measured motivation (log 185, shipping config, 2560x1351): this
             // bucket runs 5.8 segments and 19.0 DDA cells per pixel, so the
@@ -1474,10 +1576,13 @@ struct VolumeInstanceSampler
             // forced a guaranteed miss at the start of each candidate process on
             // a brick the previous process had just finished reading.
             //
-            // Correctness: the grid is fixed for this whole iteration (it comes
-            // from info.gridVolumeIdx), which is exactly the condition the brick
-            // cache's single-grid rule requires. The next brick builds a fresh
-            // setup and resets the cache again.
+            // Correctness: the setup is rebuilt exactly when info.gridVolumeIdx
+            // changes, which IS the brick cache's single-grid rule - the cache
+            // holds an atlas pointer valid for one Grid and must be invalidated
+            // when the grid changes, but may be kept when it does not. Holding
+            // it across bricks of one instance is strictly more reuse, so
+            // [COST] brickCache hit should RISE; that is the confirmation
+            // signal for this change, not the frame timer.
             // A/B TOGGLE, and it has to be compile-time: the whole point is to
             // remove instructions, and a runtime flag that selects between two
             // preambles keeps both alive in the register allocation - the run-137
@@ -1488,7 +1593,15 @@ struct VolumeInstanceSampler
             // drifts ~25% with identical counters, which is larger than this
             // effect is likely to be.
 #if GVS_SHARED_WALK_SETUP
-            const GridVolumeSampler::WalkSetup walk = gvs.beginWalk(gridVolume, ray.origin, ray.dir);
+            if (info.gridVolumeIdx != walkGridIdx)
+            {
+                const GridVolumeSampler::WalkSetup w0 = gvs.beginWalk(gridVolume, ray.origin, ray.dir);
+                walkIpos = w0.ipos;
+                walkIdir = w0.idir;
+                walkRi = w0.ri;
+                walkGridIdx = info.gridVolumeIdx;
+            }
+            const GridVolumeSampler::WalkSetup walk = gvs.resumeWalk(gridVolume, walkIpos, walkIdir, walkRi);
 #endif
 
             // Escape term: identical per-brick factor to evalTransmittanceRQ.
