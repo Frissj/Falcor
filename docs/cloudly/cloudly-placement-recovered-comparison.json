@@ -1,0 +1,78 @@
+{
+  "distanceUnits": "mip-0 texels",
+  "referenceBand": 4.0,
+  "captureMipFilter": {
+    "1": {
+      "rule": "2x2x2 encoded-byte mean, ties to even",
+      "identicalBytesFraction": 0.9728116989135742,
+      "maxByteDifference": 1
+    },
+    "2": {
+      "rule": "2x2x2 encoded-byte mean, ties to even",
+      "identicalBytesFraction": 0.9697608947753906,
+      "maxByteDifference": 1
+    }
+  },
+  "mips": {
+    "0": {
+      "Base": {
+        "referenceInsideVoxels": 65755,
+        "generatedInsideVoxels": 80587,
+        "insideIoU": 0.8159504634742576,
+        "identicalBytesFraction": 0.9648687243461609,
+        "nearSurfaceVoxels": 769367,
+        "nearSurfaceMAE": 0.09759397059679031,
+        "nearSurfaceP95": 0.49810028076171875
+      },
+      "Alto": {
+        "referenceInsideVoxels": 58244,
+        "generatedInsideVoxels": 75935,
+        "insideIoU": 0.767024428787779,
+        "identicalBytesFraction": 0.955704391002655,
+        "nearSurfaceVoxels": 955586,
+        "nearSurfaceMAE": 0.09394645690917969,
+        "nearSurfaceP95": 0.5227432250976562
+      }
+    },
+    "1": {
+      "Base": {
+        "referenceInsideVoxels": 5494,
+        "generatedInsideVoxels": 4716,
+        "insideIoU": 0.7812281926029309,
+        "identicalBytesFraction": 0.9352898597717285,
+        "nearSurfaceVoxels": 100695,
+        "nearSurfaceMAE": 0.067440465092659,
+        "nearSurfaceP95": 0.27634429931640625
+      },
+      "Alto": {
+        "referenceInsideVoxels": 4231,
+        "generatedInsideVoxels": 3387,
+        "insideIoU": 0.724309642372114,
+        "identicalBytesFraction": 0.9237771034240723,
+        "nearSurfaceVoxels": 127807,
+        "nearSurfaceMAE": 0.07273726910352707,
+        "nearSurfaceP95": 0.3407440185546875
+      }
+    },
+    "2": {
+      "Base": {
+        "referenceInsideVoxels": 370,
+        "generatedInsideVoxels": 292,
+        "insideIoU": 0.7891891891891892,
+        "identicalBytesFraction": 0.9108657836914062,
+        "nearSurfaceVoxels": 12488,
+        "nearSurfaceMAE": 0.05077575519680977,
+        "nearSurfaceP95": 0.20090484619140625
+      },
+      "Alto": {
+        "referenceInsideVoxels": 179,
+        "generatedInsideVoxels": 117,
+        "insideIoU": 0.6353591160220995,
+        "identicalBytesFraction": 0.8993301391601562,
+        "nearSurfaceVoxels": 16323,
+        "nearSurfaceMAE": 0.06112443283200264,
+        "nearSurfaceP95": 0.26806640625
+      }
+    }
+  }
+}

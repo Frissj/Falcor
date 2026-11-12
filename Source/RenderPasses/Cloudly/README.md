@@ -38,6 +38,53 @@ Mogwai.exe -s scripts/Cloudly/Cloudly.py -S scripts/Cloudly/CloudlyScene.pyscene
 
 `CLOUDLY_GAME_DATA` overrides the volume folder.
 
+## Generating Base and Alto placement SDFs
+
+See the [placement handoff](../../../docs/cloudly/README.md) for the map and sequencer index, decoded placement records, recovered shader stages, and extraction commands.
+
+By default the pass still uses the captured volumes. Set `CLOUDLY_PLACEMENT_DENSITY` (or the
+`placementDensityDir` graph property) to generate Base and Alto from `Base_density.f32` and
+`Alto_density.f32` in that directory. Each file contains a 512×512×64 volume of little-endian
+float32 density values, with X varying fastest, in the same texture coordinates as
+`CloudTex_BASE_SDF_Tex`. Voxels with density greater than `CLOUDLY_PLACEMENT_SURFACE`
+(default 0.5, graph property `placementSurface`) are inside. `CLOUDLY_GAME_DATA` still supplies
+cirrus and the displacement textures; the captured Base/Alto texture is optional in this mode.
+
+Falcor follows the recovered Base/Alto shaders. It seeds voxels where one of six axial
+neighbors crosses the density threshold, propagates a nearest boundary coordinate through
+jump flooding, and signs the distance using the density at the output voxel. The shader
+wraps X/Y and clamps Z. `CLOUDLY_PLACEMENT_FIXUP_STRENGTH` (graph property
+`placementSurfaceFixupStrength`) controls the recovered subvoxel boundary search. It ranges
+from 0 (disabled) to 1 (full strength, Falcor's default). The two outputs are packed with
+Cloudly's Base/Alto logistic encoding. Lower mips average 2×2×2 blocks in encoded space.
+From the captured parent mips, this reproduces about 97% of the lower-mip bytes exactly,
+with every byte within one code.
+
+The original shader library contains `WriteComponentsDensityCS` and the jump-flood
+kernels. The Falcor generator takes the resulting scalar density fields as input.
+To reproduce a mission, those fields must be built from the mission's placement asset,
+cloud part volume textures, and generation parameters. This port covers the boundary
+seed, jump, and decode stages. It omits Cloudly's separate optional extreme-value blur
+and normalization passes.
+
+To reproduce the diagnostic with an existing RenderDoc volume dump, run these PowerShell
+commands from the Falcor repository root. The probe needs NumPy in your Python environment.
+
+```powershell
+$env:CLOUDLY_GAME_DATA = 'C:\path\to\Capture_dxil\cloud_volumes'
+$env:CLOUDLY_PLACEMENT_DENSITY = "$env:TEMP\cloudly-probe-density"
+$env:CLOUDLY_PLACEMENT_OUTPUT = "$env:TEMP\cloudly-probe-generated"
+py scripts/Cloudly/placement_probe.py prepare $env:CLOUDLY_GAME_DATA $env:CLOUDLY_PLACEMENT_DENSITY
+& build/windows-ninja-msvc/bin/Release/Mogwai.exe -s scripts/Cloudly/Cloudly.py -S scripts/Cloudly/CloudlyScene.pyscene
+py scripts/Cloudly/placement_probe.py compare $env:CLOUDLY_GAME_DATA $env:CLOUDLY_PLACEMENT_OUTPUT
+```
+
+`CLOUDLY_PLACEMENT_OUTPUT` (graph property `placementOutputDir`) optionally exports signed
+float32 distances and packed mips. It must be separate from the capture directory.
+`prepare` thresholds the **finished captured SDF** into a binary silhouette; the probe measures the distance reconstruction from those silhouettes.
+The original pre-SDF density and subvoxel values are unavailable in that frame. For an independent comparison, skip `prepare` and supply density textures
+captured before the game runs the SDF pass.
+
 ## Known differences from the capture
 
 * Cirrus are more opaque than in the game frame.

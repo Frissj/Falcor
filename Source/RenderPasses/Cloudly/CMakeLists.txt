@@ -3,6 +3,9 @@ add_plugin(Cloudly)
 target_sources(Cloudly PRIVATE
     Cloudly.cpp
     Cloudly.h
+    CloudlyPlacement.cpp
+    CloudlyPlacement.h
+    PlacementSdf.cs.slang
     CloudlyParams.slang
     CloudlyCommon.slang
     AtmosphereLut.cs.slang

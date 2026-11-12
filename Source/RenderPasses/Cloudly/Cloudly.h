@@ -10,7 +10,7 @@ using namespace Falcor;
  * Volumetric clouds and sky modelled on the Cloudly UE plugin.
  *
  * Pipeline (Cloudly pass names in brackets):
- *   1. Noise generation, once                      [procedural; the plugin ships baked SDF textures]
+ *   1. Noise generation, once                      [procedural detail or generated placement]
  *   2. Atmosphere LUTs when the sun moves           [OpticalDepthTex, MultiScatteringLut, DistantSkyLightLut]
  *   3. Low-res checkerboard cloud trace             [SkyTraceCS]
  *   4. Temporal upscale with history                [CheckerBoardResolveCS]
@@ -44,6 +44,11 @@ private:
     CloudlyParams mParams;
     CloudlyGameData mGame;
     std::filesystem::path mGameDataDir; ///< Folder with the CloudTex_*_mip0.bin volumes dumped from a capture.
+    std::filesystem::path mPlacementDensityDir;
+    std::filesystem::path mPlacementOutputDir;
+    float mPlacementSurface = 0.5f;
+    float mPlacementSurfaceFixupStrength = 1.f;
+    bool mPlacementGenerated = false;
     ref<Texture> mpGameBaseSdf;
     ref<Texture> mpGameDisp1;
     ref<Texture> mpGameDisp2;

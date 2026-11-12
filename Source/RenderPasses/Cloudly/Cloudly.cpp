@@ -1,4 +1,5 @@
 #include "Cloudly.h"
+#include "CloudlyPlacement.h"
 #include "Scene/Lights/Light.h"
 #include <fstream>
 
@@ -32,6 +33,10 @@ const char kDrawSky[] = "drawSky";
 const char kDrawSunDisk[] = "drawSunDisk";
 const char kSceneAerialPerspective[] = "sceneAerialPerspective";
 const char kGameDataDir[] = "gameDataDir";
+const char kPlacementDensityDir[] = "placementDensityDir";
+const char kPlacementOutputDir[] = "placementOutputDir";
+const char kPlacementSurfaceFixupStrength[] = "placementSurfaceFixupStrength";
+const char kPlacementSurface[] = "placementSurface";
 const char kGameOffset[] = "gameOffset";
 const char kHotsure[] = "hotsure";
 
@@ -140,6 +145,14 @@ Cloudly::Cloudly(ref<Device> pDevice, const Properties& props) : RenderPass(pDev
             mSceneAerialPerspective = value;
         else if (key == kGameDataDir)
             mGameDataDir = value.operator std::string();
+        else if (key == kPlacementDensityDir)
+            mPlacementDensityDir = value.operator std::string();
+        else if (key == kPlacementOutputDir)
+            mPlacementOutputDir = value.operator std::string();
+        else if (key == kPlacementSurfaceFixupStrength)
+            mPlacementSurfaceFixupStrength = value;
+        else if (key == kPlacementSurface)
+            mPlacementSurface = value;
         else if (key == kGameOffset)
             mGame.gameOffsetXY = value;
         else if (key == kHotsure)
@@ -190,6 +203,13 @@ Cloudly::Cloudly(ref<Device> pDevice, const Properties& props) : RenderPass(pDev
     mpDummy3D = mpDevice->createTexture3D(1, 1, 1, ResourceFormat::RGBA8Unorm, 1, &zero, ResourceBindFlags::ShaderResource);
     if (!mGameDataDir.empty())
         loadGameVolumes(mGameDataDir);
+    FALCOR_CHECK(mPlacementDensityDir.empty() || mParams.useGameVolumes,
+                 "Cloudly placement generation requires gameDataDir for cirrus and displacement volumes.");
+    FALCOR_CHECK(mPlacementOutputDir.empty() || !mPlacementDensityDir.empty(),
+                 "Cloudly placement export requires placementDensityDir.");
+    FALCOR_CHECK(mPlacementOutputDir.empty() || !std::filesystem::exists(mPlacementOutputDir) ||
+                     !std::filesystem::equivalent(mPlacementOutputDir, mGameDataDir),
+                 "Cloudly placement output must be separate from gameDataDir to preserve the reference volumes.");
 
     float3 d = mParams.lightSourceDirection;
     mSunElevationDeg = math::degrees(std::asin(std::clamp(d.y, -1.f, 1.f)));
@@ -216,6 +236,14 @@ Properties Cloudly::getProperties() const
     props[kSceneAerialPerspective] = mSceneAerialPerspective;
     if (!mGameDataDir.empty())
         props[kGameDataDir] = mGameDataDir.string();
+    if (!mPlacementDensityDir.empty())
+    {
+        props[kPlacementDensityDir] = mPlacementDensityDir.string();
+        props[kPlacementSurface] = mPlacementSurface;
+        props[kPlacementSurfaceFixupStrength] = mPlacementSurfaceFixupStrength;
+    }
+    if (!mPlacementOutputDir.empty())
+        props[kPlacementOutputDir] = mPlacementOutputDir.string();
     props[kGameOffset] = mGame.gameOffsetXY;
     props[kHotsure] = mGame.enableHotsure != 0;
     return props;
@@ -226,6 +254,9 @@ bool Cloudly::loadGameVolumes(const std::filesystem::path& dir)
     ref<Texture> textures[5];
     for (size_t i = 0; i < 5; i++)
     {
+        // Base/Alto will be supplied by the generator at graph compile time.
+        if (i == 0 && !mPlacementDensityDir.empty())
+            continue;
         const auto& v = kGameVolumes[i];
         std::vector<uint8_t> data;
         for (uint32_t mip = 0; mip < v.mips; mip++)
@@ -272,6 +303,14 @@ RenderPassReflection Cloudly::reflect(const CompileData& compileData)
 
 void Cloudly::compile(RenderContext* pRenderContext, const CompileData& compileData)
 {
+    if (!mPlacementGenerated && !mPlacementDensityDir.empty())
+    {
+        mpGameBaseSdf = generateCloudlyPlacement(
+            pRenderContext, mpDevice, mPlacementDensityDir, mPlacementOutputDir, mPlacementSurface, mPlacementSurfaceFixupStrength
+        );
+        mPlacementGenerated = true;
+        mHistoryValid = false;
+    }
     allocateTargets(compileData.defaultTexDims);
 }
 
