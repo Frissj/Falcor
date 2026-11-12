@@ -6,6 +6,7 @@ target_sources(Cloudly PRIVATE
     CloudlyPlacement.cpp
     CloudlyPlacement.h
     PlacementSdf.cs.slang
+    AtmosphereLayout.cs.slang
     CloudlyParams.slang
     CloudlyCommon.slang
     AtmosphereLut.cs.slang

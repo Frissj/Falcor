@@ -10,6 +10,7 @@ namespace
 constexpr uint32_t kWidth = 512, kHeight = 512, kDepth = 64, kMips = 3;
 constexpr size_t kVoxelCount = size_t(kWidth) * kHeight * kDepth;
 constexpr char kShader[] = "RenderPasses/Cloudly/PlacementSdf.cs.slang";
+constexpr char kLayoutShader[] = "RenderPasses/Cloudly/AtmosphereLayout.cs.slang";
 
 std::vector<float> readDensity(const std::filesystem::path& path)
 {
@@ -45,7 +46,8 @@ ref<Texture> generateCloudlyPlacement(
     const std::filesystem::path& densityDir,
     const std::filesystem::path& outputDir,
     float surface,
-    float surfaceFixupStrength
+    float surfaceFixupStrength,
+    const CloudlyAtmosphereLayout* pLayout
 )
 {
     FALCOR_CHECK(std::isfinite(surface), "Cloudly placement: surface threshold must be finite.");
@@ -63,6 +65,23 @@ ref<Texture> generateCloudlyPlacement(
     auto pInitialize = ComputePass::create(pDevice, kShader, "initialize");
     auto pJump = ComputePass::create(pDevice, kShader, "jumpFlood");
     auto pDecode = ComputePass::create(pDevice, kShader, "decodeDistance");
+    ref<ComputePass> pRasterize;
+    ref<Texture> pLayoutDensity;
+    if (pLayout)
+    {
+        pRasterize = ComputePass::create(pDevice, kLayoutShader, "rasterize");
+        pLayoutDensity = createVolume(ResourceFormat::R32Float, readWrite);
+        auto cb = pRasterize->getRootVar()["LayoutCB"];
+        const float angle = math::radians(std::remainder(pLayout->rotation, 360.f));
+        const float2 extent(1.f / pLayout->uvScale.x, 1.f / pLayout->uvScale.y);
+        cb["gDim"] = dim;
+        cb["gOffset"] = float2(std::remainder(pLayout->offset.x, extent.x), std::remainder(pLayout->offset.y, extent.y));
+        cb["gRotation"] = float2(std::cos(angle), std::sin(angle));
+        cb["gScale"] = pLayout->scale;
+        cb["gMapExtent"] = float3(extent.x, extent.y, 1.f / pLayout->uvScale.z);
+        cb["gMapOffset"] = pLayout->uvOffset;
+        pRasterize->getRootVar()["gLayoutDensity"] = pLayoutDensity;
+    }
     ref<Texture> seeds[2] = {createVolume(ResourceFormat::R32Uint, readWrite), createVolume(ResourceFormat::R32Uint, readWrite)};
     auto pDistance = createVolume(ResourceFormat::R32Float, readWrite);
 
@@ -75,8 +94,22 @@ ref<Texture> generateCloudlyPlacement(
     for (uint32_t channel = 0; channel < 2; ++channel)
     {
         const char* layer = channel == 0 ? "Base" : "Alto";
-        const auto input = readDensity(densityDir / fmt::format("{}_density.f32", layer));
-        auto pDensity = createVolume(ResourceFormat::R32Float, ResourceBindFlags::ShaderResource, input.data());
+        ref<Texture> pDensity;
+        if (pLayout)
+        {
+            auto cb = pRasterize->getRootVar()["LayoutCB"];
+            cb["gLayer"] = channel;
+            cb["gStartHeight"] = pLayout->startHeight[channel];
+            cb["gThickness"] = pLayout->thickness[channel];
+            cb["gAmount"] = pLayout->amount[channel];
+            pRasterize->execute(pContext, dim);
+            pDensity = pLayoutDensity;
+        }
+        else
+        {
+            const auto input = readDensity(densityDir / fmt::format("{}_density.f32", layer));
+            pDensity = createVolume(ResourceFormat::R32Float, ResourceBindFlags::ShaderResource, input.data());
+        }
 
         auto init = pInitialize->getRootVar();
         init["PlacementCB"]["gDim"] = dim;
@@ -166,7 +199,7 @@ ref<Texture> generateCloudlyPlacement(
     auto pTexture = pDevice->createTexture3D(dim.x, dim.y, dim.z, ResourceFormat::RG8Unorm, kMips, packed.data(),
                                              ResourceBindFlags::ShaderResource);
     pTexture->setName("Cloudly::GeneratedBaseAltoSdf");
-    logInfo("Cloudly: generated Base and Alto placement SDFs from '{}'.", densityDir.string());
+    logInfo("Cloudly: generated Base and Alto placement SDFs from '{}'.", pLayout ? "Atmosphere layout" : densityDir.string());
     return pTexture;
 }
 }

@@ -1,5 +1,4 @@
 #include "Cloudly.h"
-#include "CloudlyPlacement.h"
 #include "Scene/Lights/Light.h"
 #include <fstream>
 
@@ -37,6 +36,11 @@ const char kPlacementDensityDir[] = "placementDensityDir";
 const char kPlacementOutputDir[] = "placementOutputDir";
 const char kPlacementSurfaceFixupStrength[] = "placementSurfaceFixupStrength";
 const char kPlacementSurface[] = "placementSurface";
+const char kAtmosphereLayout[] = "atmosphereLayout";
+const char kPlacementOffset[] = "placementOffset";
+const char kPlacementRotation[] = "placementRotation";
+const char kPlacementScale[] = "placementScale";
+const char kPlacementThickness[] = "placementThickness";
 const char kGameOffset[] = "gameOffset";
 const char kHotsure[] = "hotsure";
 
@@ -153,6 +157,16 @@ Cloudly::Cloudly(ref<Device> pDevice, const Properties& props) : RenderPass(pDev
             mPlacementSurfaceFixupStrength = value;
         else if (key == kPlacementSurface)
             mPlacementSurface = value;
+        else if (key == kAtmosphereLayout)
+            mUseAtmosphereLayout = value;
+        else if (key == kPlacementOffset)
+            mAtmosphereLayout.offset = value;
+        else if (key == kPlacementRotation)
+            mAtmosphereLayout.rotation = value;
+        else if (key == kPlacementScale)
+            mAtmosphereLayout.scale = value;
+        else if (key == kPlacementThickness)
+            mAtmosphereLayout.thickness = value;
         else if (key == kGameOffset)
             mGame.gameOffsetXY = value;
         else if (key == kHotsure)
@@ -201,12 +215,32 @@ Cloudly::Cloudly(ref<Device> pDevice, const Properties& props) : RenderPass(pDev
 
     uint32_t zero = 0;
     mpDummy3D = mpDevice->createTexture3D(1, 1, 1, ResourceFormat::RGBA8Unorm, 1, &zero, ResourceBindFlags::ShaderResource);
+    FALCOR_CHECK(!mUseAtmosphereLayout || mPlacementDensityDir.empty(),
+                 "Cloudly: atmosphereLayout and placementDensityDir are mutually exclusive.");
+    if (mUseAtmosphereLayout)
+    {
+        auto positive = [](float v) { return std::isfinite(v) && v > 0.f; };
+        FALCOR_CHECK(std::isfinite(mAtmosphereLayout.rotation) && std::isfinite(mAtmosphereLayout.offset.x) &&
+                         std::isfinite(mAtmosphereLayout.offset.y),
+                     "Cloudly: placementOffset and placementRotation must be finite.");
+        FALCOR_CHECK(std::isfinite(mParams.cloudLayersStartHeight.x) && std::isfinite(mParams.cloudLayersStartHeight.y) &&
+                         std::isfinite(mParams.layerCoverage.x) && std::isfinite(mParams.layerCoverage.y),
+                     "Cloudly: Base and Alto placement heights and amounts must be finite.");
+        FALCOR_CHECK(positive(mAtmosphereLayout.scale.x) && positive(mAtmosphereLayout.scale.y) &&
+                         positive(mAtmosphereLayout.thickness.x) && positive(mAtmosphereLayout.thickness.y),
+                     "Cloudly: placementScale and placementThickness must be finite and positive.");
+        mAtmosphereLayout.startHeight = float2(mParams.cloudLayersStartHeight.x, mParams.cloudLayersStartHeight.y);
+        mAtmosphereLayout.amount = float2(mParams.layerCoverage.x, mParams.layerCoverage.y);
+        mAtmosphereLayout.uvOffset = mGame.baseUVOffset;
+        mAtmosphereLayout.uvScale = mGame.baseUVScale;
+    }
     if (!mGameDataDir.empty())
         loadGameVolumes(mGameDataDir);
-    FALCOR_CHECK(mPlacementDensityDir.empty() || mParams.useGameVolumes,
+    const bool generatePlacement = mUseAtmosphereLayout || !mPlacementDensityDir.empty();
+    FALCOR_CHECK(!generatePlacement || mParams.useGameVolumes,
                  "Cloudly placement generation requires gameDataDir for cirrus and displacement volumes.");
-    FALCOR_CHECK(mPlacementOutputDir.empty() || !mPlacementDensityDir.empty(),
-                 "Cloudly placement export requires placementDensityDir.");
+    FALCOR_CHECK(mPlacementOutputDir.empty() || generatePlacement,
+                 "Cloudly placement export requires atmosphereLayout or placementDensityDir.");
     FALCOR_CHECK(mPlacementOutputDir.empty() || !std::filesystem::exists(mPlacementOutputDir) ||
                      !std::filesystem::equivalent(mPlacementOutputDir, mGameDataDir),
                  "Cloudly placement output must be separate from gameDataDir to preserve the reference volumes.");
@@ -236,11 +270,22 @@ Properties Cloudly::getProperties() const
     props[kSceneAerialPerspective] = mSceneAerialPerspective;
     if (!mGameDataDir.empty())
         props[kGameDataDir] = mGameDataDir.string();
-    if (!mPlacementDensityDir.empty())
+    if (mUseAtmosphereLayout || !mPlacementDensityDir.empty())
     {
-        props[kPlacementDensityDir] = mPlacementDensityDir.string();
         props[kPlacementSurface] = mPlacementSurface;
         props[kPlacementSurfaceFixupStrength] = mPlacementSurfaceFixupStrength;
+    }
+    if (!mPlacementDensityDir.empty())
+        props[kPlacementDensityDir] = mPlacementDensityDir.string();
+    if (mUseAtmosphereLayout)
+    {
+        props[kAtmosphereLayout] = true;
+        props[kPlacementOffset] = mAtmosphereLayout.offset;
+        props[kPlacementRotation] = mAtmosphereLayout.rotation;
+        props[kPlacementScale] = mAtmosphereLayout.scale;
+        props[kPlacementThickness] = mAtmosphereLayout.thickness;
+        props[kLayerStartHeight] = float3(mAtmosphereLayout.startHeight.x, mAtmosphereLayout.startHeight.y, mParams.cloudLayersStartHeight.z);
+        props[kLayerCoverage] = float3(mAtmosphereLayout.amount.x, mAtmosphereLayout.amount.y, mParams.layerCoverage.z);
     }
     if (!mPlacementOutputDir.empty())
         props[kPlacementOutputDir] = mPlacementOutputDir.string();
@@ -255,7 +300,7 @@ bool Cloudly::loadGameVolumes(const std::filesystem::path& dir)
     for (size_t i = 0; i < 5; i++)
     {
         // Base/Alto will be supplied by the generator at graph compile time.
-        if (i == 0 && !mPlacementDensityDir.empty())
+        if (i == 0 && (mUseAtmosphereLayout || !mPlacementDensityDir.empty()))
             continue;
         const auto& v = kGameVolumes[i];
         std::vector<uint8_t> data;
@@ -303,11 +348,19 @@ RenderPassReflection Cloudly::reflect(const CompileData& compileData)
 
 void Cloudly::compile(RenderContext* pRenderContext, const CompileData& compileData)
 {
-    if (!mPlacementGenerated && !mPlacementDensityDir.empty())
+    if (!mPlacementGenerated && (mUseAtmosphereLayout || !mPlacementDensityDir.empty()))
     {
         mpGameBaseSdf = generateCloudlyPlacement(
-            pRenderContext, mpDevice, mPlacementDensityDir, mPlacementOutputDir, mPlacementSurface, mPlacementSurfaceFixupStrength
+            pRenderContext, mpDevice, mPlacementDensityDir, mPlacementOutputDir, mPlacementSurface, mPlacementSurfaceFixupStrength,
+            mUseAtmosphereLayout ? &mAtmosphereLayout : nullptr
         );
+        if (mUseAtmosphereLayout)
+        {
+            mParams.cloudLayersStartHeight.x = mAtmosphereLayout.startHeight.x;
+            mParams.cloudLayersStartHeight.y = mAtmosphereLayout.startHeight.y;
+            mParams.layerCoverage.x = mAtmosphereLayout.amount.x;
+            mParams.layerCoverage.y = mAtmosphereLayout.amount.y;
+        }
         mPlacementGenerated = true;
         mHistoryValid = false;
     }
@@ -562,15 +615,41 @@ void Cloudly::renderUI(Gui::Widgets& widget)
         {
             g.text("Game volumes not loaded (set the 'gameDataDir' property).");
         }
-        g.var("Start heights (m)", mParams.cloudLayersStartHeight, 0.f, 20000.f, 10.f);
-        g.var("Base/alto thickness (m)", mParams.layerThickness, 100.f, 12000.f, 10.f);
+        if (mUseAtmosphereLayout)
+        {
+            g.var("Cirrus start height (m)", mParams.cloudLayersStartHeight.z, 0.f, 20000.f, 10.f);
+            g.slider("Procedural cirrus coverage", mParams.layerCoverage.z, 0.f, 1.f);
+        }
+        else
+        {
+            g.var("Start heights (m)", mParams.cloudLayersStartHeight, 0.f, 20000.f, 10.f);
+            g.var("Base/alto thickness (m)", mParams.layerThickness, 100.f, 12000.f, 10.f);
+            g.slider("Coverage", mParams.layerCoverage, 0.f, 1.f);
+        }
         g.var("Cirrus thickness (m)", mParams.cirrusThickness, 10.f, 3000.f, 1.f);
-        g.slider("Coverage", mParams.layerCoverage, 0.f, 1.f);
         g.var("Density (top)", mParams.cloudLayersDensity, 0.f, 2.f, 0.001f);
         g.var("Density (bottom)", mParams.cloudLayersDensityBottom, 0.f, 2.f, 0.0001f);
         g.var("Edge fade (m)", mParams.cloudLayersEdgeFadeDistance, 0.f, 20000.f, 1.f);
         g.var("Edge fade bottom (m)", mParams.cloudLayersEdgeFadeDistanceBottom, 0.f, 2000.f, 1.f);
         g.var("Sigma scat (1/m)", mParams.sigmaScatCloud, 0.f, 1.f, 0.001f);
+    }
+
+    if (mUseAtmosphereLayout)
+    {
+        if (auto g = widget.group("Atmosphere placement", true))
+        {
+            g.var("Offset X/Z (m)", mAtmosphereLayout.offset, -200000.f, 200000.f, 10.f);
+            g.var("Rotation (deg)", mAtmosphereLayout.rotation, -360.f, 360.f, 1.f);
+            g.var("Horizontal scale", mAtmosphereLayout.scale, 0.01f, 100.f, 0.01f);
+            g.var("Base/alto start height (m)", mAtmosphereLayout.startHeight, 0.f, 20000.f, 10.f);
+            g.var("Base/alto thickness (m)", mAtmosphereLayout.thickness, 100.f, 12000.f, 10.f);
+            g.slider("Base/alto amount", mAtmosphereLayout.amount, 0.f, 1.f);
+            if (g.button("Rebuild placement"))
+            {
+                mPlacementGenerated = false;
+                requestRecompile();
+            }
+        }
     }
 
     if (auto g = widget.group("Shape"))

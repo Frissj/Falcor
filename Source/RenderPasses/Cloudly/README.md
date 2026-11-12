@@ -40,6 +40,25 @@ Mogwai.exe -s scripts/Cloudly/Cloudly.py -S scripts/Cloudly/CloudlyScene.pyscene
 
 ## Generating Base and Alto placement SDFs
 
+### Atmosphere layout
+
+Set `$env:CLOUDLY_ATMOSPHERE_LAYOUT = '1'` before running the example from PowerShell.
+This places Base and Alto clouds using Atmosphere's cumulus clusters and altocumulus
+flock envelopes. Cloudly converts the fields to SDFs and applies its usual displacement,
+density, and lighting. The 390 m placement grid carries the large-scale layout. Cloudly
+supplies the finer detail and uses the captured Cirrus volumes.
+
+The **Atmosphere placement** panel controls position, yaw, horizontal scale, start
+height, thickness, and amount. Click **Rebuild placement** to apply changes. The
+same initial settings can be passed to the graph with `atmosphereLayout: True`,
+`placementOffset: float2(x, z)` in metres, `placementRotation` in degrees from +X
+toward +Z, `placementScale: float2(x, z)` along the rotated axes, and
+`placementThickness: float2(base, alto)` in metres. The existing
+`layerStartHeight` and `layerCoverage` properties set initial layer heights and
+amounts. Use `CLOUDLY_GAME_DATA` for the displacement and Cirrus volumes.
+
+### Density files
+
 See the [placement handoff](../../../docs/cloudly/README.md) for the map and sequencer index, decoded placement records, recovered shader stages, and extraction commands.
 
 By default the pass still uses the captured volumes. Set `CLOUDLY_PLACEMENT_DENSITY` (or the

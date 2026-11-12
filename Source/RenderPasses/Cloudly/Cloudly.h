@@ -3,6 +3,7 @@
 #include "RenderGraph/RenderPass.h"
 #include "Core/Pass/ComputePass.h"
 #include "CloudlyParams.slang"
+#include "CloudlyPlacement.h"
 
 using namespace Falcor;
 
@@ -46,6 +47,8 @@ private:
     std::filesystem::path mGameDataDir; ///< Folder with the CloudTex_*_mip0.bin volumes dumped from a capture.
     std::filesystem::path mPlacementDensityDir;
     std::filesystem::path mPlacementOutputDir;
+    bool mUseAtmosphereLayout = false;
+    CloudlyAtmosphereLayout mAtmosphereLayout;
     float mPlacementSurface = 0.5f;
     float mPlacementSurfaceFixupStrength = 1.f;
     bool mPlacementGenerated = false;

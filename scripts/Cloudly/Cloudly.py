@@ -14,6 +14,7 @@ def render_graph_Cloudly():
         'cameraAltitude': 0.0,
         'traceDownscale': 2,
         'gameDataDir': GAME_DATA_DIR,
+        'atmosphereLayout': os.environ.get('CLOUDLY_ATMOSPHERE_LAYOUT') == '1',
         'placementDensityDir': os.environ.get('CLOUDLY_PLACEMENT_DENSITY', ''),
         'placementOutputDir': os.environ.get('CLOUDLY_PLACEMENT_OUTPUT', ''),
         'placementSurface': float(os.environ.get('CLOUDLY_PLACEMENT_SURFACE', '0.5')),
