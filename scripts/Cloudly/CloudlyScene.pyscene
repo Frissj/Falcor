@@ -1,0 +1,31 @@
+# Test scene for the Cloudly pass. 1 unit = 1 metre, and Falcor (x, y, z) = game (x, z, y),
+# so the camera below sits exactly where the captured frame's camera was:
+#   UE WorldCameraOrigin (-42890.14, -233622.23, 120300.0) cm -> (-428.90, -2336.22, 1203.00) m,
+#   looking along UE -Y (level), vertical FOV 2*atan(0.3375) = 37.3 deg.
+
+# The captured frame is over open ocean.
+ground = Material('Ocean')
+ground.baseColor = float4(0.02, 0.07, 0.12, 1)
+ground.roughness = 0.3
+
+quad = TriangleMesh.createQuad()
+sceneBuilder.addMeshInstance(
+    sceneBuilder.addNode('Ground', Transform(scaling=float3(400000.0, 1.0, 400000.0))),
+    sceneBuilder.addTriangleMesh(quad, ground)
+)
+
+# Sun from the capture: towards-sun direction (-0.317133, 0.797791, 0.512793) in Falcor axes, 52.9 deg elevation.
+sun = DirectionalLight('Sun')
+sun.direction = float3(0.317133, -0.797791, -0.512793)
+sun.intensity = float3(3.0)
+sceneBuilder.addLight(sun)
+
+camera = Camera('Camera')
+camera.position = float3(-428.9014, 1203.0, -2336.2223)
+camera.target = float3(-428.9014, 1203.0, -3336.2223)
+camera.up = float3(0, 1, 0)
+camera.frameHeight = 24.0
+camera.focalLength = 35.5556  # 12 / tan(vfov / 2) = 12 / 0.3375
+camera.nearPlane = 1.0
+camera.farPlane = 400000.0
+sceneBuilder.addCamera(camera)
